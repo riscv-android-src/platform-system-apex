@@ -76,8 +76,10 @@ cc_library_static {
   defaults: ["apex_defaults"],
   srcs: [
     "apexd.cpp",
+    "apexd_loop.cpp",
     "apexd_prepostinstall.cpp",
     "apexd_private.cpp",
+    "apexd_prop.cpp",
     "apexd_session.cpp"
   ],
   static_libs: [
@@ -185,9 +187,11 @@ cc_test {
   defaults: ["apex_defaults"],
   data: [
     ":apex.apexd_test",
+    ":apex.apexd_test_different_app",
     ":apex.apexd_test_v2",
     ":apex.apexd_test_no_inst_key",
     ":apex.apexd_test_preinstall",
+    ":apex.apexd_test_postinstall",
   ],
   srcs: ["apexservice_test.cpp"],
   host_supported: false,

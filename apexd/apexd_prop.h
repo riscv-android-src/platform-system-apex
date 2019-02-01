@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018 The Android Open Source Project
+ * Copyright (C) 2019 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,26 +14,17 @@
  * limitations under the License.
  */
 
-#ifndef ANDROID_APEXD_APEXD_PREPOSTINSTALL_H_
-#define ANDROID_APEXD_APEXD_PREPOSTINSTALL_H_
+#ifndef ANDROID_APEXD_APEXD_PROP_H_
+#define ANDROID_APEXD_APEXD_PROP_H_
 
-#include <string>
-#include <vector>
-
-#include "status.h"
+#include "status_or.h"
 
 namespace android {
 namespace apex {
 
-class ApexFile;
-
-Status StagePreInstall(const std::vector<ApexFile>& apexes);
-int RunPreInstall(char** argv);
-
-Status StagePostInstall(const std::vector<ApexFile>& apexes);
-int RunPostInstall(char** argv);
+void waitForBootStatus(Status (&rollback_fn)());
 
 }  // namespace apex
 }  // namespace android
 
-#endif  // ANDROID_APEXD_APEXD_PREPOSTINSTALL_H_
+#endif  // ANDROID_APEXD_APEXD_PROP_H

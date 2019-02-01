@@ -184,7 +184,7 @@ class ApexServiceTest : public ::testing::Test {
   }
 
   struct PrepareTestApexForInstall {
-    static constexpr const char* kTestDir = "/data/local/apexservice_tmp";
+    static constexpr const char* kTestDir = "/data/staging/apexservice_tmp";
 
     // This is given to the constructor.
     std::string test_input;  // Original test file.
@@ -318,6 +318,17 @@ class ApexServiceTest : public ::testing::Test {
 
 namespace {
 
+void ExpectSessionsEqual(const ApexSessionInfo& lhs,
+                         const ApexSessionInfo& rhs) {
+  EXPECT_EQ(lhs.sessionId, rhs.sessionId);
+  EXPECT_EQ(lhs.isUnknown, rhs.isUnknown);
+  EXPECT_EQ(lhs.isVerified, rhs.isVerified);
+  EXPECT_EQ(lhs.isStaged, rhs.isStaged);
+  EXPECT_EQ(lhs.isActivated, rhs.isActivated);
+  EXPECT_EQ(lhs.isActivationPendingRetry, rhs.isActivationPendingRetry);
+  EXPECT_EQ(lhs.isActivationFailed, rhs.isActivationFailed);
+}
+
 bool RegularFileExists(const std::string& path) {
   struct stat buf;
   if (0 != stat(path.c_str(), &buf)) {
@@ -400,7 +411,7 @@ TEST_F(ApexServiceTest, StageFailKey) {
 
   constexpr const char* kExpectedError3 =
       "Error verifying "
-      "/data/local/apexservice_tmp/apex.apexd_test_no_inst_key.apex: "
+      "/data/staging/apexservice_tmp/apex.apexd_test_no_inst_key.apex: "
       "couldn't verify public key: Failed to compare the bundled public key "
       "with key";
   const size_t pos3 = error.find(kExpectedError3);
@@ -597,80 +608,75 @@ TEST_F(ApexServiceActivationSuccessTest, GetActivePackage) {
   ASSERT_EQ(installer_->test_installed_file, active->packagePath);
 }
 
-TEST_F(ApexServiceTest, StagePreinstall) {
-  PrepareTestApexForInstall installer(
-      GetTestFile("apex.apexd_test_preinstall.apex"));
-  if (!installer.Prepare()) {
-    return;
-  }
+class ApexServicePrePostInstallTest : public ApexServiceTest {
+ public:
+  template <typename Fn>
+  void RunPrePost(Fn fn, const std::vector<std::string>& apex_names,
+                  const char* test_message) {
+    // Using unique_ptr is just the easiest here.
+    using InstallerUPtr = std::unique_ptr<PrepareTestApexForInstall>;
+    std::vector<InstallerUPtr> installers;
+    std::vector<std::string> pkgs;
 
-  bool success;
-  android::binder::Status st =
-      service_->stagePackage(installer.test_file, &success);
-  ASSERT_TRUE(st.isOk()) << st.toString8().c_str();
-  ASSERT_TRUE(success);
+    for (const std::string& apex_name : apex_names) {
+      InstallerUPtr installer(
+          new PrepareTestApexForInstall(GetTestFile(apex_name)));
+      if (!installer->Prepare()) {
+        return;
+      }
+      pkgs.push_back(installer->test_file);
+      installers.emplace_back(std::move(installer));
+    }
+    android::binder::Status st = (service_.get()->*fn)(pkgs);
+    ASSERT_TRUE(st.isOk()) << st.toString8().c_str();
 
-  std::string logcat = GetLogcat();
-  constexpr const char* kTestMessage = "sh      : PreInstall Test\n";
-  EXPECT_NE(std::string::npos, logcat.find(kTestMessage)) << logcat;
+    std::string logcat = GetLogcat();
+    EXPECT_NE(std::string::npos, logcat.find(test_message)) << logcat;
 
-  // Ensure that the package is neither active nor mounted.
-  {
-    StatusOr<bool> active = IsActive(installer.package, installer.version);
-    ASSERT_TRUE(active.Ok());
-    EXPECT_FALSE(*active);
+    // Ensure that the package is neither active nor mounted.
+    for (const InstallerUPtr& installer : installers) {
+      StatusOr<bool> active = IsActive(installer->package, installer->version);
+      ASSERT_TRUE(active.Ok());
+      EXPECT_FALSE(*active);
+    }
+    for (const InstallerUPtr& installer : installers) {
+      StatusOr<ApexFile> apex = ApexFile::Open(installer->test_input);
+      ASSERT_TRUE(apex.Ok());
+      std::string path =
+          apexd_private::GetPackageMountPoint(apex->GetManifest());
+      std::string entry = std::string("[dir]").append(path);
+      std::vector<std::string> slash_apex = ListDir(kApexRoot);
+      auto it = std::find(slash_apex.begin(), slash_apex.end(), entry);
+      EXPECT_TRUE(it == slash_apex.end()) << Join(slash_apex, ',');
+    }
   }
-  {
-    StatusOr<ApexFile> apex = ApexFile::Open(installer.test_input);
-    ASSERT_TRUE(apex.Ok());
-    std::string path = apexd_private::GetPackageMountPoint(apex->GetManifest());
-    std::string entry = std::string("[dir]").append(path);
-    std::vector<std::string> slash_apex = ListDir(kApexRoot);
-    auto it = std::find(slash_apex.begin(), slash_apex.end(), entry);
-    EXPECT_TRUE(it == slash_apex.end()) << Join(slash_apex, ',');
-  }
+};
+
+TEST_F(ApexServicePrePostInstallTest, Preinstall) {
+  RunPrePost(&IApexService::preinstallPackages,
+             {"apex.apexd_test_preinstall.apex"}, "sh      : PreInstall Test");
 }
 
-TEST_F(ApexServiceTest, MultiStagePreinstall) {
-  PrepareTestApexForInstall installer(
-      GetTestFile("apex.apexd_test_preinstall.apex"));
-  if (!installer.Prepare()) {
-    return;
-  }
-  PrepareTestApexForInstall installer2(GetTestFile("apex.apexd_test.apex"));
-  if (!installer2.Prepare()) {
-    return;
-  }
-
-  std::vector<std::string> pkgs = {
-      installer.test_file,
-      installer2.test_file,
-  };
-  bool success;
-  android::binder::Status st = service_->stagePackages(pkgs, &success);
-  ASSERT_TRUE(st.isOk()) << st.toString8().c_str();
-  ASSERT_TRUE(success);
-
-  std::string logcat = GetLogcat();
-  constexpr const char* kTestMessage =
+TEST_F(ApexServicePrePostInstallTest, MultiPreinstall) {
+  constexpr const char* kLogcatText =
       "sh      : /apex/com.android.apex.test_package/etc/sample_prebuilt_file";
-  EXPECT_NE(std::string::npos, logcat.find(kTestMessage)) << logcat;
+  RunPrePost(&IApexService::preinstallPackages,
+             {"apex.apexd_test_preinstall.apex", "apex.apexd_test.apex"},
+             kLogcatText);
+}
 
-  // Ensure that the package is neither active nor mounted.
-  {
-    StatusOr<bool> active = IsActive(installer.package, installer.version);
-    ASSERT_TRUE(active.Ok());
-    EXPECT_FALSE(*active);
-  }
-  {
-    StatusOr<ApexFile> apex = ApexFile::Open(installer.test_input);
-    ASSERT_TRUE(apex.Ok());
-    std::string path = apexd_private::GetPackageMountPoint(apex->GetManifest());
-    std::string entry = std::string("[dir]").append(path);
-    std::vector<std::string> slash_apex = ListDir(kApexRoot);
-    auto it = std::find(slash_apex.begin(), slash_apex.end(), entry);
-    EXPECT_TRUE(it == slash_apex.end()) << Join(slash_apex, ',');
-  }
+TEST_F(ApexServicePrePostInstallTest, Postinstall) {
+  RunPrePost(&IApexService::postinstallPackages,
+             {"apex.apexd_test_postinstall.apex"},
+             "sh      : PostInstall Test");
+}
+
+TEST_F(ApexServicePrePostInstallTest, MultiPostinstall) {
+  constexpr const char* kLogcatText =
+      "sh      : /apex/com.android.apex.test_package/etc/sample_prebuilt_file";
+  RunPrePost(&IApexService::postinstallPackages,
+             {"apex.apexd_test_postinstall.apex", "apex.apexd_test.apex"},
+             kLogcatText);
 }
 
 TEST_F(ApexServiceTest, SubmitSingleSessionTestSuccess) {
@@ -707,12 +713,60 @@ TEST_F(ApexServiceTest, SubmitSingleSessionTestSuccess) {
   status = service_->getStagedSessionInfo(123, &session);
   ASSERT_TRUE(status.isOk())
       << status.toString8().c_str() << " " << GetDebugStr(&installer);
+  EXPECT_EQ(123, session.sessionId);
+  EXPECT_FALSE(session.isUnknown);
+  EXPECT_TRUE(session.isVerified);
+  EXPECT_FALSE(session.isStaged);
+  EXPECT_FALSE(session.isActivated);
+  EXPECT_FALSE(session.isActivationPendingRetry);
+  EXPECT_FALSE(session.isActivationFailed);
+
+  status = service_->markStagedSessionReady(123, &ret_value);
+  ASSERT_TRUE(status.isOk())
+      << status.toString8().c_str() << " " << GetDebugStr(&installer);
+  ASSERT_TRUE(ret_value);
+
+  status = service_->getStagedSessionInfo(123, &session);
+  ASSERT_TRUE(status.isOk())
+      << status.toString8().c_str() << " " << GetDebugStr(&installer);
+  EXPECT_EQ(123, session.sessionId);
   EXPECT_FALSE(session.isUnknown);
   EXPECT_FALSE(session.isVerified);
   EXPECT_TRUE(session.isStaged);
   EXPECT_FALSE(session.isActivated);
   EXPECT_FALSE(session.isActivationPendingRetry);
   EXPECT_FALSE(session.isActivationFailed);
+
+  // Call markStagedSessionReady again. Should be a no-op.
+  status = service_->markStagedSessionReady(123, &ret_value);
+  ASSERT_TRUE(status.isOk())
+      << status.toString8().c_str() << " " << GetDebugStr(&installer);
+  ASSERT_TRUE(ret_value);
+
+  status = service_->getStagedSessionInfo(123, &session);
+  ASSERT_TRUE(status.isOk())
+      << status.toString8().c_str() << " " << GetDebugStr(&installer);
+  EXPECT_EQ(123, session.sessionId);
+  EXPECT_FALSE(session.isUnknown);
+  EXPECT_FALSE(session.isVerified);
+  EXPECT_TRUE(session.isStaged);
+  EXPECT_FALSE(session.isActivated);
+  EXPECT_FALSE(session.isActivationPendingRetry);
+  EXPECT_FALSE(session.isActivationFailed);
+
+  // See if the session is reported with getSessions() as well
+  std::vector<ApexSessionInfo> sessions;
+  status = service_->getSessions(&sessions);
+  ASSERT_TRUE(status.isOk())
+      << status.toString8().c_str() << " " << GetDebugStr(&installer);
+  // TODO it appears there is some left-over staged state, and we get 2 sessions
+  // here EXPECT_EQ(1u, sessions.size()); So for now, only compare the session
+  // with the same sessionid
+  for (const auto& s : sessions) {
+    if (s.sessionId == session.sessionId) {
+      ExpectSessionsEqual(s, session);
+    }
+  }
 }
 
 TEST_F(ApexServiceTest, SubmitSingleSessionTestFail) {
@@ -737,6 +791,122 @@ TEST_F(ApexServiceTest, SubmitSingleSessionTestFail) {
   status = service_->getStagedSessionInfo(456, &session);
   ASSERT_TRUE(status.isOk())
       << status.toString8().c_str() << " " << GetDebugStr(&installer);
+  EXPECT_EQ(-1, session.sessionId);
+  EXPECT_TRUE(session.isUnknown);
+  EXPECT_FALSE(session.isVerified);
+  EXPECT_FALSE(session.isStaged);
+  EXPECT_FALSE(session.isActivated);
+  EXPECT_FALSE(session.isActivationPendingRetry);
+  EXPECT_FALSE(session.isActivationFailed);
+}
+
+TEST_F(ApexServiceTest, SubmitMultiSessionTestSuccess) {
+  // Parent session id: 10
+  // Children session ids: 20 30
+  PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"),
+                                      "/data/staging/session_20",
+                                      "staging_data_file");
+  PrepareTestApexForInstall installer2(
+      GetTestFile("apex.apexd_test_different_app.apex"),
+      "/data/staging/session_30", "staging_data_file");
+  if (!installer.Prepare() || !installer2.Prepare()) {
+    FAIL() << GetDebugStr(&installer) << GetDebugStr(&installer2);
+  }
+
+  ApexInfoList list;
+  bool ret_value;
+  std::vector<int> child_session_ids = {20, 30};
+  android::binder::Status status =
+      service_->submitStagedSession(10, child_session_ids, &list, &ret_value);
+
+  ASSERT_TRUE(status.isOk())
+      << status.toString8().c_str() << " " << GetDebugStr(&installer);
+  ASSERT_TRUE(ret_value);
+  EXPECT_EQ(2u, list.apexInfos.size());
+  ApexInfo match;
+  bool package1_found = false;
+  bool package2_found = false;
+  for (ApexInfo info : list.apexInfos) {
+    if (info.packageName == installer.package) {
+      ASSERT_EQ(installer.package, info.packageName);
+      ASSERT_EQ(installer.version, static_cast<uint64_t>(info.versionCode));
+      ASSERT_EQ(installer.test_file, info.packagePath);
+      package1_found = true;
+    } else if (info.packageName == installer2.package) {
+      ASSERT_EQ(installer2.package, info.packageName);
+      ASSERT_EQ(installer2.version, static_cast<uint64_t>(info.versionCode));
+      ASSERT_EQ(installer2.test_file, info.packagePath);
+      package2_found = true;
+    } else {
+      FAIL() << "Unexpected package found " << info.packageName
+             << GetDebugStr(&installer) << GetDebugStr(&installer2);
+    }
+  }
+  ASSERT_TRUE(package1_found);
+  ASSERT_TRUE(package2_found);
+
+  ApexSessionInfo session;
+  status = service_->getStagedSessionInfo(10, &session);
+  ASSERT_TRUE(status.isOk())
+      << status.toString8().c_str() << " " << GetDebugStr(&installer);
+  EXPECT_EQ(10, session.sessionId);
+  EXPECT_FALSE(session.isUnknown);
+  EXPECT_TRUE(session.isVerified);
+  EXPECT_FALSE(session.isStaged);
+  EXPECT_FALSE(session.isActivated);
+  EXPECT_FALSE(session.isActivationPendingRetry);
+  EXPECT_FALSE(session.isActivationFailed);
+
+  status = service_->markStagedSessionReady(10, &ret_value);
+  ASSERT_TRUE(status.isOk())
+      << status.toString8().c_str() << " " << GetDebugStr(&installer);
+  ASSERT_TRUE(ret_value);
+
+  status = service_->getStagedSessionInfo(10, &session);
+  ASSERT_TRUE(status.isOk())
+      << status.toString8().c_str() << " " << GetDebugStr(&installer);
+  EXPECT_FALSE(session.isUnknown);
+  EXPECT_FALSE(session.isVerified);
+  EXPECT_TRUE(session.isStaged);
+  EXPECT_FALSE(session.isActivated);
+  EXPECT_FALSE(session.isActivationPendingRetry);
+  EXPECT_FALSE(session.isActivationFailed);
+}
+
+TEST_F(ApexServiceTest, SubmitMultiSessionTestFail) {
+  // Parent session id: 11
+  // Children session ids: 21 31
+  PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"),
+                                      "/data/staging/session_21",
+                                      "staging_data_file");
+  PrepareTestApexForInstall installer2(
+      GetTestFile("apex.apexd_test_no_inst_key.apex"),
+      "/data/staging/session_31", "staging_data_file");
+  if (!installer.Prepare() || !installer2.Prepare()) {
+    FAIL() << GetDebugStr(&installer) << GetDebugStr(&installer2);
+  }
+  ApexInfoList list;
+  bool ret_value;
+  std::vector<int> child_session_ids = {21, 31};
+  android::binder::Status status =
+      service_->submitStagedSession(11, child_session_ids, &list, &ret_value);
+
+  ASSERT_TRUE(status.isOk())
+      << status.toString8().c_str() << " " << GetDebugStr(&installer);
+  ASSERT_FALSE(ret_value);
+}
+
+TEST_F(ApexServiceTest, MarkStagedSessionReadyFail) {
+  // We should fail if we ask information about a session we don't know.
+  bool ret_value;
+  auto status = service_->markStagedSessionReady(666, &ret_value);
+  ASSERT_TRUE(status.isOk()) << status.toString8().c_str();
+  ASSERT_FALSE(ret_value);
+
+  ApexSessionInfo session;
+  status = service_->getStagedSessionInfo(666, &session);
+  ASSERT_TRUE(status.isOk()) << status.toString8().c_str();
+  EXPECT_EQ(-1, session.sessionId);
   EXPECT_TRUE(session.isUnknown);
   EXPECT_FALSE(session.isVerified);
   EXPECT_FALSE(session.isStaged);

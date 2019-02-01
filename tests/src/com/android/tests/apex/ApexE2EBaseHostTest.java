@@ -20,11 +20,14 @@ import com.android.tradefed.build.BuildInfoKey.BuildInfoFileKey;
 import com.android.tradefed.config.Option;
 import com.android.tradefed.config.Option.Importance;
 import com.android.tradefed.device.DeviceNotAvailableException;
+import com.android.tradefed.device.ITestDevice.ApexInfo;
 import com.android.tradefed.log.LogUtil.CLog;
 import com.android.tradefed.testtype.junit4.BaseHostJUnit4Test;
 import com.android.tradefed.util.CommandResult;
 import com.android.tradefed.util.CommandStatus;
 import com.android.tradefed.util.FileUtil;
+import com.android.tradefed.util.IRunUtil;
+import com.android.tradefed.util.RunUtil;
 import com.android.tradefed.util.SystemUtil.EnvVariable;
 
 import org.junit.After;
@@ -33,6 +36,7 @@ import org.junit.Before;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -42,36 +46,38 @@ import java.util.regex.Pattern;
 public abstract class ApexE2EBaseHostTest extends BaseHostJUnit4Test {
     private static final String APEX_DATA_DIR = "/data/apex";
     private static final String STAGING_DATA_DIR = "/data/staging";
-    private static final String OPTION_APEX_PACKAGE_NAME = "apex_package_name";
     private static final String OPTION_APEX_FILE_NAME = "apex_file_name";
-
-    private boolean mAdbWasRoot;
-
-    @Option(name = OPTION_APEX_PACKAGE_NAME,
-            description = "The package name of the apex module. Specified in manifest.json.",
-            importance = Importance.IF_UNSET
-    )
-    private String mApexPackageName = null;
+    private static final String OPTION_BROADCASTAPP_APK_NAME = "broadcastapp_apk_name";
+    private static final String APEX_INFO_EXTRACT_REGEX =
+            ".*package:\\sname='(\\S+)\\'\\sversionCode='(\\d+)'\\s.*";
+    private final Pattern mAppPackageNamePattern =
+            Pattern.compile("appPackageName = com\\.android\\.apex\\.test;");
+    private final Pattern mIsSessionReadyPattern = Pattern.compile("isSessionReady = true");
+    private final Pattern mIsSessionAppliedPattern = Pattern.compile("isSessionApplied = true;");
+    private final Pattern mSessionBroadcastReceiver =
+            Pattern.compile("BroadcastReceiver: Action: android.content.pm.action.SESSION_UPDATED");
 
     @Option(name = OPTION_APEX_FILE_NAME,
             description = "The file name of the apex module.",
-            importance = Importance.IF_UNSET
+            importance = Importance.IF_UNSET,
+            mandatory = true
     )
     private String mApexFileName = null;
 
+    @Option(name = OPTION_BROADCASTAPP_APK_NAME,
+            description = "The APK file name of the BroadcastReceiver app.",
+            importance = Importance.IF_UNSET,
+            mandatory = true
+    )
+    private String mBroadcastAppApkName = null;
+
+    private IRunUtil mRunUtil = new RunUtil();
+
     @Before
     public synchronized void setUp() throws Exception {
-        if (mApexPackageName == null) {
-            throw new IllegalArgumentException(String.format("Missing required option %s",
-                OPTION_APEX_PACKAGE_NAME));
-        }
-        if (mApexFileName == null) {
-            throw new IllegalArgumentException(String.format("Missing required option %s",
-                OPTION_APEX_FILE_NAME));
-        }
         getDevice().executeShellV2Command("rm -rf " + APEX_DATA_DIR + "/*");
         getDevice().executeShellV2Command("rm -rf " + STAGING_DATA_DIR + "/*");
-        mAdbWasRoot = getDevice().isAdbRoot();
+        getDevice().reboot(); // for the above commands to take affect
     }
 
     /**
@@ -80,67 +86,101 @@ public abstract class ApexE2EBaseHostTest extends BaseHostJUnit4Test {
     public void doTestStageActivateUninstallApexPackage()
                                 throws DeviceNotAvailableException, IOException {
 
-        // Test staging APEX module (currently we simply install a sample apk).
-        // TODO: change sample apk to test APEX package and do install using adb.
-        File testAppFile = getTestApex();
+        File testAppFile = getTestFile(mApexFileName);
         CLog.i("Found test apex file: " + testAppFile.getAbsoluteFile());
 
-        String installResult = getDevice().installPackage(testAppFile, false);
+        // Install broadcast receiver app
+        String installResult = getDevice().installPackage(
+                getTestFile(mBroadcastAppApkName), false);
+        Assert.assertNull(
+                String.format("failed to install test app %s. Reason: %s",
+                    mBroadcastAppApkName, installResult),
+                installResult);
+        // Make MainActivity foreground service
+        getDevice().executeShellV2Command(
+                "am start -n android.apex.broadcastreceiver/.MainActivity");
+
+        // Assert that there are no session updates to begin with
+        CommandResult result = getDevice().executeShellV2Command("logcat -d");
+        Matcher matcher = mSessionBroadcastReceiver.matcher(result.getStdout());
+        Assert.assertFalse(matcher.find());
+
+        // Install apex package
+        installResult = getDevice().installPackage(testAppFile, false);
         Assert.assertNull(
                 String.format("failed to install test app %s. Reason: %s",
                     mApexFileName, installResult),
                 installResult);
 
-        // TODO: ensure that APEX is staged.
-
-        // Reboot to actually activate the staged APEX.
-        getDevice().nonBlockingReboot();
-        getDevice().waitForDeviceAvailable();
-
-        // Disable SELinux to directly talk to apexservice.
-        // TODO: Remove this by using Package Manager APIs instead.
-        final boolean adbWasRoot = getDevice().isAdbRoot();
-        if (!adbWasRoot) {
-            Assert.assertTrue(getDevice().enableAdbRoot());
-        }
-        CommandResult result = getDevice().executeShellV2Command("getenforce");
-        final boolean selinuxWasEnforcing = result.getStdout().contains("Enforcing");
-        if (selinuxWasEnforcing) {
-            result = getDevice().executeShellV2Command("setenforce 0");
-            Assert.assertEquals(CommandStatus.SUCCESS, result.getStatus());
+        try {
+            Thread.sleep(10000);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
         }
 
-        // Check that the APEX is actually activated
-        result = getDevice().executeShellV2Command("cmd apexservice getActivePackages");
-        Assert.assertEquals(CommandStatus.SUCCESS, result.getStatus());
-        String[] lines = result.getStdout().split("\n");
-        Pattern p = Pattern.compile("Package:\\ ([\\S]+)\\ Version:\\ ([\\d]+) Path:\\ ([\\S]+)");
-        boolean found = false;
-        for (String l : lines) {
-            Matcher m = p.matcher(l);
-            Assert.assertTrue("Output line:: " + l, m.matches());
-            String name = m.group(1);
-            if (name.equals(mApexPackageName)) {
-                found = true;
-                break;
-            }
-        }
+        ApexInfo testApexInfo = getApexInfo(testAppFile);
+        Assert.assertNotNull(testApexInfo);
+
+        // Assert isSessionReady is true
+        result = getDevice().executeShellV2Command("pm get-stagedsessions");
+        Assert.assertEquals("", result.getStderr());
+        matcher = mAppPackageNamePattern.matcher(result.getStdout());
+        // TODO: Look into why appPackageInfo is null
+        // Assert.assertTrue(matcher.find());
+        matcher = mIsSessionReadyPattern.matcher(result.getStdout());
+        Assert.assertTrue(matcher.find());
+
+        // Assert session update broadcast was sent to apps listening to it.
+        result = getDevice().executeShellV2Command("logcat -d");
+        matcher = mSessionBroadcastReceiver.matcher(result.getStdout());
+        Assert.assertTrue(matcher.find());
+        matcher = mIsSessionReadyPattern.matcher(result.getStdout());
+        Assert.assertTrue(matcher.find());
+
+        getDevice().reboot();
+
+        // This checks that the staged package was activated on reboot
+        result = getDevice().executeShellV2Command("pm get-stagedsessions");
+        Assert.assertEquals("", result.getStderr());
+        matcher = mIsSessionAppliedPattern.matcher(result.getStdout());
+        Assert.assertTrue(matcher.find());
+
+        Set<ApexInfo> activatedApexes = getDevice().getActiveApexes();
         Assert.assertTrue(
-                String.format("Cannot find package %s in the active packages\n%s",
-                    mApexPackageName, result.getStdout()),
-                found);
+                String.format("Failed to activate %s %s",
+                    testApexInfo.name, testApexInfo.versionCode),
+                activatedApexes.contains(testApexInfo));
 
         additionalCheck();
+    }
 
-        // Enable SELinux back on
-        // TODO: don't change SElinux enforcement at all
-        if (selinuxWasEnforcing) {
-            result = getDevice().executeShellV2Command("setenforce 1");
-            Assert.assertEquals(CommandStatus.SUCCESS, result.getStatus());
+    /*
+     * Retrieve package name and version code from test apex file.
+     */
+    private ApexInfo getApexInfo(File apex) {
+        String aaptOutput = runCmd(String.format(
+                "aapt dump badging %s", apex.getAbsolutePath()));
+        String[] lines = aaptOutput.split("\n");
+        Pattern p = Pattern.compile(APEX_INFO_EXTRACT_REGEX);
+        for (String l : lines) {
+            Matcher m = p.matcher(l);
+            if (m.matches()) {
+                ApexInfo apexInfo = new ApexInfo(m.group(1), Long.parseLong(m.group(2)));
+                return apexInfo;
+            }
         }
-        if (!adbWasRoot) {
-            Assert.assertTrue(getDevice().disableAdbRoot());
-        }
+        return null;
+    }
+
+    private String runCmd(String cmd) {
+        CLog.d("About to run command: %s", cmd);
+        CommandResult result = mRunUtil.runTimedCmd(1000 * 60 * 5, cmd.split("\\s+"));
+        Assert.assertNotNull(result);
+        Assert.assertTrue(
+                String.format("Command %s failed", cmd),
+                result.getStatus().equals(CommandStatus.SUCCESS));
+        CLog.v("output:\n%s", result.getStdout());
+        return result.getStdout();
     }
 
     /**
@@ -149,44 +189,44 @@ public abstract class ApexE2EBaseHostTest extends BaseHostJUnit4Test {
     public abstract void additionalCheck();
 
     /**
-     * Helper method to get the test apex.
+     * Helper method to get the test file.
      */
-    private File getTestApex() throws IOException {
-        File apexFile = null;
+    private File getTestFile(String testFileName) throws IOException {
+        File testFile = null;
 
         String testcasesPath = System.getenv(EnvVariable.ANDROID_HOST_OUT_TESTCASES.toString());
         if (testcasesPath != null) {
-            apexFile = searchApexFile(new File(testcasesPath), mApexFileName);
+            testFile = searchTestFile(new File(testcasesPath), testFileName);
         }
-        if (apexFile != null) {
-            return apexFile;
+        if (testFile != null) {
+            return testFile;
         }
 
         File hostLinkedDir = getBuild().getFile(BuildInfoFileKey.HOST_LINKED_DIR);
         if (hostLinkedDir != null) {
-            apexFile = searchApexFile(hostLinkedDir, mApexFileName);
+            testFile = searchTestFile(hostLinkedDir, testFileName);
         }
-        if (apexFile != null) {
-            return apexFile;
+        if (testFile != null) {
+            return testFile;
         }
 
-        // Find the apex file in the buildinfo.
-        File tzdataFile = getBuild().getFile(mApexFileName);
+        // Find the file in the buildinfo.
+        File tzdataFile = getBuild().getFile(testFileName);
         if (tzdataFile != null) {
             return tzdataFile;
         }
 
-        throw new IOException("Cannot find " + mApexFileName);
+        throw new IOException("Cannot find " + testFileName);
     }
 
     /**
      * Searches the file with the given name under the given directory, returns null if not found.
      */
-    private File searchApexFile(File baseSearchFile, String apexFileName) {
+    private File searchTestFile(File baseSearchFile, String testFileName) {
         if (baseSearchFile != null && baseSearchFile.isDirectory()) {
-            File apexFile = FileUtil.findFile(baseSearchFile, apexFileName);
-            if (apexFile != null && apexFile.isFile()) {
-                return apexFile;
+            File testFile = FileUtil.findFile(baseSearchFile, testFileName);
+            if (testFile != null && testFile.isFile()) {
+                return testFile;
             }
         }
         return null;
@@ -194,12 +234,8 @@ public abstract class ApexE2EBaseHostTest extends BaseHostJUnit4Test {
 
     @After
     public void tearDown() throws DeviceNotAvailableException {
-        Assert.assertTrue(getDevice().enableAdbRoot());
         getDevice().executeShellV2Command("rm -rf " + APEX_DATA_DIR + "/*");
         getDevice().executeShellV2Command("rm -rf " + STAGING_DATA_DIR + "/*");
-        if (!mAdbWasRoot) {
-            Assert.assertTrue(getDevice().disableAdbRoot());
-        }
         getDevice().reboot();
     }
 }

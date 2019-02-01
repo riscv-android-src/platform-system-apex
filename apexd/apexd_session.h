@@ -17,6 +17,7 @@
 #ifndef ANDROID_APEXD_APEXD_SESSION_H_
 #define ANDROID_APEXD_APEXD_SESSION_H_
 
+#include "apexd.h"
 #include "status_or.h"
 
 #include "session_state.pb.h"
@@ -24,9 +25,30 @@
 namespace android {
 namespace apex {
 
-StatusOr<::apex::proto::SessionState> readSessionState(const int session_id);
-Status writeSessionState(const int session_id,
-                         ::apex::proto::SessionState state);
+static const std::string kApexSessionsDir =
+    std::string(kApexPackageDataDir) + "/sessions";
+
+class ApexSession {
+ public:
+  static StatusOr<ApexSession> CreateSession(int session_id);
+  static StatusOr<ApexSession> GetSession(int session_id);
+  static std::vector<ApexSession> GetSessions();
+  static std::vector<ApexSession> GetSessionsInState(
+      ::apex::proto::SessionState::State state);
+  ApexSession() = delete;
+
+  const google::protobuf::RepeatedField<int> GetChildSessionIds() const;
+  ::apex::proto::SessionState::State GetState() const;
+  int GetId() const;
+
+  void SetChildSessionIds(const std::vector<int>& child_session_ids);
+  Status UpdateStateAndCommit(::apex::proto::SessionState::State state);
+
+ private:
+  ApexSession(int id, ::apex::proto::SessionState state);
+  int id_;
+  ::apex::proto::SessionState state_;
+};
 
 }  // namespace apex
 }  // namespace android
