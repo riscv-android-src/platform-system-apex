@@ -26,7 +26,7 @@ namespace android {
 namespace apex {
 
 static const std::string kApexSessionsDir =
-    std::string(kApexPackageDataDir) + "/sessions";
+    std::string(kApexDataDir) + "/sessions";
 
 class ApexSession {
  public:
@@ -45,7 +45,7 @@ class ApexSession {
   Status UpdateStateAndCommit(::apex::proto::SessionState::State state);
 
  private:
-  ApexSession(int id, ::apex::proto::SessionState state);
+  ApexSession(int id, const ::apex::proto::SessionState& state);
   int id_;
   ::apex::proto::SessionState state_;
 };
