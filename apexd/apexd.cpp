@@ -282,7 +282,7 @@ Status VerifyMountedImage(const ApexFile& apex,
     return status;
   }
   if (shim::IsShimApex(apex)) {
-    return shim::ValidateShimApex(apex);
+    return shim::ValidateShimApex(mount_point, apex);
   }
   return Status::Success();
 }
@@ -349,7 +349,7 @@ StatusOr<MountedApexData> mountNonFlattened(const ApexFile& apex,
   int last_errno = 0;
   for (size_t count = 0; count < kMountAttempts; ++count) {
     if (mount(blockDevice.c_str(), mountPoint.c_str(), "ext4",
-              MS_NOATIME | MS_NODEV | MS_DIRSYNC | MS_RDONLY, NULL) == 0) {
+              MS_NOATIME | MS_NODEV | MS_DIRSYNC | MS_RDONLY, nullptr) == 0) {
       LOG(INFO) << "Successfully mounted package " << full_path << " on "
                 << mountPoint;
       auto status = VerifyMountedImage(apex, mountPoint);
@@ -950,22 +950,8 @@ Status resumeRollbackIfNeeded() {
   return Status::Success();
 }
 
-Status activatePackage(const std::string& full_path) {
-  LOG(INFO) << "Trying to activate " << full_path;
-
-  StatusOr<ApexFile> apexFile = ApexFile::Open(full_path);
-  if (!apexFile.Ok()) {
-    return apexFile.ErrorStatus();
-  }
-
-  if (shim::IsShimApex(*apexFile)) {
-    auto validate_status = shim::ValidateShimApex(*apexFile);
-    if (!validate_status.Ok()) {
-      return validate_status;
-    }
-  }
-
-  const ApexManifest& manifest = apexFile->GetManifest();
+Status activatePackageImpl(const ApexFile& apex_file) {
+  const ApexManifest& manifest = apex_file.GetManifest();
 
   if (gBootstrap && std::find(kBootstrapApexes.begin(), kBootstrapApexes.end(),
                               manifest.name()) == kBootstrapApexes.end()) {
@@ -1006,10 +992,10 @@ Status activatePackage(const std::string& full_path) {
     }
   }
 
-  std::string mountPoint = apexd_private::GetPackageMountPoint(manifest);
+  const std::string& mountPoint = apexd_private::GetPackageMountPoint(manifest);
 
   if (!version_found_mounted) {
-    Status mountStatus = apexd_private::MountPackage(*apexFile, mountPoint);
+    Status mountStatus = apexd_private::MountPackage(apex_file, mountPoint);
     if (!mountStatus.Ok()) {
       return mountStatus;
     }
@@ -1017,7 +1003,7 @@ Status activatePackage(const std::string& full_path) {
 
   bool mounted_latest = false;
   if (is_newest_version) {
-    Status update_st = apexd_private::BindMount(
+    const Status& update_st = apexd_private::BindMount(
         apexd_private::GetActiveMountPoint(manifest), mountPoint);
     mounted_latest = update_st.Ok();
     if (!update_st.Ok()) {
@@ -1028,13 +1014,23 @@ Status activatePackage(const std::string& full_path) {
     }
   }
   if (mounted_latest) {
-    gMountedApexes.SetLatest(manifest.name(), full_path);
+    gMountedApexes.SetLatest(manifest.name(), apex_file.GetPath());
   }
 
-  LOG(DEBUG) << "Successfully activated " << full_path
+  LOG(DEBUG) << "Successfully activated " << apex_file.GetPath()
              << " package_name: " << manifest.name()
              << " version: " << manifest.version();
   return Status::Success();
+}
+
+Status activatePackage(const std::string& full_path) {
+  LOG(INFO) << "Trying to activate " << full_path;
+
+  StatusOr<ApexFile> apex_file = ApexFile::Open(full_path);
+  if (!apex_file.Ok()) {
+    return apex_file.ErrorStatus();
+  }
+  return activatePackageImpl(*apex_file);
 }
 
 Status deactivatePackage(const std::string& full_path) {
@@ -1066,6 +1062,19 @@ std::vector<ApexFile> getActivePackages() {
 
   return ret;
 }
+
+namespace {
+std::unordered_map<std::string, uint64_t> GetActivePackagesMap() {
+  std::vector<ApexFile> active_packages = getActivePackages();
+  std::unordered_map<std::string, uint64_t> ret;
+  for (const auto& package : active_packages) {
+    const ApexManifest& manifest = package.GetManifest();
+    ret.insert({manifest.name(), manifest.version()});
+  }
+  return ret;
+}
+
+}  // namespace
 
 StatusOr<ApexFile> getActivePackage(const std::string& packageName) {
   std::vector<ApexFile> packages = getActivePackages();
@@ -1159,11 +1168,31 @@ Status scanPackagesDirAndActivate(const char* apex_package_dir) {
                                     << " : " << scan.ErrorMessage());
   }
 
+  const auto& packages_with_code = GetActivePackagesMap();
+
   std::vector<std::string> failed_pkgs;
   for (const std::string& name : *scan) {
     LOG(INFO) << "Found " << name;
 
-    Status res = activatePackage(name);
+    StatusOr<ApexFile> apex_file = ApexFile::Open(name);
+    if (!apex_file.Ok()) {
+      LOG(ERROR) << "Failed to activate " << name << " : "
+                 << apex_file.ErrorMessage();
+      failed_pkgs.push_back(name);
+      continue;
+    }
+
+    uint64_t new_version =
+        static_cast<uint64_t>(apex_file->GetManifest().version());
+    const auto& it = packages_with_code.find(apex_file->GetManifest().name());
+    if (it != packages_with_code.end() && it->second >= new_version) {
+      LOG(INFO) << "Skipping activation of " << name
+                << " same package with higher version " << it->second
+                << " is already active";
+      continue;
+    }
+
+    Status res = activatePackageImpl(*apex_file);
     if (!res.Ok()) {
       LOG(ERROR) << "Failed to activate " << name << " : "
                  << res.ErrorMessage();
@@ -1285,12 +1314,7 @@ std::string StageDestPath(const ApexFile& apex_file) {
 
 std::vector<std::string> FilterUnnecessaryStagingPaths(
     const std::vector<std::string>& tmp_paths) {
-  std::vector<ApexFile> active_packages = getActivePackages();
-  std::unordered_map<std::string, uint64_t> packages_with_code;
-  for (const auto& package : active_packages) {
-    const ApexManifest& manifest = package.GetManifest();
-    packages_with_code.insert({manifest.name(), manifest.version()});
-  }
+  const auto& packages_with_code = GetActivePackagesMap();
 
   auto filter_fn = [&packages_with_code](const std::string& path) {
     auto apex_file = ApexFile::Open(path);

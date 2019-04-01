@@ -127,7 +127,7 @@ class ApexServiceTest : public ::testing::Test {
       }
       return StatusOr<bool>(false);
     }
-    return StatusOr<bool>::MakeError(status.toString8().c_str());
+    return StatusOr<bool>::MakeError(status.exceptionMessage().c_str());
   }
 
   StatusOr<std::vector<ApexInfo>> GetActivePackages() {
@@ -138,7 +138,7 @@ class ApexServiceTest : public ::testing::Test {
     }
 
     return StatusOr<std::vector<ApexInfo>>::MakeError(
-        status.toString8().c_str());
+        status.exceptionMessage().c_str());
   }
 
   StatusOr<ApexInfo> GetActivePackage(const std::string& name) {
@@ -148,7 +148,7 @@ class ApexServiceTest : public ::testing::Test {
       return StatusOr<ApexInfo>(package);
     }
 
-    return StatusOr<ApexInfo>::MakeError(status.toString8().c_str());
+    return StatusOr<ApexInfo>::MakeError(status.exceptionMessage().c_str());
   }
 
   std::vector<std::string> GetActivePackagesStrings() {
@@ -170,30 +170,29 @@ class ApexServiceTest : public ::testing::Test {
 
   static std::vector<std::string> ListDir(const std::string& path) {
     std::vector<std::string> ret;
-    auto d =
-        std::unique_ptr<DIR, int (*)(DIR*)>(opendir(path.c_str()), closedir);
-    if (d == nullptr) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_directory(path, ec)) {
       return ret;
     }
 
-    struct dirent* dp;
-    while ((dp = readdir(d.get())) != nullptr) {
+    for (const auto& entry : fs::directory_iterator(path)) {
       std::string tmp;
-      switch (dp->d_type) {
-        case DT_DIR:
+      switch (entry.symlink_status(ec).type()) {
+        case fs::file_type::directory:
           tmp = "[dir]";
           break;
-        case DT_LNK:
+        case fs::file_type::symlink:
           tmp = "[lnk]";
           break;
-        case DT_REG:
+        case fs::file_type::regular:
           tmp = "[reg]";
           break;
         default:
           tmp = "[other]";
           break;
       }
-      tmp = tmp.append(dp->d_name);
+      tmp = tmp.append(entry.path().filename().string());
       ret.push_back(tmp);
     }
     std::sort(ret.begin(), ret.end());
@@ -424,7 +423,7 @@ TEST_F(ApexServiceTest, StageFailAccess) {
   bool success;
   android::binder::Status st = service_->stagePackage(test_file, &success);
   ASSERT_FALSE(IsOk(st));
-  std::string error = st.toString8().c_str();
+  std::string error = st.exceptionMessage().c_str();
   EXPECT_NE(std::string::npos, error.find("Failed to open package")) << error;
   EXPECT_NE(std::string::npos, error.find("I/O error")) << error;
 }
@@ -444,7 +443,7 @@ TEST_F(ApexServiceTest, StageFailKey) {
   ASSERT_FALSE(IsOk(st));
 
   // May contain one of two errors.
-  std::string error = st.toString8().c_str();
+  std::string error = st.exceptionMessage().c_str();
 
   constexpr const char* kExpectedError1 = "Failed to get realpath of ";
   const size_t pos1 = error.find(kExpectedError1);
@@ -671,7 +670,7 @@ TEST_F(ApexServiceActivationManifestMismatchFailure,
   android::binder::Status st = service_->activatePackage(installer_->test_file);
   ASSERT_FALSE(IsOk(st));
 
-  std::string error = st.toString8().c_str();
+  std::string error = st.exceptionMessage().c_str();
   ASSERT_THAT(
       error,
       HasSubstr(
@@ -704,20 +703,18 @@ TEST_F(ApexServiceActivationSuccessTest, Activate) {
     // Collect direct entries of a folder.
     auto collect_entries_fn = [](const std::string& path) {
       std::vector<std::string> ret;
+      std::error_code ec;
+      namespace fs = std::filesystem;
       // Check that there is something in there.
-      auto d =
-          std::unique_ptr<DIR, int (*)(DIR*)>(opendir(path.c_str()), closedir);
-      if (d == nullptr) {
+      if (!fs::is_directory(path, ec)) {
         return ret;
       }
 
-      struct dirent* dp;
-      while ((dp = readdir(d.get())) != nullptr) {
-        if (dp->d_type != DT_DIR || (strcmp(dp->d_name, ".") == 0) ||
-            (strcmp(dp->d_name, "..") == 0)) {
+      for (const auto& entry : fs::directory_iterator(path)) {
+        if (!entry.is_directory()) {
           continue;
         }
-        ret.emplace_back(dp->d_name);
+        ret.emplace_back(entry.path().filename().string());
       }
       std::sort(ret.begin(), ret.end());
       return ret;
@@ -1783,19 +1780,26 @@ class ApexShimUpdateTest : public ApexServiceTest {
  protected:
   std::unique_ptr<PrepareTestApexForInstall> system_shim_;
 
-  void SetUp() override {
-    ApexServiceTest::SetUp();
-
-    // TODO: instead verify shim apex is pre-installed.
-    system_shim_ = std::make_unique<PrepareTestApexForInstall>(
-        GetTestFile("com.android.apex.cts.shim.v1.apex"));
+  void Activate(const std::string& test_file) {
+    if (system_shim_) {
+      // Deactivate previously active shim.
+      ASSERT_TRUE(IsOk(service_->deactivatePackage(system_shim_->test_file)));
+    }
+    system_shim_ = std::make_unique<PrepareTestApexForInstall>(test_file);
     if (!system_shim_->Prepare()) {
       FAIL() << GetDebugStr(system_shim_.get());
     }
     // Putting system version into /data/apex/active won't work, because staging
     // of a newer version will delete previous one from /data/apex/active,
-    // resulting in test not being to deactivate it on tear down.
+    // resulting in test not being able to deactivate it on tear down.
     ASSERT_TRUE(IsOk(service_->activatePackage(system_shim_->test_file)));
+  }
+
+  void SetUp() override {
+    ApexServiceTest::SetUp();
+
+    // TODO: instead verify shim apex is pre-installed.
+    Activate(GetTestFile("com.android.apex.cts.shim.v1.apex"));
   }
 
   void TearDown() override {
@@ -1827,6 +1831,96 @@ TEST_F(ApexShimUpdateTest, UpdateToV2FailureWrongSHA512) {
 
   bool success;
   ASSERT_FALSE(IsOk(service_->stagePackage(installer.test_file, &success)));
+}
+
+TEST_F(ApexShimUpdateTest, UpdateToV2FailureHasPreInstallHook) {
+  Activate(GetTestFile(
+      "com.android.apex.cts.shim.v1_updates_to_v2_with_pre_install_hook.apex"));
+  PrepareTestApexForInstall installer(
+      GetTestFile("com.android.apex.cts.shim.v2_with_pre_install_hook.apex"));
+
+  if (!installer.Prepare()) {
+    FAIL() << GetDebugStr(&installer);
+  }
+
+  bool success;
+  const auto& status = service_->stagePackage(installer.test_file, &success);
+  ASSERT_FALSE(IsOk(status));
+  const std::string& error_message =
+      std::string(status.exceptionMessage().c_str());
+  ASSERT_THAT(
+      error_message,
+      HasSubstr("Shim apex is not allowed to have pre or post install hooks"));
+}
+
+TEST_F(ApexShimUpdateTest, UpdateToV2FailureHasPostInstallHook) {
+  Activate(
+      GetTestFile("com.android.apex.cts.shim.v1_updates_to_v2_with_post_"
+                  "install_hook.apex"));
+  PrepareTestApexForInstall installer(
+      GetTestFile("com.android.apex.cts.shim.v2_with_post_install_hook.apex"));
+
+  if (!installer.Prepare()) {
+    FAIL() << GetDebugStr(&installer);
+  }
+
+  bool success;
+  const auto& status = service_->stagePackage(installer.test_file, &success);
+  ASSERT_FALSE(IsOk(status));
+  const std::string& error_message =
+      std::string(status.exceptionMessage().c_str());
+  ASSERT_THAT(
+      error_message,
+      HasSubstr("Shim apex is not allowed to have pre or post install hooks"));
+}
+
+TEST_F(ApexServiceTest, ApexShimActivationFailureAdditionalFile) {
+  PrepareTestApexForInstall installer(
+      GetTestFile("com.android.apex.cts.shim.v2_additional_file.apex"));
+  if (!installer.Prepare()) {
+    FAIL() << GetDebugStr(&installer);
+  }
+  auto cleanup_fn = [&]() {
+    const auto& status = service_->deactivatePackage(installer.test_file);
+    if (!status.isOk()) {
+      LOG(WARNING) << "Failed to deactivate " << installer.test_file << " : "
+                   << status.exceptionMessage().c_str();
+    }
+  };
+  cleanup_fn();
+  auto scope_guard = android::base::make_scope_guard(cleanup_fn);
+  const auto& status = service_->activatePackage(installer.test_file);
+  ASSERT_FALSE(IsOk(status));
+  const std::string& error_message =
+      std::string(status.exceptionMessage().c_str());
+  ASSERT_THAT(
+      error_message,
+      HasSubstr("Illegal file "
+                "\"/apex/com.android.apex.cts.shim@2/etc/additional_file\""));
+}
+
+TEST_F(ApexServiceTest, ApexShimActivationFailureAdditionalFolder) {
+  PrepareTestApexForInstall installer(
+      GetTestFile("com.android.apex.cts.shim.v2_additional_folder.apex"));
+  if (!installer.Prepare()) {
+    FAIL() << GetDebugStr(&installer);
+  }
+  auto cleanup_fn = [&]() {
+    const auto& status = service_->deactivatePackage(installer.test_file);
+    if (!status.isOk()) {
+      LOG(WARNING) << "Failed to deactivate " << installer.test_file << " : "
+                   << status.exceptionMessage().c_str();
+    }
+  };
+  cleanup_fn();
+  auto scope_guard = android::base::make_scope_guard(cleanup_fn);
+  const auto& status = service_->activatePackage(installer.test_file);
+  ASSERT_FALSE(IsOk(status));
+  const std::string& error_message =
+      std::string(status.exceptionMessage().c_str());
+  ASSERT_THAT(error_message,
+              HasSubstr("\"/apex/com.android.apex.cts.shim@2/etc/"
+                        "additional_folder\" is not a file"));
 }
 
 class LogTestToLogcat : public ::testing::EmptyTestEventListener {
