@@ -45,6 +45,7 @@
 #include <android/apex/ApexInfo.h>
 #include <android/apex/IApexService.h>
 
+#include "apex_constants.h"
 #include "apex_file.h"
 #include "apex_manifest.h"
 #include "apexd_private.h"
@@ -1944,6 +1945,18 @@ TEST_F(ApexServiceTest, ApexShimActivationFailureAdditionalFolder) {
   ASSERT_THAT(error_message,
               HasSubstr("\"/apex/com.android.apex.cts.shim@2/etc/"
                         "additional_folder\" is not a file"));
+}
+
+TEST_F(ApexServiceTest, StageCorruptApexFails) {
+  PrepareTestApexForInstall installer(
+      GetTestFile("apex.apexd_test_corrupt_apex.apex"));
+
+  if (!installer.Prepare()) {
+    FAIL() << GetDebugStr(&installer);
+  }
+
+  bool success;
+  ASSERT_FALSE(IsOk(service_->stagePackage(installer.test_file, &success)));
 }
 
 class LogTestToLogcat : public ::testing::EmptyTestEventListener {
