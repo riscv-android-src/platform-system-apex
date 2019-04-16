@@ -31,24 +31,11 @@ import subprocess
 import sys
 import tempfile
 import uuid
+import xml.etree.ElementTree as ET
 from apex_manifest import ValidateApexManifest
 from apex_manifest import ApexManifestError
 
-if 'APEXER_TOOL_PATH' not in os.environ:
-  sys.stderr.write("""
-Error. The APEXER_TOOL_PATH environment variable needs to be set, and point to
-a list of directories containing all the tools used by apexer (e.g. mke2fs,
-avbtool, etc.) separated by ':'. Typically this can be set as:
-
-export APEXER_TOOL_PATH="${ANDROID_BUILD_TOP}/out/soong/host/linux-x86/bin:${ANDROID_BUILD_TOP}/prebuilts/sdk/tools/linux/bin"
-
-Aborting.
-""")
-  sys.exit(1)
-
-tool_path = os.environ['APEXER_TOOL_PATH']
-tool_path_list = tool_path.split(":")
-
+tool_path_list = None
 BLOCK_SIZE = 4096
 
 def ParseArgs(argv):
@@ -59,6 +46,8 @@ def ParseArgs(argv):
                       help='verbose execution')
   parser.add_argument('--manifest', default='apex_manifest.json',
                       help='path to the APEX manifest file')
+  parser.add_argument('--android_manifest',
+                      help='path to the AndroidManifest file. If omitted, a default one is created and used')
   parser.add_argument('--file_contexts',
                       help='selinux file contexts file. Required for "image" APEXs.')
   parser.add_argument('--canned_fs_config',
@@ -77,6 +66,16 @@ def ParseArgs(argv):
                       help='type of APEX payload being built "zip" or "image"')
   parser.add_argument('--override_apk_package_name', required=False,
                       help='package name of the APK container. Default is the apex name in --manifest.')
+  parser.add_argument('--android_jar_path', required=False,
+                      default="prebuilts/sdk/current/public/android.jar",
+                      help='path to use as the source of the android API.')
+  apexer_path_in_environ = "APEXER_TOOL_PATH" in os.environ
+  parser.add_argument('--apexer_tool_path', required=not apexer_path_in_environ,
+                      default=os.environ['APEXER_TOOL_PATH'].split(":") if apexer_path_in_environ else None,
+                      type=lambda s: s.split(":"),
+                      help="""A list of directories containing all the tools used by apexer (e.g.
+                              mke2fs, avbtool, etc.) separated by ':'. Can also be set using the
+                              APEXER_TOOL_PATH environment variable""")
   return parser.parse_args(argv)
 
 def FindBinaryPath(binary):
@@ -84,7 +83,7 @@ def FindBinaryPath(binary):
     binary_path = os.path.join(path, binary)
     if os.path.exists(binary_path):
       return binary_path
-  raise Exception("Failed to find binary " + binary + " in path " + tool_path)
+  raise Exception("Failed to find binary " + binary + " in path " + ":".join(tool_path_list))
 
 def RunCommand(cmd, verbose=False, env=None):
   env = env or {}
@@ -134,6 +133,13 @@ def PrepareAndroidManifest(package, version):
 """
   return template.format(package=package, version=version)
 
+def ValidateAndroidManifest(package, android_manifest):
+  tree = ET.parse(android_manifest)
+  manifest_tag = tree.getroot()
+  package_in_xml = manifest_tag.attrib['package']
+  if package_in_xml != package:
+    raise Exception("Package name '" + package_in_xml + "' in '" + android_manifest +
+                    " differ from package name '" + package + "' in the apex_manifest.json")
 
 def ValidateArgs(args):
   if not os.path.exists(args.manifest):
@@ -143,6 +149,15 @@ def ValidateArgs(args):
   if not os.path.isfile(args.manifest):
     print("Manifest file '" + args.manifest + "' is not a file")
     return False
+
+  if args.android_manifest is not None:
+    if not os.path.exists(args.android_manifest):
+      print("Android Manifest file '" + args.android_manifest + "' does not exist")
+      return False
+
+    if not os.path.isfile(args.android_manifest):
+      print("Android Manifest file '" + args.android_manifest + "' is not a file")
+      return False
 
   if not os.path.exists(args.input_dir):
     print("Input directory '" + args.input_dir + "' does not exist")
@@ -228,9 +243,7 @@ def CreateApex(args, work_dir):
     cmd.extend(['-b', str(BLOCK_SIZE)])
     cmd.extend(['-m', '0']) # reserved block percentage
     cmd.extend(['-t', 'ext4'])
-    # TODO(b/122991714) setting the inode size makes the image root digest
-    # non-deterministic, figure out why.
-    # cmd.extend(['-I', '256']) # inode size
+    cmd.extend(['-I', '256']) # inode size
     cmd.extend(['-N', str(inode_num)])
     uu = str(uuid.uuid5(uuid.NAMESPACE_URL, "www.android.com"))
     cmd.extend(['-U', uu])
@@ -255,7 +268,7 @@ def CreateApex(args, work_dir):
     cmd.extend(['-C', args.canned_fs_config])
     cmd.append('-s') # share dup blocks
     cmd.append(img_file)
-    RunCommand(cmd, args.verbose)
+    RunCommand(cmd, args.verbose, {"E2FSPROGS_FAKE_TIME": "1"})
 
     cmd = ['e2fsdroid']
     cmd.append('-e') # input is not android_sparse_file
@@ -312,16 +325,17 @@ def CreateApex(args, work_dir):
     RunCommand(cmd, args.verbose)
 
   # package the image file and APEX manifest as an APK.
-  # The AndroidManifest file is automatically generated.
+  # The AndroidManifest file is automatically generated if not given.
   android_manifest_file = os.path.join(work_dir, 'AndroidManifest.xml')
-  if args.verbose:
-    print('Creating AndroidManifest ' + android_manifest_file)
-  with open(android_manifest_file, 'w+') as f:
-    app_package_name = manifest_apex.name
-    if args.override_apk_package_name:
-      app_package_name = args.override_apk_package_name
-
-    f.write(PrepareAndroidManifest(app_package_name, manifest_apex.version))
+  if not args.android_manifest:
+    if args.verbose:
+      print('Creating AndroidManifest ' + android_manifest_file)
+    with open(android_manifest_file, 'w+') as f:
+      app_package_name = manifest_apex.name
+      f.write(PrepareAndroidManifest(app_package_name, manifest_apex.version))
+  else:
+    ValidateAndroidManifest(manifest_apex.name, args.android_manifest)
+    shutil.copyfile(args.android_manifest, android_manifest_file)
 
   # copy manifest to the content dir so that it is also accessible
   # without mounting the image
@@ -335,8 +349,13 @@ def CreateApex(args, work_dir):
   cmd = ['aapt2']
   cmd.append('link')
   cmd.extend(['--manifest', android_manifest_file])
+  if args.override_apk_package_name:
+    cmd.extend(['--rename-manifest-package', args.override_apk_package_name])
+  # This version from apex_manifest.json is used when versionCode isn't
+  # specified in AndroidManifest.xml
+  cmd.extend(['--version-code', str(manifest_apex.version)])
   cmd.extend(['-o', apk_file])
-  cmd.extend(['-I', "prebuilts/sdk/current/public/android.jar"])
+  cmd.extend(['-I', args.android_jar_path])
   RunCommand(cmd, args.verbose)
 
   zip_file = os.path.join(work_dir, 'apex.zip')
@@ -382,7 +401,9 @@ class TempDirectory(object):
 
 
 def main(argv):
+  global tool_path_list
   args = ParseArgs(argv)
+  tool_path_list = args.apexer_tool_path
   with TempDirectory() as work_dir:
     success = CreateApex(args, work_dir)
 

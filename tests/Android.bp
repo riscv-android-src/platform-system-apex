@@ -23,20 +23,11 @@ java_test_host {
 
     data: [
             ":apex.test",
-            ":BroadcastReceiverApp"
     ],
 
     test_config: "apex-e2e-tests.xml",
 
     test_suites: ["general-tests"],
-}
-
-android_app {
-    name: "BroadcastReceiverApp",
-
-    srcs: ["broadcastapp/src/android/apex/broadcastreceiver/*.java"],
-
-    sdk_version: "current",
 }
 
 java_test_host {
@@ -46,11 +37,13 @@ java_test_host {
 
     libs: ["tradefed"],
 
-    static_libs: ["apex_e2e_base_test"],
+    static_libs: [
+        "apex_e2e_base_test",
+        "platformprotos",
+    ],
 
     data: [
         ":test1_com.android.tzdata",
-        ":BroadcastReceiverApp",
     ],
 
     test_config: "timezone-data-e2e-tests.xml",
@@ -63,6 +56,8 @@ java_test_host {
 
     libs: ["tradefed"],
 
+    srcs:  ["src/**/ApexTargetPrepTest.java"],
+
     data: [":apex.test"],
 
     test_config: "apex-targetprep-tests.xml",
@@ -72,7 +67,7 @@ java_test_host {
 
 java_library_host {
     name: "apex_e2e_base_test",
-    srcs: ["src/**/ApexE2EBaseHostTest.java"],
+    srcs: ["src/**/ApexE2EBaseHostTest.java","src/**/ApexTestUtils.java"],
     libs: ["tradefed"],
 }
 
@@ -91,6 +86,7 @@ apex {
     name: "apex_test_build_features",
     file_contexts: "apex.test",
     manifest: "testdata/apex_manifest.json",
+    androidManifest: "testdata/AndroidManifest.xml",
     binaries: ["surfaceflinger", "vold"],
     multilib: {
         prefer32: {
