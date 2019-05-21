@@ -107,14 +107,6 @@ cc_binary {
   // any APEX activated. To do so, it uses the bootstrap linker
   // and the bootstrap bionic libraries.
   bootstrap: true,
-  target: {
-    android: {
-      ldflags: ["-Wl,--rpath,/system/${LIB}/bootstrap"],
-    },
-  },
-  required: [
-    "com.android.apex.cts.shim.v1_prebuilt",
-  ],
 }
 
 cc_library_static {

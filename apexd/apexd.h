@@ -33,7 +33,6 @@ namespace apex {
 class CheckpointInterface;
 
 Status resumeRollbackIfNeeded();
-void unmountAndDetachExistingImages();
 
 Status scanPackagesDirAndActivate(const char* apex_package_dir);
 void scanStagedSessionsDirAndStage();
@@ -65,6 +64,7 @@ Status abortActiveSession();
 int onBootstrap();
 void onStart(CheckpointInterface* checkpoint_service);
 void onAllPackagesReady();
+void unmountDanglingMounts();
 
 }  // namespace apex
 }  // namespace android
