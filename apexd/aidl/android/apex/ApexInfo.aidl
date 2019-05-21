@@ -20,4 +20,7 @@ parcelable ApexInfo {
     @utf8InCpp String packageName;
     @utf8InCpp String packagePath;
     long versionCode;
+    @utf8InCpp String versionName;
+    boolean isFactory;
+    boolean isActive;
 }

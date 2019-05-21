@@ -22,7 +22,6 @@
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <linux/loop.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -244,29 +243,6 @@ void DestroyLoopDevice(const std::string& path, const DestroyLoopFn& extra) {
     if (ioctl(fd.get(), LOOP_CLR_FD, 0) < 0) {
       PLOG(WARNING) << "Failed to LOOP_CLR_FD " << path;
     }
-  }
-}
-
-void destroyAllLoopDevices() {
-  std::string root = "/dev/block/";
-  StatusOr<std::vector<std::string>> loop_files =
-      ReadDir(root, [](const std::filesystem::directory_entry& entry) {
-        return StartsWith(entry.path().filename().string(), "loop");
-      });
-
-  if (!loop_files.Ok()) {
-    PLOG(ERROR) << "Failed to open /dev/block/, can't destroy loop devices.";
-    return;
-  }
-
-  // Poke through all devices looking for loop devices.
-  auto log_fn = [](const std::string& path, const std::string& id) {
-    LOG(DEBUG) << "Tearing down stale loop device at " << path << " named "
-               << id;
-  };
-
-  for (const std::string& full_path : *loop_files) {
-    DestroyLoopDevice(full_path, log_fn);
   }
 }
 

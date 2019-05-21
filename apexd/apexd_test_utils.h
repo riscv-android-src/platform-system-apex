@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <android/apex/ApexInfo.h>
 #include <android/apex/ApexSessionInfo.h>
 #include <binder/IServiceManager.h>
 #include <gmock/gmock.h>
@@ -26,6 +27,11 @@ using apex::proto::SessionState;
 namespace android {
 namespace apex {
 namespace testing {
+
+using ::testing::AllOf;
+using ::testing::Eq;
+using ::testing::ExplainMatchResult;
+using ::testing::Field;
 
 inline ::testing::AssertionResult IsOk(const Status& status) {
   if (status.Ok()) {
@@ -56,11 +62,6 @@ inline ::testing::AssertionResult IsOk(const android::binder::Status& status) {
 }
 
 MATCHER_P(SessionInfoEq, other, "") {
-  using ::testing::AllOf;
-  using ::testing::Eq;
-  using ::testing::ExplainMatchResult;
-  using ::testing::Field;
-
   return ExplainMatchResult(
       AllOf(
           Field("sessionId", &ApexSessionInfo::sessionId, Eq(other.sessionId)),
@@ -76,7 +77,19 @@ MATCHER_P(SessionInfoEq, other, "") {
                 Eq(other.isActivationFailed)),
           Field("isSuccess", &ApexSessionInfo::isSuccess, Eq(other.isSuccess)),
           Field("isRolledBack", &ApexSessionInfo::isRolledBack,
-                Eq(other.isRolledBack))),
+                Eq(other.isRolledBack)),
+          Field("isRollbackFailed", &ApexSessionInfo::isRollbackFailed,
+                Eq(other.isRollbackFailed))),
+      arg, result_listener);
+}
+
+MATCHER_P(ApexInfoEq, other, "") {
+  return ExplainMatchResult(
+      AllOf(Field("packageName", &ApexInfo::packageName, Eq(other.packageName)),
+            Field("packagePath", &ApexInfo::packagePath, Eq(other.packagePath)),
+            Field("versioncode", &ApexInfo::versionCode, Eq(other.versionCode)),
+            Field("isFactory", &ApexInfo::isFactory, Eq(other.isFactory)),
+            Field("isActive", &ApexInfo::isActive, Eq(other.isActive))),
       arg, result_listener);
 }
 
@@ -91,6 +104,7 @@ inline ApexSessionInfo CreateSessionInfo(int session_id) {
   info.isActivationFailed = false;
   info.isSuccess = false;
   info.isRolledBack = false;
+  info.isRollbackFailed = false;
   return info;
 }
 
@@ -107,6 +121,7 @@ inline void PrintTo(const ApexSessionInfo& session, std::ostream* os) {
   *os << "  isActivationFailed : " << session.isActivationFailed << "\n";
   *os << "  isSuccess : " << session.isSuccess << "\n";
   *os << "  isRolledBack : " << session.isRolledBack << "\n";
+  *os << "  isRollbackFailed : " << session.isRollbackFailed << "\n";
   *os << "}";
 }
 

@@ -55,6 +55,8 @@ constexpr const bool kDebugAllowBundledKey = true;
 constexpr const bool kDebugAllowBundledKey = false;
 #endif
 
+}  // namespace
+
 // Tests if <path>/manifest.json file exists.
 bool isFlattenedApex(const std::string& path) {
   struct stat buf;
@@ -77,8 +79,6 @@ bool isFlattenedApex(const std::string& path) {
   }
   return true;
 }
-
-}  // namespace
 
 StatusOr<ApexFile> ApexFile::Open(const std::string& path) {
   bool flattened;
@@ -122,7 +122,7 @@ StatusOr<ApexFile> ApexFile::Open(const std::string& path) {
 
     // Locate the mountable image within the zipfile and store offset and size.
     ZipEntry entry;
-    ret = FindEntry(handle, ZipString(kImageFilename), &entry);
+    ret = FindEntry(handle, kImageFilename, &entry);
     if (ret < 0) {
       std::string err = StringLog() << "Could not find entry \""
                                     << kImageFilename << "\" in package "
@@ -132,7 +132,7 @@ StatusOr<ApexFile> ApexFile::Open(const std::string& path) {
     image_offset = entry.offset;
     image_size = entry.uncompressed_length;
 
-    ret = FindEntry(handle, ZipString(kManifestFilename), &entry);
+    ret = FindEntry(handle, kManifestFilename, &entry);
     if (ret < 0) {
       std::string err = StringLog() << "Could not find entry \""
                                     << kManifestFilename << "\" in package "
@@ -152,7 +152,7 @@ StatusOr<ApexFile> ApexFile::Open(const std::string& path) {
       return StatusOr<ApexFile>::MakeError(err);
     }
 
-    ret = FindEntry(handle, ZipString(kBundledPublicKeyFilename), &entry);
+    ret = FindEntry(handle, kBundledPublicKeyFilename, &entry);
     if (ret >= 0) {
       LOG(VERBOSE) << "Found bundled key in package " << path;
       length = entry.uncompressed_length;
@@ -467,6 +467,28 @@ Status ApexFile::VerifyManifestMatches(const std::string& mount_path) const {
   return Status::Success();
 }
 
+StatusOr<std::vector<std::string>> FindApexes(
+    const std::vector<std::string>& paths) {
+  using StatusT = StatusOr<std::vector<std::string>>;
+  std::vector<std::string> result;
+  for (const auto& path : paths) {
+    auto exist = PathExists(path);
+    if (!exist.Ok()) {
+      return StatusT::MakeError(exist.ErrorStatus());
+    }
+    if (!*exist) continue;
+
+    const auto& apexes =
+        FindApexFilesByName(path, isPathForBuiltinApexes(path));
+    if (!apexes.Ok()) {
+      return apexes;
+    }
+
+    result.insert(result.end(), apexes->begin(), apexes->end());
+  }
+  return StatusOr<std::vector<std::string>>(result);
+}
+
 StatusOr<std::vector<std::string>> FindApexFilesByName(const std::string& path,
                                                        bool include_dirs) {
   auto filter_fn =
@@ -483,8 +505,12 @@ StatusOr<std::vector<std::string>> FindApexFilesByName(const std::string& path,
 }
 
 bool isPathForBuiltinApexes(const std::string& path) {
-  return StartsWith(path, kApexPackageSystemDir) ||
-         StartsWith(path, kApexPackageProductDir);
+  for (const auto& dir : kApexPackageBuiltinDirs) {
+    if (StartsWith(path, dir)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // namespace apex

@@ -33,6 +33,7 @@
 #include "status_or.h"
 #include "string_log.h"
 
+#include <ApexProperties.sysprop.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/macros.h>
@@ -50,7 +51,6 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/loop.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -110,11 +110,52 @@ bool gInFsCheckpointMode = false;
 
 static constexpr size_t kLoopDeviceSetupAttempts = 3u;
 
+static const bool kUpdatable =
+    android::sysprop::ApexProperties::updatable().value_or(false);
+
 bool gBootstrap = false;
 static const std::vector<const std::string> kBootstrapApexes = {
     "com.android.runtime",
     "com.android.tzdata",
 };
+
+static constexpr const int kNumRetriesWhenCheckpointingEnabled = 1;
+
+bool isBootstrapApex(const ApexFile& apex) {
+  return std::find(kBootstrapApexes.begin(), kBootstrapApexes.end(),
+                   apex.GetManifest().name()) != kBootstrapApexes.end();
+}
+
+// Pre-allocate loop devices so that we don't have to wait for them
+// later when actually activating APEXes.
+Status preAllocateLoopDevices() {
+  auto scan = FindApexes(kApexPackageBuiltinDirs);
+  if (!scan.Ok()) {
+    return scan.ErrorStatus();
+  }
+
+  auto size = 0;
+  for (const auto& path : *scan) {
+    auto apexFile = ApexFile::Open(path);
+    if (!apexFile.Ok() || apexFile->IsFlattened()) {
+      continue;
+    }
+    size++;
+    // bootstrap Apexes may be activated on separate namespaces.
+    if (isBootstrapApex(*apexFile)) {
+      size++;
+    }
+  }
+
+  // note: do not call preAllocateLoopDevices() if size == 0.
+  // For devices (e.g. ARC) which doesn't support loop-control
+  // preAllocateLoopDevices() can cause problem when it tries
+  // to access /dev/loop-control.
+  if (size == 0) {
+    return Status::Success();
+  }
+  return loop::preAllocateLoopDevices(size);
+}
 
 std::unique_ptr<DmTable> createVerityTable(const ApexVerityData& verity_data,
                                            const std::string& loop,
@@ -143,6 +184,64 @@ std::unique_ptr<DmTable> createVerityTable(const ApexVerityData& verity_data,
   return table;
 }
 
+enum WaitForDeviceMode {
+  kWaitToBeCreated = 0,
+  kWaitToBeDeleted,
+};
+
+Status waitForDevice(const std::string& device, const WaitForDeviceMode& mode) {
+  // TODO(b/122059364): Make this more efficient
+  // TODO: use std::chrono?
+
+  // Deleting a device might take more time, so wait a little bit longer.
+  size_t num_tries = mode == kWaitToBeCreated ? 10u : 15u;
+
+  LOG(DEBUG) << "Waiting for " << device << " to be "
+             << (mode == kWaitToBeCreated ? "created" : " deleted");
+  for (size_t i = 0; i < num_tries; ++i) {
+    StatusOr<bool> status = PathExists(device);
+    if (status.Ok()) {
+      if (mode == kWaitToBeCreated && *status) {
+        return Status::Success();
+      }
+      if (mode == kWaitToBeDeleted && !*status) {
+        return Status::Success();
+      }
+    }
+    if (i + 1 < num_tries) {
+      usleep(50000);
+    }
+  }
+
+  return Status::Fail(StringLog()
+                      << "Failed to wait for device " << device << " to be "
+                      << (mode == kWaitToBeCreated ? " created" : " deleted"));
+}
+
+// Deletes a dm-verity device with a given name and path.
+// Synchronizes on the device actually being deleted from userspace.
+Status DeleteVerityDevice(const std::string& name, const std::string& path) {
+  DeviceMapper& dm = DeviceMapper::Instance();
+  if (!dm.DeleteDevice(name)) {
+    return Status::Fail(StringLog() << "Failed to delete device " << name
+                                    << " with path " << path);
+  }
+  // Block until device is deleted from userspace.
+  return waitForDevice(path, kWaitToBeDeleted);
+}
+
+// Deletes dm-verity device with a given name.
+// See function above.
+Status DeleteVerityDevice(const std::string& name) {
+  DeviceMapper& dm = DeviceMapper::Instance();
+  std::string path;
+  if (!dm.GetDmDevicePathByName(name, &path)) {
+    return Status::Fail(StringLog()
+                        << "Unable to get path for dm-verity device " << name);
+  }
+  return DeleteVerityDevice(name, path);
+}
+
 class DmVerityDevice {
  public:
   DmVerityDevice() : cleared_(true) {}
@@ -168,8 +267,10 @@ class DmVerityDevice {
 
   ~DmVerityDevice() {
     if (!cleared_) {
-      DeviceMapper& dm = DeviceMapper::Instance();
-      dm.DeleteDevice(name_);
+      Status ret = DeleteVerityDevice(name_, dev_path_);
+      if (!ret.Ok()) {
+        LOG(ERROR) << ret.ErrorMessage();
+      }
     }
   }
 
@@ -190,8 +291,14 @@ StatusOr<DmVerityDevice> createVerityDevice(const std::string& name,
   DeviceMapper& dm = DeviceMapper::Instance();
 
   if (dm.GetState(name) != DmDeviceState::INVALID) {
+    // TODO: since apexd tears down devices during unmount, can this happen?
     LOG(WARNING) << "Deleting existing dm device " << name;
-    dm.DeleteDevice(name);
+    const Status& status = DeleteVerityDevice(name);
+    if (!status.Ok()) {
+      // TODO: should we fail instead?
+      LOG(ERROR) << "Failed to delete device " << name << " : "
+                 << status.ErrorMessage();
+    }
   }
 
   if (!dm.CreateDevice(name, table)) {
@@ -208,11 +315,6 @@ StatusOr<DmVerityDevice> createVerityDevice(const std::string& name,
   dev.SetDevPath(dev_path);
 
   return StatusOr<DmVerityDevice>(std::move(dev));
-}
-
-template <char kTypeVal>
-bool DTypeFilter(unsigned char d_type, const char* d_name ATTRIBUTE_UNUSED) {
-  return d_type == kTypeVal;
 }
 
 Status RemovePreviouslyActiveApexFiles(
@@ -251,22 +353,6 @@ Status RemovePreviouslyActiveApexFiles(
   }
 
   return Status::Success();
-}
-
-Status waitForDevice(const std::string& device) {
-  // TODO(b/122059364): Make this more efficient
-  static constexpr size_t kNumTries = 10u;
-
-  for (size_t i = 0; i < kNumTries; ++i) {
-    StatusOr<bool> status = PathExists(device);
-    if (status.Ok() && *status) {
-      return Status::Success();
-    } else {
-      usleep(50000);
-    }
-  }
-
-  return Status::Fail(StringLog() << "Failed to wait for device " << device);
 }
 
 // Reads the entire device to verify the image is authenticatic
@@ -337,7 +423,7 @@ StatusOr<MountedApexData> mountNonFlattened(const ApexFile& apex,
   }
   std::string blockDevice = loopbackDevice.name;
   MountedApexData apex_data(loopbackDevice.name, apex.GetPath(), mountPoint,
-                            device_name);
+                            /* device_name = */ "");
 
   // for APEXes in immutable partitions, we don't need to mount them on
   // dm-verity because they are already in the dm-verity protected partition;
@@ -358,6 +444,7 @@ StatusOr<MountedApexData> mountNonFlattened(const ApexFile& apex,
                            << full_path << ": " << verityDevRes.ErrorMessage());
     }
     verityDev = std::move(*verityDevRes);
+    apex_data.device_name = device_name;
     blockDevice = verityDev.GetDevPath();
 
     Status readAheadStatus = loop::configureReadAhead(verityDev.GetDevPath());
@@ -371,11 +458,12 @@ StatusOr<MountedApexData> mountNonFlattened(const ApexFile& apex,
   // device node in userspace. To solve this properly we should listen on
   // the netlink socket for uevents, or use inotify. For now, this will
   // have to do.
-  Status deviceStatus = waitForDevice(blockDevice);
+  Status deviceStatus = waitForDevice(blockDevice, kWaitToBeCreated);
   if (!deviceStatus.Ok()) {
     return StatusM::MakeError(deviceStatus);
   }
 
+  // TODO: consider moving this inside RunVerifyFnInsideTempMount.
   if (mountOnVerity && verifyImage) {
     Status verityStatus =
         readVerityDevice(blockDevice, (*verityData).desc->image_size);
@@ -496,9 +584,10 @@ Status Unmount(const MountedApexData& data) {
 
   // Try to free up the device-mapper device.
   if (!data.device_name.empty()) {
-    DeviceMapper& dm = DeviceMapper::Instance();
-    if (!dm.DeleteDevice(data.device_name)) {
-      LOG(ERROR) << "Unable to delete dm device " << data.device_name;
+    const auto& status = DeleteVerityDevice(data.device_name);
+    if (!status.Ok()) {
+      LOG(DEBUG) << "Failed to free device " << data.device_name << " : "
+                 << status.ErrorMessage();
     }
   }
 
@@ -510,7 +599,41 @@ Status Unmount(const MountedApexData& data) {
     };
     loop::DestroyLoopDevice(data.loop_name, log_fn);
   }
+
   return Status::Success();
+}
+
+std::string GetPackageTempMountPoint(const ApexManifest& manifest) {
+  return StringPrintf("%s.tmp",
+                      apexd_private::GetPackageMountPoint(manifest).c_str());
+}
+
+template <typename VerifyFn>
+Status RunVerifyFnInsideTempMount(const ApexFile& apex,
+                                  const VerifyFn& verify_fn) {
+  // Temp mount image of this apex to validate it was properly signed;
+  // this will also read the entire block device through dm-verity, so
+  // we can be sure there is no corruption.
+  const std::string& temp_mount_point =
+      GetPackageTempMountPoint(apex.GetManifest());
+
+  StatusOr<MountedApexData> mount_status =
+      VerifyAndTempMountPackage(apex, temp_mount_point);
+  if (!mount_status.Ok()) {
+    LOG(ERROR) << "Failed to temp mount to " << temp_mount_point << " : "
+               << mount_status.ErrorMessage();
+    return mount_status.ErrorStatus();
+  }
+  auto cleaner = [&]() {
+    LOG(DEBUG) << "Unmounting " << temp_mount_point;
+    Status status = Unmount(*mount_status);
+    if (!status.Ok()) {
+      LOG(WARNING) << "Failed to unmount " << temp_mount_point << " : "
+                   << status.ErrorMessage();
+    }
+  };
+  auto scope_guard = android::base::make_scope_guard(cleaner);
+  return verify_fn(temp_mount_point);
 }
 
 template <typename HookFn, typename HookCall>
@@ -567,24 +690,22 @@ RetType HandlePackages(const std::vector<std::string>& paths, Fn fn) {
 }
 
 Status ValidateStagingShimApex(const ApexFile& to) {
-  const std::string& package_name = to.GetManifest().name();
-  auto from = getActivePackage(package_name);
-  if (!from.Ok()) {
-    return Status::Fail(StringLog()
-                        << "Can't load active version of " << package_name
-                        << " : " << from.ErrorMessage());
+  using android::base::StringPrintf;
+  auto system_shim = ApexFile::Open(
+      StringPrintf("%s/%s", kApexPackageSystemDir, shim::kSystemShimApexName));
+  if (!system_shim.Ok()) {
+    return system_shim.ErrorStatus();
   }
-  std::string from_mount_point =
-      apexd_private::GetActiveMountPoint(from->GetManifest());
-  return shim::ValidateUpdate(from_mount_point, to.GetPath());
+  auto verify_fn = [&](const std::string& system_apex_path) {
+    return shim::ValidateUpdate(system_apex_path, to.GetPath());
+  };
+  return RunVerifyFnInsideTempMount(*system_shim, verify_fn);
 }
 
-std::string GetPackageTempMountPoint(const ApexManifest& manifest) {
-  return StringPrintf("%s.tmp",
-                      apexd_private::GetPackageMountPoint(manifest).c_str());
-}
-
-Status verifyPackage(const ApexFile& apex_file) {
+// A version of apex verification that happens during boot.
+// This function should only verification checks that are necessary to run on
+// each boot. Try to avoid putting expensive checks inside this function.
+Status VerifyPackageBoot(const ApexFile& apex_file) {
   if (apex_file.IsFlattened()) {
     return Status::Fail("Can't upgrade flattened apex");
   }
@@ -594,46 +715,51 @@ Status verifyPackage(const ApexFile& apex_file) {
   }
 
   if (shim::IsShimApex(apex_file)) {
-    auto status = ValidateStagingShimApex(apex_file);
+    // Validating shim is not a very cheap operation, but it's fine to perform
+    // it here since it only runs during CTS tests and will never be triggered
+    // during normal flow.
+    const auto& status = ValidateStagingShimApex(apex_file);
     if (!status.Ok()) {
       return status;
     }
   }
-
-  // Temp mount image of this apex to validate it was properly signed;
-  // this will also read the entire block device through dm-verity, so
-  // we can be sure there is no corruption.
-  const std::string& temp_mount_point =
-      GetPackageTempMountPoint(apex_file.GetManifest());
-
-  StatusOr<MountedApexData> mount_status =
-      VerifyAndTempMountPackage(apex_file, temp_mount_point);
-  if (!mount_status.Ok()) {
-    LOG(ERROR) << "Failed to temp mount to " << temp_mount_point << " : "
-               << mount_status.ErrorMessage();
-    return mount_status.ErrorStatus();
-  }
-  // TODO: move unmount inside scope guard.
-  LOG(DEBUG) << "Unmounting " << temp_mount_point;
-  Status status = Unmount(*mount_status);
-  if (!status.Ok()) {
-    LOG(WARNING) << "Failed to unmount " << temp_mount_point << " : "
-                 << status.ErrorMessage();
-  }
   return Status::Success();
 }
 
+// A version of apex verification that happens on submitStagedSession.
+// This function contains checks that might be expensive to perform, e.g. temp
+// mounting a package and reading entire dm-verity device, and shouldn't be run
+// during boot.
+Status VerifyPackageInstall(const ApexFile& apex_file) {
+  const auto& verify_package_boot_status = VerifyPackageBoot(apex_file);
+  if (!verify_package_boot_status.Ok()) {
+    return verify_package_boot_status;
+  }
+  if (!kUpdatable) {
+    return Status::Fail(StringLog() << "Attempted to upgrade apex package "
+                                    << apex_file.GetPath()
+                                    << " on a device that doesn't support it");
+  }
+  StatusOr<ApexVerityData> verity_or = apex_file.VerifyApexVerity();
+
+  constexpr const auto kSuccessFn = [](const std::string& _) {
+    return Status::Success();
+  };
+  return RunVerifyFnInsideTempMount(apex_file, kSuccessFn);
+}
+
+template <typename VerifyApexFn>
 StatusOr<std::vector<ApexFile>> verifyPackages(
-    const std::vector<std::string>& paths) {
+    const std::vector<std::string>& paths, const VerifyApexFn& verify_apex_fn) {
   if (paths.empty()) {
     return StatusOr<std::vector<ApexFile>>::MakeError("Empty set of inputs");
   }
   LOG(DEBUG) << "verifyPackages() for " << Join(paths, ',');
 
   using StatusT = StatusOr<std::vector<ApexFile>>;
-  auto verify_fn = [](std::vector<ApexFile>& apexes) {
+  auto verify_fn = [&](std::vector<ApexFile>& apexes) {
     for (const ApexFile& apex_file : apexes) {
-      Status status = verifyPackage(apex_file);
+      Status status = verify_apex_fn(apex_file);
       if (!status.Ok()) {
         return StatusT::MakeError(status);
       }
@@ -660,7 +786,7 @@ StatusOr<ApexFile> verifySessionDir(const int session_id) {
         "More than one APEX package found in the same session directory.");
   }
 
-  auto verified = verifyPackages(*scan);
+  auto verified = verifyPackages(*scan, VerifyPackageInstall);
   if (!verified.Ok()) {
     return StatusOr<ApexFile>::MakeError(verified.ErrorStatus());
   }
@@ -760,11 +886,20 @@ Status BackupActivePackages() {
   return Status::Success();
 }
 
-Status DoRollback() {
+Status DoRollback(ApexSession& session) {
   if (gInFsCheckpointMode) {
     // We will roll back automatically when we reboot
     return Status::Success();
   }
+  auto scope_guard = android::base::make_scope_guard([&]() {
+    auto st = session.UpdateStateAndCommit(SessionState::ROLLBACK_FAILED);
+    LOG(DEBUG) << "Marking " << session << " as failed to rollback";
+    if (!st.Ok()) {
+      LOG(WARNING) << "Failed to mark session " << session
+                   << " as failed to rollback : " << st.ErrorMessage();
+    }
+  });
+
   auto backup_exists = PathExists(std::string(kApexBackupDir));
   if (!backup_exists.Ok()) {
     return backup_exists.ErrorStatus();
@@ -802,6 +937,7 @@ Status DoRollback() {
                         << kActiveApexPackagesDataDir);
   }
 
+  scope_guard.Disable();  // Rollback succeeded. Accept state.
   return Status::Success();
 }
 
@@ -813,6 +949,7 @@ Status RollbackStagedSession(ApexSession& session) {
 
 Status RollbackActivatedSession(ApexSession& session) {
   if (gInFsCheckpointMode) {
+    LOG(DEBUG) << "Checkpoint mode is enabled";
     // On checkpointing devices, our modifications on /data will be
     // automatically rolled back when we abort changes. Updating the session
     // state is pointless here, as it will be rolled back as well.
@@ -827,7 +964,7 @@ Status RollbackActivatedSession(ApexSession& session) {
                                     << " failed : " << status.ErrorMessage());
   }
 
-  status = DoRollback();
+  status = DoRollback(session);
   if (!status.Ok()) {
     return Status::Fail(StringLog() << "Rollback of session " << session
                                     << " failed : " << status.ErrorMessage());
@@ -866,7 +1003,7 @@ Status ResumeRollback(ApexSession& session) {
     return backup_exists.ErrorStatus();
   }
   if (*backup_exists) {
-    auto rollback_status = DoRollback();
+    auto rollback_status = DoRollback(session);
     if (!rollback_status.Ok()) {
       return rollback_status;
     }
@@ -980,9 +1117,11 @@ Status resumeRollbackIfNeeded() {
 Status activatePackageImpl(const ApexFile& apex_file) {
   const ApexManifest& manifest = apex_file.GetManifest();
 
-  if (gBootstrap && std::find(kBootstrapApexes.begin(), kBootstrapApexes.end(),
-                              manifest.name()) == kBootstrapApexes.end()) {
+  if (gBootstrap && !isBootstrapApex(apex_file)) {
     LOG(INFO) << "Skipped when bootstrapping";
+    return Status::Success();
+  } else if (!kUpdatable && !gBootstrap && isBootstrapApex(apex_file)) {
+    LOG(INFO) << "Package already activated in bootstrap";
     return Status::Success();
   }
 
@@ -1103,6 +1242,26 @@ std::unordered_map<std::string, uint64_t> GetActivePackagesMap() {
 
 }  // namespace
 
+std::vector<ApexFile> getFactoryPackages() {
+  std::vector<ApexFile> ret;
+  for (const auto& dir : kApexPackageBuiltinDirs) {
+    auto apex_files = FindApexFilesByName(dir, /* include_dirs=*/false);
+    if (!apex_files.Ok()) {
+      LOG(ERROR) << apex_files.ErrorMessage();
+      continue;
+    }
+    for (const std::string& path : *apex_files) {
+      StatusOr<ApexFile> apex_file = ApexFile::Open(path);
+      if (!apex_file.Ok()) {
+        LOG(ERROR) << apex_file.ErrorMessage();
+      } else {
+        ret.emplace_back(std::move(*apex_file));
+      }
+    }
+  }
+  return ret;
+}
+
 StatusOr<ApexFile> getActivePackage(const std::string& packageName) {
   std::vector<ApexFile> packages = getActivePackages();
   for (ApexFile& apex : packages) {
@@ -1138,50 +1297,6 @@ Status abortActiveSession() {
     LOG(DEBUG) << "There are no active sessions";
     return Status::Success();
   }
-}
-
-void unmountAndDetachExistingImages() {
-  // TODO: this procedure should probably not be needed anymore when apexd
-  // becomes an actual daemon. Remove if that's the case.
-  LOG(INFO) << "Scanning " << kApexRoot
-            << " looking for packages already mounted.";
-  // Find directories having apex manifest in it. This is to exclude
-  // the empty directories (mount points) that were created by the bootstrap
-  // apexd on the /apex tmpfs.
-  StatusOr<std::vector<std::string>> folders_status =
-      ReadDir(kApexRoot, [](const std::filesystem::directory_entry& entry) {
-        std::error_code ec;
-        return entry.is_directory(ec) &&
-               ApexFile::Open(std::string(kApexRoot) + "/" +
-                              entry.path().filename().string())
-                   .Ok();
-      });
-  if (!folders_status.Ok()) {
-    LOG(ERROR) << folders_status.ErrorMessage();
-    return;
-  }
-
-  // Sort the folders. This way, the "latest" folder will appear before any
-  // versioned folder, so we'll unmount the bind-mount first.
-  std::vector<std::string>& folders = *folders_status;
-  std::sort(folders.begin(), folders.end());
-
-  for (const std::string& full_path : folders) {
-    LOG(INFO) << "Unmounting " << full_path;
-    // Lazily try to umount whatever is mounted.
-    if (umount2(full_path.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) != 0 &&
-        errno != EINVAL && errno != ENOENT) {
-      PLOG(ERROR) << "Failed to unmount directory " << full_path;
-    }
-    // Attempt to delete the folder. If the folder is retained, other
-    // data may be incorrect.
-    // TODO: Fix this.
-    if (rmdir(full_path.c_str()) != 0) {
-      PLOG(ERROR) << "Failed to rmdir directory " << full_path;
-    }
-  }
-
-  loop::destroyAllLoopDevices();
 }
 
 Status scanPackagesDirAndActivate(const char* apex_package_dir) {
@@ -1383,7 +1498,7 @@ Status stagePackages(const std::vector<std::string>& tmpPaths) {
   //       it will open ApexFiles multiple times.
 
   // 1) Verify all packages.
-  auto verify_status = verifyPackages(tmpPaths);
+  auto verify_status = verifyPackages(tmpPaths, VerifyPackageBoot);
   if (!verify_status.Ok()) {
     return Status::Fail(verify_status.ErrorMessage());
   }
@@ -1473,19 +1588,26 @@ Status unstagePackages(const std::vector<std::string>& paths) {
 
 Status rollbackStagedSessionIfAny() {
   auto session = ApexSession::GetActiveSession();
-  if (session.Ok() && session->has_value() &&
-      (*session)->GetState() == SessionState::STAGED) {
-    return RollbackStagedSession(*(*session));
+  if (!session.Ok()) {
+    return session.ErrorStatus();
   }
-
-  return Status::Success();
+  if (!session->has_value()) {
+    LOG(WARNING) << "No session to rollback";
+    return Status::Success();
+  }
+  if ((*session)->GetState() == SessionState::STAGED) {
+    LOG(INFO) << "Rolling back session " << **session;
+    return RollbackStagedSession(**session);
+  }
+  return Status::Fail(StringLog() << "Can't rollback " << **session
+                                  << " because it is not in STAGED state");
 }
 
 Status rollbackActiveSession() {
   auto session = ApexSession::GetActiveSession();
   if (!session.Ok()) {
-    LOG(ERROR) << "Failed to get active session : " << session.ErrorMessage();
-    return DoRollback();
+    return Status::Fail(StringLog() << "Failed to get active session : "
+                                    << session.ErrorMessage());
   } else if (!session->has_value()) {
     return Status::Fail(
         "Rollback requested, when there are no active sessions.");
@@ -1514,21 +1636,13 @@ Status rollbackActiveSessionAndReboot() {
 int onBootstrap() {
   gBootstrap = true;
 
-  // Scan /system/apex to get the number of (non-flattened) APEXes and
-  // pre-allocated loopback devices so that we don't have to wait for it
-  // later when actually activating APEXes.
-  StatusOr<std::vector<std::string>> scan =
-      FindApexFilesByName(kApexPackageSystemDir, false /*include_dirs*/);
-  if (!scan.Ok()) {
-    LOG(WARNING) << scan.ErrorMessage();
-  } else if (scan->size() > 0) {
-    Status preAllocStatus = loop::preAllocateLoopDevices(scan->size());
-    if (!preAllocStatus.Ok()) {
-      LOG(ERROR) << preAllocStatus.ErrorMessage();
-    }
+  Status preAllocate = preAllocateLoopDevices();
+  if (!preAllocate.Ok()) {
+    LOG(ERROR) << "Failed to pre-allocate loop devices : "
+               << preAllocate.ErrorMessage();
   }
 
-  Status status = collectApexKeys();
+  Status status = collectApexKeys({kApexPackageSystemDir});
   if (!status.Ok()) {
     LOG(ERROR) << "Failed to collect APEX keys : " << status.ErrorMessage();
     return 1;
@@ -1577,6 +1691,9 @@ void onStart(CheckpointInterface* checkpoint_service) {
       LOG(ERROR) << "Failed to check if we need a rollback: "
                  << needs_rollback.ErrorMessage();
     } else if (*needs_rollback) {
+      LOG(INFO) << "Exceeded number of session retries ("
+                << kNumRetriesWhenCheckpointingEnabled
+                << "). Starting a rollback";
       Status status = rollbackStagedSessionIfAny();
       if (!status.Ok()) {
         LOG(ERROR)
@@ -1586,11 +1703,13 @@ void onStart(CheckpointInterface* checkpoint_service) {
     }
   }
 
-  Status status = collectApexKeys();
+  Status status = collectApexKeys(kApexPackageBuiltinDirs);
   if (!status.Ok()) {
     LOG(ERROR) << "Failed to collect APEX keys : " << status.ErrorMessage();
     return;
   }
+
+  gMountedApexes.PopulateFromMounts();
 
   // Activate APEXes from /data/apex. If one in the directory is newer than the
   // system one, the new one will eclipse the old one.
@@ -1611,9 +1730,9 @@ void onStart(CheckpointInterface* checkpoint_service) {
     }
   }
 
-  for (auto dir : {kApexPackageSystemDir, kApexPackageProductDir}) {
+  for (const auto& dir : kApexPackageBuiltinDirs) {
     // TODO(b/123622800): if activation failed, rollback and reboot.
-    status = scanPackagesDirAndActivate(dir);
+    status = scanPackagesDirAndActivate(dir.c_str());
     if (!status.Ok()) {
       // This should never happen. Like **really** never.
       // TODO: should we kill apexd in this case?
@@ -1638,12 +1757,27 @@ void onAllPackagesReady() {
 
 StatusOr<std::vector<ApexFile>> submitStagedSession(
     const int session_id, const std::vector<int>& child_session_ids) {
+  bool needsBackup = true;
   Status cleanup_status = ClearSessions();
   if (!cleanup_status.Ok()) {
     return StatusOr<std::vector<ApexFile>>::MakeError(cleanup_status);
   }
 
-  if (!gSupportsFsCheckpoints) {
+  if (gSupportsFsCheckpoints) {
+    Status checkpoint_status =
+        gVoldService->StartCheckpoint(kNumRetriesWhenCheckpointingEnabled);
+    if (!checkpoint_status.Ok()) {
+      // The device supports checkpointing, but we could not start it;
+      // log a warning, but do continue, since we can live without it.
+      LOG(WARNING) << "Failed to start filesystem checkpoint on device that "
+                      "should support it: "
+                   << checkpoint_status.ErrorMessage();
+    } else {
+      needsBackup = false;
+    }
+  }
+
+  if (needsBackup) {
     Status backup_status = BackupActivePackages();
     if (!backup_status.Ok()) {
       return StatusOr<std::vector<ApexFile>>::MakeError(backup_status);
@@ -1725,6 +1859,34 @@ Status markStagedSessionSuccessful(const int session_id) {
   } else {
     return Status::Fail(StringLog() << "Session " << *session
                                     << " can not be marked successful");
+  }
+}
+
+// Find dangling mounts and unmount them.
+// If one is on /data/apex/active, remove it.
+void unmountDanglingMounts() {
+  std::multimap<std::string, MountedApexData> danglings;
+  gMountedApexes.ForallMountedApexes([&](const std::string& package,
+                                         const MountedApexData& data,
+                                         bool latest) {
+    if (!latest) {
+      danglings.insert({package, data});
+    }
+  });
+
+  for (const auto& [package, data] : danglings) {
+    const std::string& path = data.full_path;
+    LOG(VERBOSE) << "Unmounting " << data.mount_point;
+    gMountedApexes.RemoveMountedApex(package, path);
+    if (auto st = Unmount(data); !st.Ok()) {
+      LOG(ERROR) << st.ErrorMessage();
+    }
+    if (StartsWith(path, kActiveApexPackagesDataDir)) {
+      LOG(VERBOSE) << "Deleting old APEX " << path;
+      if (unlink(path.c_str()) != 0) {
+        PLOG(ERROR) << "Failed to delete " << path;
+      }
+    }
   }
 }
 
