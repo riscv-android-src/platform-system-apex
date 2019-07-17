@@ -18,6 +18,7 @@
 
 #include <strings.h>
 
+#include <ApexProperties.sysprop.h>
 #include <android-base/logging.h>
 
 #include "apexd.h"
@@ -25,7 +26,6 @@
 #include "apexd_prepostinstall.h"
 #include "apexd_prop.h"
 #include "apexservice.h"
-#include "status_or.h"
 
 #include <android-base/properties.h>
 
@@ -70,18 +70,26 @@ int main(int /*argc*/, char** argv) {
   // Use CombinedLogger to also log to the kernel log.
   android::base::InitLogging(argv, CombinedLogger());
 
+  if (!android::sysprop::ApexProperties::updatable().value_or(false)) {
+    LOG(INFO) << "This device does not support updatable APEX. Exiting";
+    android::apex::onAllPackagesReady();  // mark apexd as ready so that init
+                                          // can proceed
+    android::base::SetProperty("ctl.stop", "apexd");
+    return 0;
+  }
+
   if (argv[1] != nullptr) {
     return HandleSubcommand(argv);
   }
   // TODO: add a -v flag or an external setting to change LogSeverity.
   android::base::SetMinimumLogSeverity(android::base::VERBOSE);
 
-  android::apex::StatusOr<android::apex::VoldCheckpointInterface>
+  android::base::Result<android::apex::VoldCheckpointInterface>
       vold_service_st = android::apex::VoldCheckpointInterface::Create();
   android::apex::VoldCheckpointInterface* vold_service = nullptr;
-  if (!vold_service_st.Ok()) {
+  if (!vold_service_st) {
     LOG(ERROR) << "Could not retrieve vold service: "
-               << vold_service_st.ErrorMessage();
+               << vold_service_st.error();
   } else {
     vold_service = &*vold_service_st;
   }

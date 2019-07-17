@@ -1,9 +1,9 @@
 service apexd /system/bin/apexd
     class core
-    critical
     user root
     group system
     shutdown critical
+    disabled # does not start with the core class
 
 service apexd-bootstrap /system/bin/apexd --bootstrap
     critical
