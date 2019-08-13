@@ -873,13 +873,6 @@ TEST_F(ApexServiceTest, GetAllPackages) {
   }
 }
 
-TEST_F(ApexServiceActivationSuccessTest, StageAlreadyActivePackageSameVersion) {
-  ASSERT_TRUE(IsOk(service_->activatePackage(installer_->test_installed_file)))
-      << GetDebugStr(installer_.get());
-
-  ASSERT_TRUE(IsOk(service_->stagePackages({installer_->test_file})));
-}
-
 class ApexServiceDeactivationTest : public ApexServiceActivationSuccessTest {
  public:
   void SetUp() override {
@@ -1977,6 +1970,29 @@ TEST_F(ApexShimUpdateTest, SubmitStagedSessionFailureAdditionalFolder) {
 
   ApexInfoList list;
   ASSERT_FALSE(IsOk(service_->submitStagedSession(42, {}, &list)));
+}
+
+TEST_F(ApexShimUpdateTest, UpdateToV1Success) {
+  PrepareTestApexForInstall installer(
+      GetTestFile("com.android.apex.cts.shim.apex"));
+
+  if (!installer.Prepare()) {
+    FAIL() << GetDebugStr(&installer);
+  }
+
+  ASSERT_TRUE(IsOk(service_->stagePackages({installer.test_file})));
+}
+
+TEST_F(ApexShimUpdateTest, SubmitStagedSessionV1ShimApexSuccess) {
+  PrepareTestApexForInstall installer(
+      GetTestFile("com.android.apex.cts.shim.apex"),
+      "/data/app-staging/session_97", "staging_data_file");
+  if (!installer.Prepare()) {
+    FAIL() << GetDebugStr(&installer);
+  }
+
+  ApexInfoList list;
+  ASSERT_TRUE(IsOk(service_->submitStagedSession(97, {}, &list)));
 }
 
 TEST_F(ApexServiceTest, SubmitStagedSessionCorruptApexFails) {
