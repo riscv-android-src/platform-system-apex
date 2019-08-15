@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018 The Android Open Source Project
+ * Copyright (C) 2019 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,25 +14,20 @@
  * limitations under the License.
  */
 
-#ifndef ANDROID_APEXD_APEX_MANIFEST_H_
-#define ANDROID_APEXD_APEX_MANIFEST_H_
-
-#include <android-base/result.h>
-
-#include "apex_manifest.pb.h"
+#pragma once
 
 #include <string>
 
-using ::apex::proto::ApexManifest;
+#include "apex_file.h"
+#include "apexd_loop.h"
 
 namespace android {
 namespace apex {
-// Parses and validates APEX manifest.
-android::base::Result<ApexManifest> ParseManifest(const std::string& content);
-// Returns package id of an ApexManifest
-std::string GetPackageId(const ApexManifest& apex_manifest);
+
+android::base::Result<loop::LoopbackDeviceUniqueFd> GetHashTree(
+    const ApexFile& apex, const ApexVerityData& verity_data);
+
+void RemoveObsoleteHashTrees();
 
 }  // namespace apex
 }  // namespace android
-
-#endif  // ANDROID_APEXD_APEX_MANIFEST_H_

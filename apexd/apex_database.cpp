@@ -20,12 +20,12 @@
 #include "apex_constants.h"
 #include "apex_file.h"
 #include "apexd_utils.h"
-#include "status_or.h"
 #include "string_log.h"
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/parseint.h>
+#include <android-base/result.h>
 #include <android-base/strings.h>
 
 #include <filesystem>
@@ -34,9 +34,10 @@
 #include <unordered_map>
 #include <utility>
 
-using android::base::EndsWith;
+using android::base::Errorf;
 using android::base::ParseInt;
 using android::base::ReadFileToString;
+using android::base::Result;
 using android::base::Split;
 using android::base::StartsWith;
 using android::base::Trim;
@@ -49,21 +50,6 @@ namespace apex {
 namespace {
 
 using MountedApexData = MountedApexDatabase::MountedApexData;
-
-// from art/runtime/class_linker.cc
-inline size_t hash_combine(size_t seed, size_t val) {
-  return seed ^ (val + 0x9e3779b9 + (seed << 6) + (seed >> 2));
-}
-
-typedef std::pair<dev_t, ino_t> inode_t;
-struct inode_hash {
-  size_t operator()(const inode_t& inode) const {
-    auto h1 = std::hash<dev_t>{}(inode.first);
-    auto h2 = std::hash<ino_t>{}(inode.second);
-    return hash_combine(h1, h2);
-  }
-};
-typedef std::unordered_map<inode_t, std::string, inode_hash> inode_map;
 
 enum BlockDeviceType {
   UnknownDevice,
@@ -89,13 +75,13 @@ class BlockDevice {
 
   fs::path DevPath() const { return kDevBlock / name; }
 
-  StatusOr<std::string> GetProperty(const std::string& property) const {
+  Result<std::string> GetProperty(const std::string& property) const {
     auto propertyFile = SysPath() / property;
     std::string propertyValue;
     if (!ReadFileToString(propertyFile, &propertyValue)) {
-      return StatusOr<std::string>::MakeError(PStringLog() << "Fail to read");
+      return ErrnoError() << "Fail to read";
     }
-    return StatusOr<std::string>(Trim(propertyValue));
+    return Trim(propertyValue);
   }
 
   std::vector<BlockDevice> GetSlaves() const {
@@ -107,8 +93,8 @@ class BlockDevice {
         slaves.push_back(dev);
       }
     });
-    if (!status.Ok()) {
-      LOG(WARNING) << status.ErrorMessage();
+    if (!status) {
+      LOG(WARNING) << status.error();
     }
     return slaves;
   }
@@ -139,84 +125,37 @@ bool isActiveMountPoint(const std::string& mountPoint) {
   return (mountPoint.find('@') == std::string::npos);
 }
 
-StatusOr<inode_t> inodeFor(const std::string& path) {
-  struct stat buf;
-  if (stat(path.c_str(), &buf)) {
-    return StatusOr<inode_t>::MakeError(PStringLog() << "stat failed");
-  }
-  return StatusOr<inode_t>(buf.st_dev, buf.st_ino);
-}
-
-// Flattened packages from builtin APEX dirs(/system/apex, /product/apex, ...)
-inode_map scanFlattendedPackages() {
-  inode_map map;
-
-  for (const auto& dir : kApexPackageBuiltinDirs) {
-    WalkDir(dir, [&](const fs::directory_entry& entry) {
-      const auto& path = entry.path();
-      if (isFlattenedApex(path)) {
-        auto inode = inodeFor(path);
-        if (inode.Ok()) {
-          map[*inode] = path;
-        }
-      }
-    });
-  }
-
-  return map;
-}
-
-StatusOr<MountedApexData> resolveMountInfo(const BlockDevice& block,
-                                           const std::string& mountPoint,
-                                           const inode_map& inodeMap) {
-  auto Error = [](auto e) { return StatusOr<MountedApexData>::MakeError(e); };
-
-  // First, see if it is bind-mount'ed to a flattened APEX
-  // This is checked first since flattened APEXes can be located in any stacked
-  // filesystem. (e.g. if / is mounted via /dev/loop1, then /proc/mounts shows
-  // that loop device as associated block device. But it is not related to APEX
-  // activation.) In any cases, comparing (dev,inode) pair with scanned
-  // flattened APEXes must identify bind-mounted APEX properly.
-  // See b/131924899.
-  auto inode = inodeFor(mountPoint);
-  if (inode.Ok()) {
-    auto iter = inodeMap.find(*inode);
-    if (iter != inodeMap.end()) {
-      return StatusOr<MountedApexData>("", iter->second, mountPoint, "");
-    }
-  }
-
+Result<MountedApexData> resolveMountInfo(const BlockDevice& block,
+                                         const std::string& mountPoint) {
   // Now, see if it is dm-verity or loop mounted
   switch (block.GetType()) {
     case LoopDevice: {
       auto backingFile = block.GetProperty("loop/backing_file");
-      if (!backingFile.Ok()) {
-        return Error(backingFile.ErrorStatus());
+      if (!backingFile) {
+        return backingFile.error();
       }
-      return StatusOr<MountedApexData>(block.DevPath(), *backingFile,
-                                       mountPoint, "");
+      return MountedApexData(block.DevPath(), *backingFile, mountPoint, "");
     }
     case DeviceMapperDevice: {
       auto name = block.GetProperty("dm/name");
-      if (!name.Ok()) {
-        return Error(name.ErrorStatus());
+      if (!name) {
+        return name.error();
       }
       auto slaves = block.GetSlaves();
       if (slaves.empty() || slaves[0].GetType() != LoopDevice) {
-        return Error("DeviceMapper device with no loop devices");
+        return Errorf("DeviceMapper device with no loop devices");
       }
       // TODO(jooyung): handle multiple loop devices when hash tree is
       // externalized
       auto slave = slaves[0];
       auto backingFile = slave.GetProperty("loop/backing_file");
-      if (!backingFile.Ok()) {
-        return Error(backingFile.ErrorStatus());
+      if (!backingFile) {
+        return backingFile.error();
       }
-      return StatusOr<MountedApexData>(slave.DevPath(), *backingFile,
-                                       mountPoint, *name);
+      return MountedApexData(slave.DevPath(), *backingFile, mountPoint, *name);
     }
     case UnknownDevice: {
-      return Error("Can't resolve " + block.DevPath().string());
+      return Errorf("Can't resolve {}", block.DevPath().string());
     }
   }
 }
@@ -228,7 +167,6 @@ StatusOr<MountedApexData> resolveMountInfo(const BlockDevice& block,
 // /apex/<package-id> can be mounted from
 // - /dev/block/loopX : loop device
 // - /dev/block/dm-X : dm-verity
-// - <flattened> : bind-mount
 
 // In case of loop device, it is from a non-flattened
 // APEX file. This original APEX file can be tracked
@@ -242,11 +180,6 @@ StatusOr<MountedApexData> resolveMountInfo(const BlockDevice& block,
 // Device name can be retrieved from
 // /sys/block/dm-Y/dm/name.
 
-// In case of <flattened>, it is --bind mounted to a flattened
-// APEX directory. This is allowed only for system/product
-// partitions. So, original APEX directory can be found
-// by comparing dev/inode pair with candidates.
-
 // By synchronizing the mounts info with Database on startup,
 // Apexd serves the correct package list even on the devices
 // which are not ro.apex.updatable.
@@ -254,7 +187,6 @@ void MountedApexDatabase::PopulateFromMounts() {
   LOG(INFO) << "Populating APEX database from mounts...";
 
   std::unordered_map<std::string, int> activeVersions;
-  inode_map inodeToFlattendApexMap = scanFlattendedPackages();
 
   std::ifstream mounts("/proc/mounts");
   std::string line;
@@ -268,10 +200,9 @@ void MountedApexDatabase::PopulateFromMounts() {
       continue;
     }
 
-    auto mountData = resolveMountInfo(BlockDevice(block), mountPoint,
-                                      inodeToFlattendApexMap);
-    if (!mountData.Ok()) {
-      LOG(WARNING) << "Can't resolve mount info " << mountData.ErrorMessage();
+    auto mountData = resolveMountInfo(BlockDevice(block), mountPoint);
+    if (!mountData) {
+      LOG(WARNING) << "Can't resolve mount info " << mountData.error();
       continue;
     }
 
