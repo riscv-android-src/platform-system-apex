@@ -85,6 +85,12 @@ def ParseArgs(argv):
       help='package name of the APK container. Default is the apex name in --manifest.'
   )
   parser.add_argument(
+      '--no_hashtree',
+      required=False,
+      action='store_true',
+      help='hashtree is omitted from "image".'
+  )
+  parser.add_argument(
       '--android_jar_path',
       required=False,
       default='prebuilts/sdk/current/public/android.jar',
@@ -103,6 +109,11 @@ def ParseArgs(argv):
       '--target_sdk_version',
       required=False,
       help='Default target SDK version to use for AndroidManifest.xml')
+  parser.add_argument(
+      '--do_not_check_keyname',
+      required=False,
+      action='store_true',
+      help='Do not check key name. Use the name of apex instead of the basename of --key.')
   return parser.parse_args(argv)
 
 
@@ -264,6 +275,8 @@ def CreateApex(args, work_dir):
 
   if args.payload_type == 'image':
     key_name = os.path.basename(os.path.splitext(args.key)[0])
+    if args.do_not_check_keyname:
+      key_name = manifest_apex.name
 
     if manifest_apex.name != key_name:
       print("package name '" + manifest_apex.name +
@@ -338,6 +351,8 @@ def CreateApex(args, work_dir):
     salt = hashlib.sha256(manifest_raw).hexdigest()
     cmd.extend(['--salt', salt])
     cmd.extend(['--image', img_file])
+    if args.no_hashtree:
+      cmd.append('--no_hashtree')
     RunCommand(cmd, args.verbose)
 
     # Get the minimum size of the partition required.
