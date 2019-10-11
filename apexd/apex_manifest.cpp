@@ -15,8 +15,9 @@
  */
 
 #include "apex_manifest.h"
-#include "string_log.h"
+#include <android-base/file.h>
 #include <android-base/logging.h>
+#include "string_log.h"
 
 #include <google/protobuf/util/json_util.h>
 #include <google/protobuf/util/type_resolver_util.h>
@@ -26,7 +27,6 @@
 using android::base::Error;
 using android::base::Result;
 using google::protobuf::DescriptorPool;
-using google::protobuf::scoped_ptr;
 using google::protobuf::util::NewTypeResolverForDescriptorPool;
 using google::protobuf::util::TypeResolver;
 
@@ -47,7 +47,7 @@ std::string GetTypeUrl(const ApexManifest& apex_manifest) {
 // as and when the android tree gets updated
 Result<void> JsonToApexManifestMessage(const std::string& content,
                                        ApexManifest* apex_manifest) {
-  scoped_ptr<TypeResolver> resolver(NewTypeResolverForDescriptorPool(
+  std::unique_ptr<TypeResolver> resolver(NewTypeResolverForDescriptorPool(
       kTypeUrlPrefix, DescriptorPool::generated_pool()));
   std::string binary;
   auto parse_status = JsonToBinaryString(
@@ -89,6 +89,14 @@ Result<ApexManifest> ParseManifest(const std::string& content) {
 
 std::string GetPackageId(const ApexManifest& apexManifest) {
   return apexManifest.name() + "@" + std::to_string(apexManifest.version());
+}
+
+Result<ApexManifest> ReadManifest(const std::string& path) {
+  std::string content;
+  if (!android::base::ReadFileToString(path, &content)) {
+    return Error() << "Failed to read manifest file: " << path;
+  }
+  return ParseManifest(content);
 }
 
 }  // namespace apex

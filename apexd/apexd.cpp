@@ -98,6 +98,8 @@ static constexpr const char* kApexStatusSysprop = "apexd.status";
 static constexpr const char* kApexStatusStarting = "starting";
 static constexpr const char* kApexStatusReady = "ready";
 
+static constexpr const char* kBuildFingerprintSysprop = "ro.build.fingerprint";
+
 static constexpr const char* kApexVerityOnSystemProp =
     "persist.apexd.verity_on_system";
 static bool gForceDmVerityOnSystem =
@@ -120,6 +122,7 @@ static const bool kUpdatable =
 
 bool gBootstrap = false;
 static const std::vector<const std::string> kBootstrapApexes = {
+    "com.android.art",
     "com.android.i18n",
     "com.android.runtime",
     "com.android.tzdata",
@@ -153,11 +156,12 @@ Result<void> preAllocateLoopDevices() {
     }
   }
 
-  // note: do not call preAllocateLoopDevices() if size == 0.
+  // note: do not call preAllocateLoopDevices() if size == 0
+  // or the device does not support updatable APEX.
   // For devices (e.g. ARC) which doesn't support loop-control
   // preAllocateLoopDevices() can cause problem when it tries
   // to access /dev/loop-control.
-  if (size == 0) {
+  if (size == 0 || !kUpdatable) {
     return {};
   }
   return loop::preAllocateLoopDevices(size);
@@ -548,6 +552,8 @@ Result<MountedApexData> VerifyAndTempMountPackage(
 }
 
 Result<void> Unmount(const MountedApexData& data) {
+  LOG(DEBUG) << "Unmounting " << data.full_path << " from mount point "
+             << data.mount_point;
   // Lazily try to umount whatever is mounted.
   if (umount2(data.mount_point.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) != 0 &&
       errno != EINVAL && errno != ENOENT) {
@@ -572,7 +578,7 @@ Result<void> Unmount(const MountedApexData& data) {
   if (!data.loop_name.empty()) {
     auto log_fn = [](const std::string& path,
                      const std::string& id ATTRIBUTE_UNUSED) {
-      LOG(VERBOSE) << "Freeing loop device " << path << "for unmount.";
+      LOG(VERBOSE) << "Freeing loop device " << path << " for unmount.";
     };
     loop::DestroyLoopDevice(data.loop_name, log_fn);
   }
@@ -580,10 +586,6 @@ Result<void> Unmount(const MountedApexData& data) {
   return {};
 }
 
-std::string GetPackageTempMountPoint(const ApexManifest& manifest) {
-  return StringPrintf("%s.tmp",
-                      apexd_private::GetPackageMountPoint(manifest).c_str());
-}
 
 template <typename VerifyFn>
 Result<void> RunVerifyFnInsideTempMount(const ApexFile& apex,
@@ -592,7 +594,7 @@ Result<void> RunVerifyFnInsideTempMount(const ApexFile& apex,
   // this will also read the entire block device through dm-verity, so
   // we can be sure there is no corruption.
   const std::string& temp_mount_point =
-      GetPackageTempMountPoint(apex.GetManifest());
+      apexd_private::GetPackageTempMountPoint(apex.GetManifest());
 
   Result<MountedApexData> mount_status =
       VerifyAndTempMountPackage(apex, temp_mount_point);
@@ -1023,8 +1025,6 @@ Result<void> UnmountPackage(const ApexFile& apex, bool allow_latest) {
 
 }  // namespace
 
-namespace apexd_private {
-
 Result<void> MountPackage(const ApexFile& apex, const std::string& mountPoint) {
   auto ret =
       MountPackageImpl(apex, mountPoint, GetPackageId(apex.GetManifest()),
@@ -1033,13 +1033,21 @@ Result<void> MountPackage(const ApexFile& apex, const std::string& mountPoint) {
     return ret.error();
   }
 
-  gMountedApexes.AddMountedApex(apex.GetManifest().name(), false,
-                                std::move(*ret));
+  gMountedApexes.AddMountedApex(apex.GetManifest().name(), false, *ret);
   return {};
 }
 
-Result<void> UnmountPackage(const ApexFile& apex) {
-  return android::apex::UnmountPackage(apex, /* allow_latest= */ false);
+namespace apexd_private {
+
+Result<MountedApexData> TempMountPackage(const ApexFile& apex,
+                                         const std::string& mount_point) {
+  // TODO(ioffe): consolidate these two methods.
+  return android::apex::VerifyAndTempMountPackage(apex, mount_point);
+}
+
+Result<void> Unmount(const MountedApexData& data) {
+  // TODO(ioffe): consolidate these two methods.
+  return android::apex::Unmount(data);
 }
 
 bool IsMounted(const std::string& name, const std::string& full_path) {
@@ -1055,6 +1063,10 @@ bool IsMounted(const std::string& name, const std::string& full_path) {
 
 std::string GetPackageMountPoint(const ApexManifest& manifest) {
   return StringPrintf("%s/%s", kApexRoot, GetPackageId(manifest).c_str());
+}
+
+std::string GetPackageTempMountPoint(const ApexManifest& manifest) {
+  return StringPrintf("%s.tmp", GetPackageMountPoint(manifest).c_str());
 }
 
 std::string GetActiveMountPoint(const ApexManifest& manifest) {
@@ -1125,8 +1137,7 @@ Result<void> activatePackageImpl(const ApexFile& apex_file) {
   const std::string& mountPoint = apexd_private::GetPackageMountPoint(manifest);
 
   if (!version_found_mounted) {
-    Result<void> mountStatus =
-        apexd_private::MountPackage(apex_file, mountPoint);
+    auto mountStatus = MountPackage(apex_file, mountPoint);
     if (!mountStatus) {
       return mountStatus;
     }
@@ -1316,6 +1327,7 @@ Result<void> scanPackagesDirAndActivate(const char* apex_package_dir) {
 }
 
 void scanStagedSessionsDirAndStage() {
+  using android::base::GetProperty;
   LOG(INFO) << "Scanning " << kApexSessionsDir
             << " looking for sessions to be activated.";
 
@@ -1332,6 +1344,12 @@ void scanStagedSessionsDirAndStage() {
       }
     };
     auto scope_guard = android::base::make_scope_guard(session_failed_fn);
+
+    std::string build_fingerprint = GetProperty(kBuildFingerprintSysprop, "");
+    if (session.GetBuildFingerprint().compare(build_fingerprint) != 0) {
+      LOG(ERROR) << "APEX build fingerprint has changed";
+      continue;
+    }
 
     std::vector<std::string> dirsToScan;
     if (session.GetChildSessionIds().empty()) {
@@ -1755,6 +1773,7 @@ void onAllPackagesReady() {
 
 Result<std::vector<ApexFile>> submitStagedSession(
     const int session_id, const std::vector<int>& child_session_ids) {
+  using android::base::GetProperty;
   bool needsBackup = true;
   Result<void> cleanup_status = ClearSessions();
   if (!cleanup_status) {
@@ -1809,6 +1828,8 @@ Result<std::vector<ApexFile>> submitStagedSession(
     return session.error();
   }
   (*session).SetChildSessionIds(child_session_ids);
+  std::string build_fingerprint = GetProperty(kBuildFingerprintSysprop, "");
+  (*session).SetBuildFingerprint(build_fingerprint);
   Result<void> commit_status =
       (*session).UpdateStateAndCommit(SessionState::VERIFIED);
   if (!commit_status) {

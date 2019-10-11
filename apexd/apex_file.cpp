@@ -32,6 +32,7 @@
 #include <google/protobuf/util/message_differencer.h>
 #include <libavb/libavb.h>
 
+#include "apex_constants.h"
 #include "apex_key.h"
 #include "apexd_utils.h"
 #include "string_log.h"
@@ -50,7 +51,6 @@ namespace apex {
 namespace {
 
 constexpr const char* kImageFilename = "apex_payload.img";
-constexpr const char* kManifestFilename = "apex_manifest.json";
 constexpr const char* kBundledPublicKeyFilename = "apex_pubkey";
 #ifdef DEBUG_ALLOW_BUNDLED_KEY
 constexpr const bool kDebugAllowBundledKey = true;
@@ -119,7 +119,8 @@ Result<ApexFile> ApexFile::Open(const std::string& path) {
     return manifest.error();
   }
 
-  return ApexFile(path, image_offset, image_size, *manifest, pubkey);
+  return ApexFile(path, image_offset, image_size, *manifest, pubkey,
+                  isPathForBuiltinApexes(path));
 }
 
 // AVB-related code.

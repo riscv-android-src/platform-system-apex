@@ -44,16 +44,18 @@ class ApexSession {
   const google::protobuf::RepeatedField<int> GetChildSessionIds() const;
   ::apex::proto::SessionState::State GetState() const;
   int GetId() const;
+  std::string GetBuildFingerprint() const;
   bool IsFinalized() const;
 
   void SetChildSessionIds(const std::vector<int>& child_session_ids);
+  void SetBuildFingerprint(const std::string& fingerprint);
   android::base::Result<void> UpdateStateAndCommit(
       const ::apex::proto::SessionState::State& state);
 
   android::base::Result<void> DeleteSession() const;
 
  private:
-  ApexSession(const ::apex::proto::SessionState& state);
+  ApexSession(::apex::proto::SessionState state);
   ::apex::proto::SessionState state_;
 
   static android::base::Result<ApexSession> GetSessionFromFile(

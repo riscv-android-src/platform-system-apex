@@ -16,16 +16,15 @@
 
 package com.android.tests.apex;
 
+import static com.google.common.truth.Truth.assertThat;
+
+import static org.junit.Assume.assumeTrue;
+
 import com.android.tests.util.ModuleTestUtils;
-import com.android.tradefed.device.DeviceNotAvailableException;
 import com.android.tradefed.device.ITestDevice;
 import com.android.tradefed.device.ITestDevice.ApexInfo;
 import com.android.tradefed.testtype.DeviceJUnit4ClassRunner;
 import com.android.tradefed.testtype.junit4.BaseHostJUnit4Test;
-
-import static com.google.common.truth.Truth.assertThat;
-
-import static org.junit.Assume.assumeTrue;
 
 import org.junit.After;
 import org.junit.Test;
@@ -39,70 +38,15 @@ import java.util.Set;
  */
 @RunWith(DeviceJUnit4ClassRunner.class)
 public class ApexRollbackTests extends BaseHostJUnit4Test {
-
-    private static final String SHIM_APEX_PACKAGE_NAME = "com.android.apex.cts.shim";
-    private static final String SYSTEM_TRIGGER_WATCHDOG_RC = "/system/etc/init/trigger_watchdog.rc";
-    private static final String SYSTEM_TRIGGER_WATCHDOG_SH = "/system/bin/trigger_watchdog.sh";
-
-    /**
-     * Uninstalls a shim apex only if its latest version is installed on /data partition (i.e.
-     * it has a version higher than {@code 1}).
-     *
-     * <p>This is purely to optimize tests run time, since uninstalling an apex requires a reboot.
-     */
-    private void uninstallShimApexIfNecessary() throws Exception {
-        if (!isApexUpdateSupported()) {
-            return;
-        }
-
-        final ITestDevice.ApexInfo shimApex = getShimApex();
-        if (shimApex.versionCode == 1) {
-            // System version is active, skipping uninstalling active apex and rebooting the device.
-            return;
-        }
-        // Non system version is active, need to uninstall it and reboot the device.
-        final String errorMessage = getDevice().uninstallPackage(SHIM_APEX_PACKAGE_NAME);
-        if (errorMessage != null) {
-            throw new AssertionError("Failed to uninstall " + shimApex);
-        }
-        getDevice().reboot();
-        assertThat(getShimApex().versionCode).isEqualTo(1L);
-    }
-
-    /**
-     * Get {@link ITestDevice.ApexInfo} for the installed shim apex.
-     */
-    private ITestDevice.ApexInfo getShimApex() throws DeviceNotAvailableException {
-        return getDevice().getActiveApexes().stream().filter(
-                apex -> apex.name.equals(SHIM_APEX_PACKAGE_NAME)).findAny().orElseThrow(
-                    () -> new AssertionError("Can't find " + SHIM_APEX_PACKAGE_NAME));
-    }
-
+    private final ModuleTestUtils mUtils = new ModuleTestUtils(this);
     /**
      * Uninstalls any version greater than 1 of shim apex and reboots the device if necessary
      * to complete the uninstall.
      */
     @After
     public void tearDown() throws Exception {
-        uninstallShimApexIfNecessary();
-
-        // Only clean up the trigger watchdog files if they exist to avoid
-        // the extra boot loop needed in some cases to remount the system
-        // writable.
-        ITestDevice device = getDevice();
-        if (device.doesFileExist(SYSTEM_TRIGGER_WATCHDOG_RC)
-                || device.doesFileExist(SYSTEM_TRIGGER_WATCHDOG_SH)) {
-            device.remountSystemWritable();
-            device.deleteFile(SYSTEM_TRIGGER_WATCHDOG_RC);
-            device.deleteFile(SYSTEM_TRIGGER_WATCHDOG_SH);
-        }
-    }
-
-    /**
-     * Return {@code true} if and only if device supports updating apex.
-     */
-    private boolean isApexUpdateSupported() throws Exception {
-        return "true".equals(getDevice().getProperty("ro.apex.updatable"));
+        mUtils.abandonActiveStagedSession();
+        mUtils.uninstallShimApexIfNecessary();
     }
 
     /**
@@ -110,12 +54,9 @@ public class ApexRollbackTests extends BaseHostJUnit4Test {
      */
     @Test
     public void testAutomaticBootLoopRecovery() throws Exception {
-        assumeTrue("Device does not support updating APEX", isApexUpdateSupported());
+        assumeTrue("Device does not support updating APEX", mUtils.isApexUpdateSupported());
 
-        ModuleTestUtils utils = new ModuleTestUtils(this);
-        File triggerWatchdogRcFile = utils.getTestFile("trigger_watchdog.rc");
-        File triggerWatchdogShFile = utils.getTestFile("trigger_watchdog.sh");
-        File apexFile = utils.getTestFile("com.android.apex.cts.shim.v2.apex");
+        File apexFile = mUtils.getTestFile("com.android.apex.cts.shim.v2.apex");
 
         // To simulate an apex update that causes a boot loop, we install a
         // trigger_watchdog.rc file that arranges for a trigger_watchdog.sh
@@ -125,14 +66,9 @@ public class ApexRollbackTests extends BaseHostJUnit4Test {
         // trigger_watchdog.sh repeatedly kills the system server causing a
         // boot loop.
         ITestDevice device = getDevice();
-        device.remountSystemWritable();
-        device.pushFile(triggerWatchdogRcFile, SYSTEM_TRIGGER_WATCHDOG_RC);
-        device.pushFile(triggerWatchdogShFile, SYSTEM_TRIGGER_WATCHDOG_SH);
         device.setProperty("persist.debug.trigger_watchdog.apex", "com.android.apex.cts.shim@2");
-        String error = device.installPackage(apexFile, false);
+        String error = device.installPackage(apexFile, false, "--wait");
         assertThat(error).isNull();
-
-        utils.waitForStagedSessionReady();
 
         // After we reboot the device, we expect the device to go into boot
         // loop from trigger_watchdog.sh. Native watchdog should detect and

@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <utility>
 
 using android::base::Error;
 using android::base::Result;
@@ -79,7 +80,7 @@ Result<void> deleteSessionDir(int session_id) {
 
 }  // namespace
 
-ApexSession::ApexSession(const SessionState& state) : state_(state) {}
+ApexSession::ApexSession(SessionState state) : state_(std::move(state)) {}
 
 Result<ApexSession> ApexSession::CreateSession(int session_id) {
   SessionState state;
@@ -167,6 +168,10 @@ SessionState::State ApexSession::GetState() const { return state_.state(); }
 
 int ApexSession::GetId() const { return state_.id(); }
 
+std::string ApexSession::GetBuildFingerprint() const {
+  return state_.expected_build_fingerprint();
+}
+
 bool ApexSession::IsFinalized() const {
   switch (GetState()) {
     case SessionState::SUCCESS:
@@ -191,6 +196,10 @@ void ApexSession::SetChildSessionIds(
     const std::vector<int>& child_session_ids) {
   *(state_.mutable_child_session_ids()) = {child_session_ids.begin(),
                                            child_session_ids.end()};
+}
+
+void ApexSession::SetBuildFingerprint(const std::string& fingerprint) {
+  *(state_.mutable_expected_build_fingerprint()) = fingerprint;
 }
 
 Result<void> ApexSession::UpdateStateAndCommit(
