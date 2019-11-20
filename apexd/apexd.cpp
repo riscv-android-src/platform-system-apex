@@ -528,7 +528,9 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
               << mountPoint;
     auto status = VerifyMountedImage(apex, mountPoint);
     if (!status) {
-      umount2(mountPoint.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH);
+      if (umount2(mountPoint.c_str(), UMOUNT_NOFOLLOW) != 0) {
+        PLOG(ERROR) << "Failed to umount " << mountPoint;
+      }
       return Error() << "Failed to verify " << full_path << ": "
                      << status.error();
     }
@@ -558,7 +560,7 @@ Result<void> Unmount(const MountedApexData& data) {
   LOG(DEBUG) << "Unmounting " << data.full_path << " from mount point "
              << data.mount_point;
   // Lazily try to umount whatever is mounted.
-  if (umount2(data.mount_point.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) != 0 &&
+  if (umount2(data.mount_point.c_str(), UMOUNT_NOFOLLOW) != 0 &&
       errno != EINVAL && errno != ENOENT) {
     return ErrnoError() << "Failed to unmount directory " << data.mount_point;
   }
@@ -572,8 +574,7 @@ Result<void> Unmount(const MountedApexData& data) {
   if (!data.device_name.empty()) {
     const auto& status = DeleteVerityDevice(data.device_name);
     if (!status) {
-      LOG(DEBUG) << "Failed to free device " << data.device_name << " : "
-                 << status.error();
+      return status;
     }
   }
 
@@ -1007,7 +1008,7 @@ Result<void> UnmountPackage(const ApexFile& apex, bool allow_latest) {
     }
     std::string mount_point = apexd_private::GetActiveMountPoint(manifest);
     LOG(VERBOSE) << "Unmounting and deleting " << mount_point;
-    if (umount2(mount_point.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) != 0) {
+    if (umount2(mount_point.c_str(), UMOUNT_NOFOLLOW) != 0) {
       return ErrnoError() << "Failed to unmount " << mount_point;
     }
     if (rmdir(mount_point.c_str()) != 0) {
@@ -1482,8 +1483,10 @@ Result<void> stagePackages(const std::vector<std::string>& tmpPaths) {
     }
     std::string dest_path = StageDestPath(*apex_file);
     if (access(dest_path.c_str(), F_OK) == 0) {
-      LOG(DEBUG) << dest_path << " already exists. Skipping";
-      continue;
+      LOG(DEBUG) << dest_path << " already exists. Deleting";
+      if (TEMP_FAILURE_RETRY(unlink(dest_path.c_str())) != 0) {
+        return ErrnoError() << "Failed to unlink " << dest_path;
+      }
     }
 
     if (link(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
@@ -1902,6 +1905,32 @@ void unmountDanglingMounts() {
   }
 
   RemoveObsoleteHashTrees();
+}
+
+int unmountAll() {
+  gMountedApexes.PopulateFromMounts();
+  int ret = 0;
+  gMountedApexes.ForallMountedApexes([&](const std::string& /*package*/,
+                                         const MountedApexData& data,
+                                         bool latest) {
+    LOG(INFO) << "Unmounting " << data.full_path << " mounted on "
+              << data.mount_point;
+    if (latest) {
+      auto pos = data.mount_point.find('@');
+      CHECK(pos != std::string::npos);
+      std::string bind_mount = data.mount_point.substr(0, pos);
+      if (umount2(bind_mount.c_str(), UMOUNT_NOFOLLOW) != 0) {
+        PLOG(ERROR) << "Failed to unmount bind-mount " << bind_mount;
+        ret = 1;
+      }
+    }
+    if (auto status = Unmount(data); !status) {
+      LOG(ERROR) << "Failed to unmount " << data.mount_point << " : "
+                 << status.error();
+      ret = 1;
+    }
+  });
+  return ret;
 }
 
 }  // namespace apex
