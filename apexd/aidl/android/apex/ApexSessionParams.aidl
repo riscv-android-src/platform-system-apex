@@ -14,21 +14,12 @@
  * limitations under the License.
  */
 
-#pragma once
+package android.apex;
 
-#include <string>
-
-#include "apex_file.h"
-#include "apexd_loop.h"
-
-namespace android {
-namespace apex {
-
-android::base::Result<loop::LoopbackDeviceUniqueFd> GetHashTree(
-    const ApexFile& apex, const ApexVerityData& verity_data,
-    const std::string& hashtree_file);
-
-void RemoveObsoleteHashTrees();
-
-}  // namespace apex
-}  // namespace android
+parcelable ApexSessionParams {
+    int sessionId = 0;
+    int[] childSessionIds = {};
+    boolean hasRollbackEnabled = false;
+    boolean isRollback = false;
+    int rollbackId = 0;
+}

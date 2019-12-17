@@ -25,9 +25,15 @@ namespace apex {
 static constexpr const char* kApexDataDir = "/data/apex";
 static constexpr const char* kActiveApexPackagesDataDir = "/data/apex/active";
 static constexpr const char* kApexBackupDir = "/data/apex/backup";
+static constexpr const char* kApexHashTreeDir = "/data/apex/hashtree";
 static constexpr const char* kApexPackageSystemDir = "/system/apex";
+static constexpr const char* kApexPackageSystemExtDir = "/system_ext/apex";
 static const std::vector<std::string> kApexPackageBuiltinDirs = {
-    kApexPackageSystemDir, "/product/apex", "/vendor/apex"};
+    kApexPackageSystemDir,
+    kApexPackageSystemExtDir,
+    "/product/apex",
+    "/vendor/apex",
+};
 static constexpr const char* kApexRoot = "/apex";
 static constexpr const char* kStagedSessionsDir = "/data/app-staging";
 

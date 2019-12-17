@@ -19,6 +19,7 @@
 #include "apexd.h"
 #include "apexd_private.h"
 
+#include "apex_constants.h"
 #include "apex_database.h"
 #include "apex_file.h"
 #include "apex_manifest.h"
@@ -60,6 +61,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -199,62 +201,14 @@ std::unique_ptr<DmTable> createVerityTable(const ApexVerityData& verity_data,
   return table;
 }
 
-enum WaitForDeviceMode {
-  kWaitToBeCreated = 0,
-  kWaitToBeDeleted,
-};
-
-Result<void> waitForDevice(const std::string& device,
-                           const WaitForDeviceMode& mode) {
-  // TODO(b/122059364): Make this more efficient
-  // TODO: use std::chrono?
-
-  // Deleting a device might take more time, so wait a little bit longer.
-  size_t num_tries = mode == kWaitToBeCreated ? 10u : 15u;
-
-  LOG(DEBUG) << "Waiting for " << device << " to be "
-             << (mode == kWaitToBeCreated ? "created" : " deleted");
-  for (size_t i = 0; i < num_tries; ++i) {
-    Result<bool> status = PathExists(device);
-    if (status) {
-      if (mode == kWaitToBeCreated && *status) {
-        return {};
-      }
-      if (mode == kWaitToBeDeleted && !*status) {
-        return {};
-      }
-    }
-    if (i + 1 < num_tries) {
-      usleep(50000);
-    }
-  }
-
-  return Error() << "Failed to wait for device " << device << " to be "
-                 << (mode == kWaitToBeCreated ? " created" : " deleted");
-}
-
-// Deletes a dm-verity device with a given name and path.
+// Deletes a dm-verity device with a given name and path
 // Synchronizes on the device actually being deleted from userspace.
-Result<void> DeleteVerityDevice(const std::string& name,
-                                const std::string& path) {
-  DeviceMapper& dm = DeviceMapper::Instance();
-  if (!dm.DeleteDevice(name)) {
-    return Error() << "Failed to delete device " << name << " with path "
-                   << path;
-  }
-  // Block until device is deleted from userspace.
-  return waitForDevice(path, kWaitToBeDeleted);
-}
-
-// Deletes dm-verity device with a given name.
-// See function above.
 Result<void> DeleteVerityDevice(const std::string& name) {
   DeviceMapper& dm = DeviceMapper::Instance();
-  std::string path;
-  if (!dm.GetDmDevicePathByName(name, &path)) {
-    return Error() << "Unable to get path for dm-verity device " << name;
+  if (!dm.DeleteDevice(name, 750ms)) {
+    return Error() << "Failed to delete dm-device " << name;
   }
-  return DeleteVerityDevice(name, path);
+  return {};
 }
 
 class DmVerityDevice {
@@ -284,7 +238,7 @@ class DmVerityDevice {
 
   ~DmVerityDevice() {
     if (!cleared_) {
-      Result<void> ret = DeleteVerityDevice(name_, dev_path_);
+      Result<void> ret = DeleteVerityDevice(name_);
       if (!ret) {
         LOG(ERROR) << ret.error();
       }
@@ -293,7 +247,6 @@ class DmVerityDevice {
 
   const std::string& GetName() const { return name_; }
   const std::string& GetDevPath() const { return dev_path_; }
-  void SetDevPath(const std::string& dev_path) { dev_path_ = dev_path; }
 
   void Release() { cleared_ = true; }
 
@@ -318,18 +271,11 @@ Result<DmVerityDevice> createVerityDevice(const std::string& name,
     }
   }
 
-  if (!dm.CreateDevice(name, table)) {
+  std::string dev_path;
+  if (!dm.CreateDevice(name, table, &dev_path, 500ms)) {
     return Errorf("Couldn't create verity device.");
   }
-  DmVerityDevice dev(name);
-
-  std::string dev_path;
-  if (!dm.GetDmDevicePathByName(name, &dev_path)) {
-    return Errorf("Couldn't get verity device path!");
-  }
-  dev.SetDevPath(dev_path);
-
-  return dev;
+  return DmVerityDevice(name, dev_path);
 }
 
 Result<void> RemovePreviouslyActiveApexFiles(
@@ -407,6 +353,7 @@ Result<void> VerifyMountedImage(const ApexFile& apex,
 Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
                                          const std::string& mountPoint,
                                          const std::string& device_name,
+                                         const std::string& hashtree_file,
                                          bool verifyImage) {
   LOG(VERBOSE) << "Creating mount point: " << mountPoint;
   // Note: the mount point could exist in case when the APEX was activated
@@ -471,7 +418,7 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   if (mountOnVerity) {
     std::string hash_device = loopbackDevice.name;
     if (verityData->desc->tree_size == 0) {
-      auto hash_tree = GetHashTree(apex, *verityData);
+      auto hash_tree = GetHashTree(apex, *verityData, hashtree_file);
       if (!hash_tree) {
         return hash_tree.error();
       }
@@ -497,17 +444,6 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
       return readAheadStatus.error();
     }
   }
-
-  // TODO(b/122059364): Even though the kernel has created the verity
-  // device, we still depend on ueventd to run to actually create the
-  // device node in userspace. To solve this properly we should listen on
-  // the netlink socket for uevents, or use inotify. For now, this will
-  // have to do.
-  Result<void> deviceStatus = waitForDevice(blockDevice, kWaitToBeCreated);
-  if (!deviceStatus) {
-    return deviceStatus.error();
-  }
-
   // TODO: consider moving this inside RunVerifyFnInsideTempMount.
   if (mountOnVerity && verifyImage) {
     Result<void> verityStatus =
@@ -547,12 +483,26 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   }
 }
 
+std::string GetHashTreeFileName(const ApexFile& apex, bool is_new) {
+  std::string ret =
+      std::string(kApexHashTreeDir) + "/" + GetPackageId(apex.GetManifest());
+  return is_new ? ret + ".new" : ret;
+}
+
 Result<MountedApexData> VerifyAndTempMountPackage(
     const ApexFile& apex, const std::string& mount_point) {
   const std::string& package_id = GetPackageId(apex.GetManifest());
   LOG(DEBUG) << "Temp mounting " << package_id << " to " << mount_point;
   const std::string& temp_device_name = package_id + ".tmp";
+  std::string hashtree_file = GetHashTreeFileName(apex, /* is_new = */ true);
+  if (access(hashtree_file.c_str(), F_OK) == 0) {
+    LOG(DEBUG) << hashtree_file << " already exists. Deleting it";
+    if (TEMP_FAILURE_RETRY(unlink(hashtree_file.c_str())) != 0) {
+      return ErrnoError() << "Failed to unlink " << hashtree_file;
+    }
+  }
   return MountPackageImpl(apex, mount_point, temp_device_name,
+                          GetHashTreeFileName(apex, /* is_new = */ true),
                           /* verifyImage = */ true);
 }
 
@@ -589,7 +539,6 @@ Result<void> Unmount(const MountedApexData& data) {
 
   return {};
 }
-
 
 template <typename VerifyFn>
 Result<void> RunVerifyFnInsideTempMount(const ApexFile& apex,
@@ -1027,6 +976,7 @@ Result<void> UnmountPackage(const ApexFile& apex, bool allow_latest) {
 Result<void> MountPackage(const ApexFile& apex, const std::string& mountPoint) {
   auto ret =
       MountPackageImpl(apex, mountPoint, GetPackageId(apex.GetManifest()),
+                       GetHashTreeFileName(apex, /* is_new = */ false),
                        /* verifyImage = */ false);
   if (!ret) {
     return ret.error();
@@ -1466,10 +1416,16 @@ Result<void> stagePackages(const std::vector<std::string>& tmpPaths) {
 
   // Ensure the APEX gets removed on failure.
   std::unordered_set<std::string> staged_files;
-  auto deleter = [&staged_files]() {
+  std::vector<std::string> changed_hashtree_files;
+  auto deleter = [&staged_files, &changed_hashtree_files]() {
     for (const std::string& staged_path : staged_files) {
       if (TEMP_FAILURE_RETRY(unlink(staged_path.c_str())) != 0) {
         PLOG(ERROR) << "Unable to unlink " << staged_path;
+      }
+    }
+    for (const std::string& hashtree_file : changed_hashtree_files) {
+      if (TEMP_FAILURE_RETRY(unlink(hashtree_file.c_str())) != 0) {
+        PLOG(ERROR) << "Unable to unlink " << hashtree_file;
       }
     }
   };
@@ -1481,6 +1437,21 @@ Result<void> stagePackages(const std::vector<std::string>& tmpPaths) {
     if (!apex_file) {
       return apex_file.error();
     }
+    // First promote new hashtree file to the one that will be used when
+    // mounting apex.
+    std::string new_hashtree_file = GetHashTreeFileName(*apex_file,
+                                                        /* is_new = */ true);
+    std::string old_hashtree_file = GetHashTreeFileName(*apex_file,
+                                                        /* is_new = */ false);
+    if (access(new_hashtree_file.c_str(), F_OK) == 0) {
+      if (TEMP_FAILURE_RETRY(rename(new_hashtree_file.c_str(),
+                                    old_hashtree_file.c_str())) != 0) {
+        return ErrnoError() << "Failed to move " << new_hashtree_file << " to "
+                            << old_hashtree_file;
+      }
+      changed_hashtree_files.emplace_back(std::move(old_hashtree_file));
+    }
+    // And only then move apex to /data/apex/active.
     std::string dest_path = StageDestPath(*apex_file);
     if (access(dest_path.c_str(), F_OK) == 0) {
       LOG(DEBUG) << dest_path << " already exists. Deleting";
@@ -1584,18 +1555,22 @@ int onBootstrap() {
                << preAllocate.error();
   }
 
-  Result<void> status = collectPreinstalledData({kApexPackageSystemDir});
+  std::vector<std::string> bootstrap_apex_dirs{kApexPackageSystemDir,
+                                               kApexPackageSystemExtDir};
+  Result<void> status = collectPreinstalledData(bootstrap_apex_dirs);
   if (!status) {
     LOG(ERROR) << "Failed to collect APEX keys : " << status.error();
     return 1;
   }
 
   // Activate built-in APEXes for processes launched before /data is mounted.
-  status = scanPackagesDirAndActivate(kApexPackageSystemDir);
-  if (!status) {
-    LOG(ERROR) << "Failed to activate APEX files in " << kApexPackageSystemDir
-               << " : " << status.error();
-    return 1;
+  for (auto const& dir : bootstrap_apex_dirs) {
+    status = scanPackagesDirAndActivate(dir.c_str());
+    if (!status) {
+      LOG(ERROR) << "Failed to activate APEX files in " << dir << " : "
+                 << status.error();
+      return 1;
+    }
   }
   LOG(INFO) << "Bootstrapping done";
   return 0;
@@ -1770,8 +1745,15 @@ void onAllPackagesReady() {
 }
 
 Result<std::vector<ApexFile>> submitStagedSession(
-    const int session_id, const std::vector<int>& child_session_ids) {
+    const int session_id, const std::vector<int>& child_session_ids,
+    const bool has_rollback_enabled, const bool is_rollback,
+    const int rollback_id) {
   using android::base::GetProperty;
+
+  if (session_id == 0) {
+    return Error() << "Session id was not provided.";
+  }
+
   bool needsBackup = true;
   Result<void> cleanup_status = ClearSessions();
   if (!cleanup_status) {
@@ -1821,6 +1803,11 @@ Result<std::vector<ApexFile>> submitStagedSession(
     return preinstall_status.error();
   }
 
+  if (has_rollback_enabled && is_rollback) {
+    return Error() << "Cannot set session " << session_id << " as both a"
+                   << " rollback and enabled for rollback.";
+  }
+
   auto session = ApexSession::CreateSession(session_id);
   if (!session) {
     return session.error();
@@ -1828,6 +1815,9 @@ Result<std::vector<ApexFile>> submitStagedSession(
   (*session).SetChildSessionIds(child_session_ids);
   std::string build_fingerprint = GetProperty(kBuildFingerprintSysprop, "");
   (*session).SetBuildFingerprint(build_fingerprint);
+  session->SetHasRollbackEnabled(has_rollback_enabled);
+  session->SetIsRollback(is_rollback);
+  session->SetRollbackId(rollback_id);
   Result<void> commit_status =
       (*session).UpdateStateAndCommit(SessionState::VERIFIED);
   if (!commit_status) {
