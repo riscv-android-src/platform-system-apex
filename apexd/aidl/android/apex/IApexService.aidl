@@ -19,9 +19,10 @@ package android.apex;
 import android.apex.ApexInfo;
 import android.apex.ApexInfoList;
 import android.apex.ApexSessionInfo;
+import android.apex.ApexSessionParams;
 
 interface IApexService {
-   void submitStagedSession(int session_id, in int[] child_session_ids, out ApexInfoList packages);
+   void submitStagedSession(in ApexSessionParams params, out ApexInfoList packages);
    void markStagedSessionReady(int session_id);
    void markStagedSessionSuccessful(int session_id);
 
@@ -31,6 +32,18 @@ interface IApexService {
    ApexInfo[] getAllPackages();
 
    void abortActiveSession();
+
+   /**
+    * Copies the CE apex data directory for the given user to the backup
+    * location, and returns the inode of the snapshot directory.
+    */
+   long snapshotCeData(int user_id, int rollback_id, in @utf8InCpp String apex_name);
+
+   /**
+    * Restores the snapshot of the CE apex data directory for the given user and
+    * apex.
+    */
+   void restoreCeData(int user_id, int rollback_id, in @utf8InCpp String apex_name);
 
    void unstagePackages(in @utf8InCpp List<String> active_package_paths);
 

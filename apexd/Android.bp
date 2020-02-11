@@ -76,6 +76,7 @@ aidl_interface {
     "aidl/android/apex/ApexInfo.aidl",
     "aidl/android/apex/ApexInfoList.aidl",
     "aidl/android/apex/ApexSessionInfo.aidl",
+    "aidl/android/apex/ApexSessionParams.aidl",
     "aidl/android/apex/IApexService.aidl",
   ],
   local_include_dir: "aidl",
@@ -288,11 +289,11 @@ genrule {
   name: "gen_bad_apexes",
   out: ["apex.apexd_test_manifest_mismatch.apex"],
   srcs: [":apex.apexd_test"],
-  tools: ["soong_zip", "zipalign"],
+  tools: ["soong_zip", "zipalign", "conv_apex_manifest"],
   cmd: "unzip -q $(in) -d $(genDir) && " +
-       "sed -i -e 's/\"version\": 1/\"version\": 137/' $(genDir)/apex_manifest.json && " +
+       "$(location conv_apex_manifest) setprop version 137 $(genDir)/apex_manifest.pb && " +
        "$(location soong_zip) -d -C $(genDir) -D $(genDir) " +
-       "-s apex_manifest.json -s apex_payload.img -s apex_pubkey " +
+       "-s apex_manifest.pb -s apex_payload.img -s apex_pubkey " +
        "-o $(genDir)/unaligned.apex && " +
        "$(location zipalign) -f 4096 $(genDir)/unaligned.apex " +
        "$(genDir)/apex.apexd_test_manifest_mismatch.apex"
@@ -308,7 +309,7 @@ genrule {
   cmd: "unzip -q $(in) -d $(genDir) && " +
        "dd if=/dev/zero of=$(genDir)/apex_payload.img conv=notrunc bs=1024 seek=16 count=1 && " +
        "$(location soong_zip) -d -C $(genDir) -D $(genDir) " +
-       "-s apex_manifest.json -s apex_payload.img -s apex_pubkey " +
+       "-s apex_manifest.pb -s apex_payload.img -s apex_pubkey " +
        "-o $(genDir)/unaligned.apex && " +
        "$(location zipalign) -f 4096 $(genDir)/unaligned.apex " +
        "$(genDir)/apex.apexd_test_corrupt_apex.apex"
@@ -328,6 +329,8 @@ cc_test {
   data: [
     ":apex.apexd_test",
     ":apex.apexd_test_different_app",
+    ":apex.apexd_test_no_hashtree",
+    ":apex.apexd_test_no_hashtree_2",
     ":apex.apexd_test_no_inst_key",
     ":apex.apexd_test_nocode",
     ":apex.apexd_test_postinstall",
@@ -351,6 +354,7 @@ cc_test {
     "apex_aidl_interface-cpp",
     "libapex",
     "libapexd",
+    "libfstab",
     "libgmock",
   ],
   shared_libs: [
@@ -379,3 +383,34 @@ cc_test {
   test_config: "flattened_apex_test_config.xml",
 }
 
+cc_test {
+  name: "apexd_verity_test",
+  defaults: [
+    "apex_flags_defaults",
+    "libapex-deps",
+    "libapexd-deps"
+  ],
+  cflags: [
+    // Otherwise libgmock won't compile.
+    "-Wno-used-but-marked-unused",
+  ],
+  data: [
+    ":apex.apexd_test_no_hashtree",
+    ":apex.apexd_test_no_hashtree_2",
+  ],
+  srcs: ["apexd_verity_test.cpp"],
+  host_supported: false,
+  compile_multilib: "first",
+  static_libs: [
+    "apex_aidl_interface-cpp",
+    "libapex",
+    "libapexd",
+    "libgmock",
+  ],
+  shared_libs: [
+    "libbinder",
+    "libutils",
+  ],
+  test_suites: ["device-tests"],
+  test_config: "apexd_verity_test_config.xml",
+}

@@ -47,28 +47,24 @@ int HandleSubcommand(char** argv) {
     return android::apex::onBootstrap();
   }
 
+  if (strcmp("--unmount-all", argv[1]) == 0) {
+    LOG(INFO) << "Unmount all subcommand detected";
+    return android::apex::unmountAll();
+  }
+
+  if (strcmp("--snapshotde", argv[1]) == 0) {
+    LOG(INFO) << "Snapshot DE subcommand detected";
+    return android::apex::snapshotOrRestoreDeUserData();
+  }
+
   LOG(ERROR) << "Unknown subcommand: " << argv[1];
   return 1;
 }
 
-struct CombinedLogger {
-  android::base::LogdLogger logd;
-
-  CombinedLogger() {}
-
-  void operator()(android::base::LogId id, android::base::LogSeverity severity,
-                  const char* tag, const char* file, unsigned int line,
-                  const char* message) {
-    logd(id, severity, tag, file, line, message);
-    KernelLogger(id, severity, tag, file, line, message);
-  }
-};
-
 }  // namespace
 
 int main(int /*argc*/, char** argv) {
-  // Use CombinedLogger to also log to the kernel log.
-  android::base::InitLogging(argv, CombinedLogger());
+  android::base::InitLogging(argv, &android::base::KernelLogger);
   // TODO: add a -v flag or an external setting to change LogSeverity.
   android::base::SetMinimumLogSeverity(android::base::VERBOSE);
 
@@ -90,7 +86,7 @@ int main(int /*argc*/, char** argv) {
   android::base::Result<android::apex::VoldCheckpointInterface>
       vold_service_st = android::apex::VoldCheckpointInterface::Create();
   android::apex::VoldCheckpointInterface* vold_service = nullptr;
-  if (!vold_service_st) {
+  if (!vold_service_st.ok()) {
     LOG(ERROR) << "Could not retrieve vold service: "
                << vold_service_st.error();
   } else {

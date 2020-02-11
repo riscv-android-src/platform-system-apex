@@ -59,8 +59,7 @@ class ApexService : public BnApexService {
 
   BinderStatus stagePackages(const std::vector<std::string>& paths) override;
   BinderStatus unstagePackages(const std::vector<std::string>& paths) override;
-  BinderStatus submitStagedSession(int session_id,
-                                   const std::vector<int>& child_session_ids,
+  BinderStatus submitStagedSession(const ApexSessionParams& params,
                                    ApexInfoList* apex_info_list) override;
   BinderStatus markStagedSessionReady(int session_id) override;
   BinderStatus markStagedSessionSuccessful(int session_id) override;
@@ -80,6 +79,11 @@ class ApexService : public BnApexService {
   BinderStatus abortActiveSession() override;
   BinderStatus rollbackActiveSession() override;
   BinderStatus resumeRollbackIfNeeded() override;
+  BinderStatus snapshotCeData(int user_id, int rollback_id,
+                              const std::string& apex_name,
+                              int64_t* _aidl_return) override;
+  BinderStatus restoreCeData(int user_id, int rollback_id,
+                             const std::string& apex_name) override;
 
   status_t dump(int fd, const Vector<String16>& args) override;
 
@@ -109,7 +113,7 @@ BinderStatus ApexService::stagePackages(const std::vector<std::string>& paths) {
 
   Result<void> res = ::android::apex::stagePackages(paths);
 
-  if (res) {
+  if (res.ok()) {
     return BinderStatus::ok();
   }
 
@@ -124,7 +128,7 @@ BinderStatus ApexService::stagePackages(const std::vector<std::string>& paths) {
 BinderStatus ApexService::unstagePackages(
     const std::vector<std::string>& paths) {
   Result<void> res = ::android::apex::unstagePackages(paths);
-  if (res) {
+  if (res.ok()) {
     return BinderStatus::ok();
   }
 
@@ -136,17 +140,17 @@ BinderStatus ApexService::unstagePackages(
       String8(res.error().message().c_str()));
 }
 
-BinderStatus ApexService::submitStagedSession(
-    int session_id, const std::vector<int>& child_session_ids,
-    ApexInfoList* apex_info_list) {
+BinderStatus ApexService::submitStagedSession(const ApexSessionParams& params,
+                                              ApexInfoList* apex_info_list) {
   LOG(DEBUG) << "submitStagedSession() received by ApexService, session id "
-             << session_id << " child sessions: ["
-             << android::base::Join(child_session_ids, ',') << "]";
+             << params.sessionId << " child sessions: ["
+             << android::base::Join(params.childSessionIds, ',') << "]";
 
-  Result<std::vector<ApexFile>> packages =
-      ::android::apex::submitStagedSession(session_id, child_session_ids);
-  if (!packages) {
-    LOG(ERROR) << "Failed to submit session id " << session_id << ": "
+  Result<std::vector<ApexFile>> packages = ::android::apex::submitStagedSession(
+      params.sessionId, params.childSessionIds, params.hasRollbackEnabled,
+      params.isRollback, params.rollbackId);
+  if (!packages.ok()) {
+    LOG(ERROR) << "Failed to submit session id " << params.sessionId << ": "
                << packages.error();
     return BinderStatus::fromExceptionCode(
         BinderStatus::EX_SERVICE_SPECIFIC,
@@ -167,7 +171,7 @@ BinderStatus ApexService::markStagedSessionReady(int session_id) {
   LOG(DEBUG) << "markStagedSessionReady() received by ApexService, session id "
              << session_id;
   Result<void> success = ::android::apex::markStagedSessionReady(session_id);
-  if (!success) {
+  if (!success.ok()) {
     LOG(ERROR) << "Failed to mark session id " << session_id
                << " as ready: " << success.error();
     return BinderStatus::fromExceptionCode(
@@ -182,7 +186,7 @@ BinderStatus ApexService::markStagedSessionSuccessful(int session_id) {
       << "markStagedSessionSuccessful() received by ApexService, session id "
       << session_id;
   Result<void> ret = ::android::apex::markStagedSessionSuccessful(session_id);
-  if (!ret) {
+  if (!ret.ok()) {
     LOG(ERROR) << "Failed to mark session " << session_id
                << " as SUCCESS: " << ret.error();
     return BinderStatus::fromExceptionCode(
@@ -254,7 +258,7 @@ static ApexInfo getApexInfo(const ApexFile& package) {
   out.isActive = false;
   Result<std::string> preinstalledPath =
       getApexPreinstalledPath(package.GetManifest().name());
-  if (preinstalledPath) {
+  if (preinstalledPath.ok()) {
     out.preinstalledModulePath = *preinstalledPath;
   }
   return out;
@@ -289,7 +293,7 @@ BinderStatus ApexService::getStagedSessionInfo(
   LOG(DEBUG) << "getStagedSessionInfo() received by ApexService, session id "
              << session_id;
   auto session = ApexSession::GetSession(session_id);
-  if (!session) {
+  if (!session.ok()) {
     // Unknown session.
     ClearSessionInfo(apex_session_info);
     apex_session_info->isUnknown = true;
@@ -312,7 +316,7 @@ BinderStatus ApexService::activatePackage(const std::string& packagePath) {
 
   Result<void> res = ::android::apex::activatePackage(packagePath);
 
-  if (res) {
+  if (res.ok()) {
     return BinderStatus::ok();
   }
 
@@ -334,7 +338,7 @@ BinderStatus ApexService::deactivatePackage(const std::string& packagePath) {
 
   Result<void> res = ::android::apex::deactivatePackage(packagePath);
 
-  if (res) {
+  if (res.ok()) {
     return BinderStatus::ok();
   }
 
@@ -360,7 +364,7 @@ BinderStatus ApexService::getActivePackages(
 BinderStatus ApexService::getActivePackage(const std::string& packageName,
                                            ApexInfo* aidl_return) {
   Result<ApexFile> apex = ::android::apex::getActivePackage(packageName);
-  if (apex) {
+  if (apex.ok()) {
     *aidl_return = getApexInfo(*apex);
     aidl_return->isActive = true;
   }
@@ -394,7 +398,7 @@ BinderStatus ApexService::preinstallPackages(
   }
 
   Result<void> res = ::android::apex::preinstallPackages(paths);
-  if (res) {
+  if (res.ok()) {
     return BinderStatus::ok();
   }
 
@@ -414,7 +418,7 @@ BinderStatus ApexService::postinstallPackages(
   }
 
   Result<void> res = ::android::apex::postinstallPackages(paths);
-  if (res) {
+  if (res.ok()) {
     return BinderStatus::ok();
   }
 
@@ -429,7 +433,7 @@ BinderStatus ApexService::postinstallPackages(
 BinderStatus ApexService::abortActiveSession() {
   LOG(DEBUG) << "abortActiveSession() received by ApexService.";
   Result<void> res = ::android::apex::abortActiveSession();
-  if (!res) {
+  if (!res.ok()) {
     return BinderStatus::fromExceptionCode(
         BinderStatus::EX_ILLEGAL_ARGUMENT,
         String8(res.error().message().c_str()));
@@ -444,8 +448,8 @@ BinderStatus ApexService::rollbackActiveSession() {
   }
 
   LOG(DEBUG) << "rollbackActiveSession() received by ApexService.";
-  Result<void> res = ::android::apex::rollbackActiveSession();
-  if (!res) {
+  Result<void> res = ::android::apex::rollbackActiveSession("");
+  if (!res.ok()) {
     return BinderStatus::fromExceptionCode(
         BinderStatus::EX_ILLEGAL_ARGUMENT,
         String8(res.error().message().c_str()));
@@ -461,9 +465,37 @@ BinderStatus ApexService::resumeRollbackIfNeeded() {
 
   LOG(DEBUG) << "resumeRollbackIfNeeded() received by ApexService.";
   Result<void> res = ::android::apex::resumeRollbackIfNeeded();
-  if (!res) {
+  if (!res.ok()) {
     return BinderStatus::fromExceptionCode(
         BinderStatus::EX_ILLEGAL_ARGUMENT,
+        String8(res.error().message().c_str()));
+  }
+  return BinderStatus::ok();
+}
+
+BinderStatus ApexService::snapshotCeData(int user_id, int rollback_id,
+                                         const std::string& apex_name,
+                                         int64_t* _aidl_return) {
+  LOG(DEBUG) << "snapshotCeData() received by ApexService.";
+  Result<ino_t> res =
+      ::android::apex::snapshotCeData(user_id, rollback_id, apex_name);
+  if (!res.ok()) {
+    return BinderStatus::fromExceptionCode(
+        BinderStatus::EX_SERVICE_SPECIFIC,
+        String8(res.error().message().c_str()));
+  }
+  *_aidl_return = static_cast<uint64_t>(*res);
+  return BinderStatus::ok();
+}
+
+BinderStatus ApexService::restoreCeData(int user_id, int rollback_id,
+                                        const std::string& apex_name) {
+  LOG(DEBUG) << "restoreCeData() received by ApexService.";
+  Result<void> res =
+      ::android::apex::restoreCeData(user_id, rollback_id, apex_name);
+  if (!res.ok()) {
+    return BinderStatus::fromExceptionCode(
+        BinderStatus::EX_SERVICE_SPECIFIC,
         String8(res.error().message().c_str()));
   }
   return BinderStatus::ok();
@@ -743,9 +775,10 @@ status_t ApexService::shellCommand(int in, int out, int err,
 
     ApexInfoList list;
     std::vector<int> empty_child_session_ids;
-
-    BinderStatus status =
-        submitStagedSession(session_id, empty_child_session_ids, &list);
+    ApexSessionParams params;
+    params.sessionId = session_id;
+    params.childSessionIds = empty_child_session_ids;
+    BinderStatus status = submitStagedSession(params, &list);
     if (status.isOk()) {
         for (const auto& item : list.apexInfos) {
           std::string msg = toString(item);

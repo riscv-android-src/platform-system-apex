@@ -14,11 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import apex_manifest_pb2
-from google.protobuf.json_format import Parse
-from google.protobuf.json_format import ParseError
-
+from google.protobuf import message
+from google.protobuf.json_format import MessageToJson
+import zipfile
 
 class ApexManifestError(Exception):
 
@@ -27,12 +26,12 @@ class ApexManifestError(Exception):
     self.errmessage = errmessage
 
 
-def ValidateApexManifest(manifest_raw):
+def ValidateApexManifest(file):
   try:
-    manifest_json = json.loads(manifest_raw)
-    manifest_pb = Parse(
-        json.dumps(manifest_json), apex_manifest_pb2.ApexManifest())
-  except (ParseError, ValueError) as err:
+    with open(file, "rb") as f:
+      manifest_pb = apex_manifest_pb2.ApexManifest()
+      manifest_pb.ParseFromString(f.read())
+  except message.DecodeError as err:
     raise ApexManifestError(err)
   # Checking required fields
   if manifest_pb.name == "":
@@ -45,3 +44,13 @@ def ValidateApexManifest(manifest_raw):
         "'noCode' can't be true when either preInstallHook or postInstallHook is set"
     )
   return manifest_pb
+
+def fromApex(apexFilePath):
+  with zipfile.ZipFile(apexFilePath, 'r') as apexFile:
+    with apexFile.open('apex_manifest.pb') as manifestFile:
+      manifest = apex_manifest_pb2.ApexManifest()
+      manifest.ParseFromString(manifestFile.read())
+      return manifest
+
+def toJsonString(manifest):
+  return MessageToJson(manifest, indent=2)

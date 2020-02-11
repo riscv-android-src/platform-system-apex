@@ -28,11 +28,49 @@ apexer_tools = [
       "fec",
 ]
 
+python_library_host {
+    name: "apex_manifest",
+    srcs: [
+        "apex_manifest.py",
+    ],
+    version: {
+        py2: {
+            enabled: true,
+        },
+        py3: {
+            enabled: true,
+        },
+    },
+    libs: [
+        "apex_manifest_proto",
+    ],
+}
+
 python_binary_host {
     name: "apexer",
     srcs: [
         "apexer.py",
-        "apex_manifest.py"
+    ],
+    version: {
+        py2: {
+            enabled: true,
+            embedded_launcher: true,
+        },
+        py3: {
+            enabled: false,
+        },
+    },
+    libs: [
+        "apex_manifest",
+        "apex_build_info_proto",
+    ],
+    required: apexer_tools,
+}
+
+python_binary_host {
+    name: "conv_apex_manifest",
+    srcs: [
+        "conv_apex_manifest.py",
     ],
     version: {
         py2: {
@@ -46,7 +84,6 @@ python_binary_host {
     libs: [
         "apex_manifest_proto",
     ],
-    required: apexer_tools,
 }
 
 apex_key {

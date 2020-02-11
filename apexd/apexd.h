@@ -48,14 +48,17 @@ android::base::Result<void> unstagePackages(
     const std::vector<std::string>& paths) WARN_UNUSED;
 
 android::base::Result<std::vector<ApexFile>> submitStagedSession(
-    const int session_id,
-    const std::vector<int>& child_session_ids) WARN_UNUSED;
+    const int session_id, const std::vector<int>& child_session_ids,
+    const bool has_rollback_enabled, const bool is_rollback,
+    const int rollback_id) WARN_UNUSED;
 android::base::Result<void> markStagedSessionReady(const int session_id)
     WARN_UNUSED;
 android::base::Result<void> markStagedSessionSuccessful(const int session_id)
     WARN_UNUSED;
-android::base::Result<void> rollbackActiveSession();
-android::base::Result<void> rollbackActiveSessionAndReboot();
+android::base::Result<void> rollbackActiveSession(
+    const std::string& crashing_native_process);
+android::base::Result<void> rollbackActiveSessionAndReboot(
+    const std::string& crashing_native_process);
 
 android::base::Result<void> activatePackage(const std::string& full_path)
     WARN_UNUSED;
@@ -70,10 +73,20 @@ std::vector<ApexFile> getFactoryPackages();
 
 android::base::Result<void> abortActiveSession();
 
+android::base::Result<ino_t> snapshotCeData(const int user_id,
+                                            const int rollback_id,
+                                            const std::string& apex_name);
+android::base::Result<void> restoreCeData(const int user_id,
+                                          const int rollback_id,
+                                          const std::string& apex_name);
+
 int onBootstrap();
 void onStart(CheckpointInterface* checkpoint_service);
 void onAllPackagesReady();
 void unmountDanglingMounts();
+int snapshotOrRestoreDeUserData();
+
+int unmountAll();
 
 }  // namespace apex
 }  // namespace android

@@ -19,15 +19,18 @@ python_binary_host {
     ],
     version: {
         py2: {
+            enabled: false,
+        },
+        py3: {
             enabled: true,
             embedded_launcher: true,
         },
-        py3: {
-            enabled: false,
-        },
     },
+    libs: [
+        "apex_manifest",
+    ],
     required: [
-        "debugfs",
+        "debugfs_static",
     ],
 }
 

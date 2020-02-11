@@ -31,13 +31,13 @@
 #include <android-base/chrono_utils.h>
 #include <android-base/logging.h>
 #include <android-base/result.h>
+#include <android-base/scopeguard.h>
 #include <android-base/strings.h>
 #include <cutils/android_reboot.h>
 
 #include "string_log.h"
 
 using android::base::ErrnoError;
-using android::base::ErrnoErrorf;
 using android::base::Error;
 using android::base::Result;
 
@@ -117,7 +117,7 @@ Result<std::vector<std::string>> ReadDir(const std::string& path, FilterFn fn) {
       ret.push_back(entry.path());
     }
   });
-  if (!status) {
+  if (!status.ok()) {
     return status.error();
   }
   return ret;
@@ -125,7 +125,7 @@ Result<std::vector<std::string>> ReadDir(const std::string& path, FilterFn fn) {
 
 inline bool IsEmptyDirectory(const std::string& path) {
   auto res = ReadDir(path, [](auto _) { return true; });
-  return res && res->empty();
+  return res.ok() && res->empty();
 }
 
 inline Result<void> createDirIfNeeded(const std::string& path, mode_t mode) {
@@ -156,7 +156,7 @@ inline Result<void> createDirIfNeeded(const std::string& path, mode_t mode) {
 
 inline Result<void> DeleteDirContent(const std::string& path) {
   auto files = ReadDir(path, [](auto _) { return true; });
-  if (!files) {
+  if (!files.ok()) {
     return Error() << "Failed to delete " << path << " : " << files.error();
   }
   for (const std::string& file : *files) {
@@ -165,6 +165,47 @@ inline Result<void> DeleteDirContent(const std::string& path) {
     }
   }
   return {};
+}
+
+inline Result<void> ReplaceFiles(const std::string& from_path,
+                                 const std::string& to_path) {
+  namespace fs = std::filesystem;
+
+  std::error_code error_code;
+  fs::remove_all(to_path, error_code);
+  if (error_code) {
+    return Error() << "Failed to delete existing files at " << to_path << " : "
+                   << error_code.message();
+  }
+
+  auto deleter = [&] {
+    std::error_code error_code;
+    fs::remove_all(to_path, error_code);
+    if (error_code) {
+      LOG(ERROR) << "Failed to clean up files at " << to_path << " : "
+                 << error_code.message();
+    }
+  };
+  auto scope_guard = android::base::make_scope_guard(deleter);
+
+  // TODO(b/147425590): Ensure that file permissions and owners are preserved.
+  fs::copy(from_path, to_path, fs::copy_options::recursive, error_code);
+  if (error_code) {
+    return Error() << "Failed to copy  from [" << from_path << "] to ["
+                   << to_path << "] :" << error_code.message();
+  }
+  scope_guard.Disable();
+  return {};
+}
+
+inline Result<ino_t> get_path_inode(const std::string& path) {
+  struct stat buf;
+  memset(&buf, 0, sizeof(buf));
+  if (stat(path.c_str(), &buf) != 0) {
+    return ErrnoError() << "Failed to stat " << path;
+  } else {
+    return buf.st_ino;
+  }
 }
 
 inline Result<bool> PathExists(const std::string& path) {
