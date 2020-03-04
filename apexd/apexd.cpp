@@ -27,6 +27,7 @@
 #include "apexd_loop.h"
 #include "apexd_prepostinstall.h"
 #include "apexd_prop.h"
+#include "apexd_rollback_utils.h"
 #include "apexd_session.h"
 #include "apexd_utils.h"
 #include "apexd_verity.h"
@@ -63,6 +64,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -96,6 +98,7 @@ namespace {
 // These should be in-sync with system/sepolicy/public/property_contexts
 static constexpr const char* kApexStatusSysprop = "apexd.status";
 static constexpr const char* kApexStatusStarting = "starting";
+static constexpr const char* kApexStatusActivated = "activated";
 static constexpr const char* kApexStatusReady = "ready";
 
 static constexpr const char* kBuildFingerprintSysprop = "ro.build.fingerprint";
@@ -119,6 +122,7 @@ static const std::vector<std::string> kBootstrapApexes = ([]() {
       "com.android.i18n",
       "com.android.runtime",
       "com.android.tzdata",
+      "com.android.os.statsd",
   };
 
   auto vendor_vndk_ver = GetProperty("ro.vndk.version", "");
@@ -1222,7 +1226,10 @@ Result<void> abortActiveSession() {
   }
 }
 
-Result<void> scanPackagesDirAndActivate(const char* apex_package_dir) {
+// TODO(ioffe): cleanup activation logic to avoid unnecessary scanning.
+namespace {
+
+Result<std::vector<ApexFile>> ScanApexFiles(const char* apex_package_dir) {
   LOG(INFO) << "Scanning " << apex_package_dir << " looking for APEX packages.";
   if (access(apex_package_dir, F_OK) != 0 && errno == ENOENT) {
     LOG(INFO) << "... does not exist. Skipping";
@@ -1233,50 +1240,64 @@ Result<void> scanPackagesDirAndActivate(const char* apex_package_dir) {
     return Error() << "Failed to scan " << apex_package_dir << " : "
                    << scan.error();
   }
-
-  const auto& packages_with_code = GetActivePackagesMap();
-
-  std::vector<std::string> failed_pkgs;
-  size_t activated_cnt = 0;
-  size_t skipped_cnt = 0;
-  for (const std::string& name : *scan) {
+  std::vector<ApexFile> ret;
+  for (const auto& name : *scan) {
     LOG(INFO) << "Found " << name;
-
     Result<ApexFile> apex_file = ApexFile::Open(name);
     if (!apex_file.ok()) {
-      LOG(ERROR) << "Failed to activate " << name << " : " << apex_file.error();
-      failed_pkgs.push_back(name);
-      continue;
+      LOG(ERROR) << "Failed to scan " << name << " : " << apex_file.error();
+    } else {
+      ret.emplace_back(std::move(*apex_file));
     }
+  }
+  return ret;
+}
 
-    uint64_t new_version =
-        static_cast<uint64_t>(apex_file->GetManifest().version());
-    const auto& it = packages_with_code.find(apex_file->GetManifest().name());
+Result<void> ActivateApexPackages(const std::vector<ApexFile>& apexes) {
+  const auto& packages_with_code = GetActivePackagesMap();
+  size_t failed_cnt = 0;
+  size_t skipped_cnt = 0;
+  size_t activated_cnt = 0;
+  for (const auto& apex : apexes) {
+    uint64_t new_version = static_cast<uint64_t>(apex.GetManifest().version());
+    const auto& it = packages_with_code.find(apex.GetManifest().name());
     if (it != packages_with_code.end() && it->second >= new_version) {
-      LOG(INFO) << "Skipping activation of " << name
+      LOG(INFO) << "Skipping activation of " << apex.GetPath()
                 << " same package with higher version " << it->second
                 << " is already active";
       skipped_cnt++;
       continue;
     }
 
-    Result<void> res = activatePackageImpl(*apex_file);
-    if (!res.ok()) {
-      LOG(ERROR) << "Failed to activate " << name << " : " << res.error();
-      failed_pkgs.push_back(name);
+    if (auto res = activatePackageImpl(apex); !res.ok()) {
+      LOG(ERROR) << "Failed to activate " << apex.GetPath() << " : "
+                 << res.error();
+      failed_cnt++;
     } else {
       activated_cnt++;
     }
   }
-
-  if (!failed_pkgs.empty()) {
-    return Error() << "Failed to activate following packages : "
-                   << Join(failed_pkgs, ',');
+  if (failed_cnt > 0) {
+    return Error() << "Failed to activate " << failed_cnt << " APEX packages";
   }
-
   LOG(INFO) << "Activated " << activated_cnt
             << " packages. Skipped: " << skipped_cnt;
   return {};
+}
+
+bool ShouldActivateApexOnData(const ApexFile& apex) {
+  return HasPreInstalledVersion(apex.GetManifest().name()) &&
+         !apex.HasOnlyJsonManifest();
+}
+
+}  // namespace
+
+Result<void> scanPackagesDirAndActivate(const char* apex_package_dir) {
+  auto apexes = ScanApexFiles(apex_package_dir);
+  if (!apexes.ok()) {
+    return apexes.error();
+  }
+  return ActivateApexPackages(*apexes);
 }
 
 /**
@@ -1313,7 +1334,11 @@ Result<void> restoreDataDirectory(const std::string& base_dir,
                    rollback_id, apex_name.c_str());
   auto to_path = StringPrintf("%s/%s/%s", base_dir.c_str(), kApexDataSubDir,
                               apex_name.c_str());
-  return ReplaceFiles(from_path, to_path);
+  const Result<void> result = ReplaceFiles(from_path, to_path);
+  if (!result.ok()) {
+    return result;
+  }
+  return RestoreconPath(to_path);
 }
 
 void snapshotOrRestoreIfNeeded(const std::string& base_dir,
@@ -1340,17 +1365,16 @@ void snapshotOrRestoreIfNeeded(const std::string& base_dir,
   }
 }
 
+void snapshotOrRestoreDeSysData() {
+  auto sessions = ApexSession::GetSessionsInState(SessionState::ACTIVATED);
+
+  for (const ApexSession& session : sessions) {
+    snapshotOrRestoreIfNeeded(kDeSysDataDir, session);
+  }
+}
+
 int snapshotOrRestoreDeUserData() {
-  auto filter_fn = [](const std::filesystem::directory_entry& entry) {
-    std::error_code ec;
-    bool result = entry.is_directory(ec);
-    if (ec) {
-      LOG(ERROR) << "Failed to check is_directory : " << ec.message();
-      return false;
-    }
-    return result;
-  };
-  auto user_dirs = ReadDir(kDeNDataDir, filter_fn);
+  auto user_dirs = GetDeUserDirs();
 
   if (!user_dirs.ok()) {
     LOG(ERROR) << "Error reading dirs " << user_dirs.error();
@@ -1413,6 +1437,36 @@ Result<void> migrateSessionsDirIfNeeded() {
     return Error() << "Failed to delete old sessions directory "
                    << error_code.message();
   }
+  return {};
+}
+
+Result<void> destroySnapshots(const std::string& base_dir,
+                              const int rollback_id) {
+  namespace fs = std::filesystem;
+  auto path = StringPrintf("%s/%s/%d", base_dir.c_str(), kApexSnapshotSubDir,
+                           rollback_id);
+
+  std::error_code error_code;
+  fs::remove_all(path, error_code);
+  if (error_code) {
+    return Error() << "Failed to delete snapshots at " << path << " : "
+                   << error_code.message();
+  }
+  return {};
+}
+
+Result<void> destroyDeSnapshots(const int rollback_id) {
+  destroySnapshots(kDeSysDataDir, rollback_id);
+
+  auto user_dirs = GetDeUserDirs();
+  if (!user_dirs.ok()) {
+    return Error() << "Error reading user dirs " << user_dirs.error();
+  }
+
+  for (const auto& user_dir : *user_dirs) {
+    destroySnapshots(user_dir, rollback_id);
+  }
+
   return {};
 }
 
@@ -1499,8 +1553,6 @@ void scanStagedSessionsDirAndStage() {
       }
       session.AddApexName(apex_file->GetManifest().name());
     }
-
-    snapshotOrRestoreIfNeeded(kDeSysDataDir, session);
 
     const Result<void> result = stagePackages(apexes);
     if (!result.ok()) {
@@ -1714,8 +1766,8 @@ int onBootstrap() {
                << preAllocate.error();
   }
 
-  std::vector<std::string> bootstrap_apex_dirs{kApexPackageSystemDir,
-                                               kApexPackageSystemExtDir};
+  std::vector<std::string> bootstrap_apex_dirs{
+      kApexPackageSystemDir, kApexPackageSystemExtDir, kApexPackageVendorDir};
   Result<void> status = collectPreinstalledData(bootstrap_apex_dirs);
   if (!status.ok()) {
     LOG(ERROR) << "Failed to collect APEX keys : " << status.error();
@@ -1723,11 +1775,16 @@ int onBootstrap() {
   }
 
   // Activate built-in APEXes for processes launched before /data is mounted.
-  for (auto const& dir : bootstrap_apex_dirs) {
-    status = scanPackagesDirAndActivate(dir.c_str());
-    if (!status.ok()) {
+  for (const auto& dir : bootstrap_apex_dirs) {
+    auto scan_status = ScanApexFiles(dir.c_str());
+    if (!scan_status.ok()) {
+      LOG(ERROR) << "Failed to scan APEX files in " << dir << " : "
+                 << scan_status.error();
+      return 1;
+    }
+    if (auto ret = ActivateApexPackages(*scan_status); !ret.ok()) {
       LOG(ERROR) << "Failed to activate APEX files in " << dir << " : "
-                 << status.error();
+                 << ret.error();
       return 1;
     }
   }
@@ -1860,27 +1917,54 @@ void onStart(CheckpointInterface* checkpoint_service) {
     LOG(ERROR) << "Failed to resume rollback : " << status.error();
   }
 
-  status = scanPackagesDirAndActivate(kActiveApexPackagesDataDir);
-  if (!status.ok()) {
+  std::vector<ApexFile> data_apex;
+  if (auto scan = ScanApexFiles(kActiveApexPackagesDataDir); !scan.ok()) {
+    LOG(ERROR) << "Failed to scan packages from " << kActiveApexPackagesDataDir
+               << " : " << scan.error();
+    if (auto rollback = rollbackActiveSessionAndReboot(""); !rollback.ok()) {
+      LOG(ERROR) << "Failed to rollback : " << rollback.error();
+    }
+  } else {
+    auto filter_fn = [](const ApexFile& apex) {
+      if (!ShouldActivateApexOnData(apex)) {
+        LOG(WARNING) << "Skipping " << apex.GetPath();
+        return false;
+      }
+      return true;
+    };
+    std::copy_if(std::make_move_iterator(scan->begin()),
+                 std::make_move_iterator(scan->end()),
+                 std::back_inserter(data_apex), filter_fn);
+  }
+
+  if (auto ret = ActivateApexPackages(data_apex); !ret.ok()) {
     LOG(ERROR) << "Failed to activate packages from "
-               << kActiveApexPackagesDataDir << " : " << status.error();
-    Result<void> rollback_status = rollbackActiveSessionAndReboot("");
-    if (!rollback_status.ok()) {
-      // TODO: should we kill apexd in this case?
-      LOG(ERROR) << "Failed to rollback : " << rollback_status.error();
+               << kActiveApexPackagesDataDir << " : " << ret.error();
+    if (auto rollback = rollbackActiveSessionAndReboot(""); !rollback.ok()) {
+      LOG(ERROR) << "Failed to rollback : " << rollback.error();
     }
   }
 
+  // Now also scan and activate APEXes from pre-installed directories.
   for (const auto& dir : kApexPackageBuiltinDirs) {
-    // TODO(b/123622800): if activation failed, rollback and reboot.
-    status = scanPackagesDirAndActivate(dir.c_str());
-    if (!status.ok()) {
+    auto scan = ScanApexFiles(dir.c_str());
+    if (!scan.ok()) {
+      LOG(ERROR) << "Failed to scan APEX packages from " << dir << " : "
+                 << scan.error();
+      if (auto rollback = rollbackActiveSessionAndReboot(""); !rollback.ok()) {
+        LOG(ERROR) << "Failed to rollback : " << rollback.error();
+      }
+    }
+    if (auto activate = ActivateApexPackages(*scan); !activate.ok()) {
       // This should never happen. Like **really** never.
       // TODO: should we kill apexd in this case?
       LOG(ERROR) << "Failed to activate packages from " << dir << " : "
-                 << status.error();
+                 << activate.error();
     }
   }
+
+  // Now that APEXes are mounted, snapshot or restore DE_sys data.
+  snapshotOrRestoreDeSysData();
 
   if (android::base::GetBoolProperty("ro.debuggable", false)) {
     status = monitorBuiltinDirs();
@@ -1890,8 +1974,21 @@ void onStart(CheckpointInterface* checkpoint_service) {
   }
 }
 
+void onAllPackagesActivated() {
+  // Set a system property to let other components know that APEXs are
+  // activated, but are not yet ready to be used. init is expected to wait
+  // for this status before performing configuration based on activated
+  // apexes. Other components that need to use APEXs should wait for the
+  // ready state instead.
+  LOG(INFO) << "Marking APEXd as activated";
+  if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusActivated)) {
+    PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
+                << kApexStatusActivated;
+  }
+}
+
 void onAllPackagesReady() {
-  // Set a system property to let other components to know that APEXs are
+  // Set a system property to let other components know that APEXs are
   // correctly mounted and ready to be used. Before using any file from APEXs,
   // they can query this system property to ensure that they are okay to
   // access. Or they may have a on-property trigger to delay a task until
@@ -1907,7 +2004,6 @@ Result<std::vector<ApexFile>> submitStagedSession(
     const int session_id, const std::vector<int>& child_session_ids,
     const bool has_rollback_enabled, const bool is_rollback,
     const int rollback_id) {
-
   if (session_id == 0) {
     return Error() << "Session id was not provided.";
   }
@@ -2025,9 +2121,11 @@ Result<void> markStagedSessionSuccessful(const int session_id) {
   }
 }
 
+namespace {
+
 // Find dangling mounts and unmount them.
 // If one is on /data/apex/active, remove it.
-void unmountDanglingMounts() {
+void UnmountDanglingMounts() {
   std::multimap<std::string, MountedApexData> danglings;
   gMountedApexes.ForallMountedApexes([&](const std::string& package,
                                          const MountedApexData& data,
@@ -2053,6 +2151,36 @@ void unmountDanglingMounts() {
   }
 
   RemoveObsoleteHashTrees();
+}
+
+// Removes APEXes on /data that don't have corresponding pre-installed version.
+void RemoveOrphanedApexes() {
+  auto data_apexes = FindApexFilesByName(kActiveApexPackagesDataDir);
+  if (!data_apexes.ok()) {
+    LOG(ERROR) << "Failed to scan " << kActiveApexPackagesDataDir << " : "
+               << data_apexes.error();
+    return;
+  }
+  for (const auto& path : *data_apexes) {
+    auto apex = ApexFile::Open(path);
+    if (!apex.ok()) {
+      LOG(ERROR) << "Failed to open " << path << " : " << apex.error();
+      continue;
+    }
+    if (!ShouldActivateApexOnData(*apex)) {
+      LOG(DEBUG) << "Removing orphaned APEX " << path;
+      if (unlink(path.c_str()) != 0) {
+        PLOG(ERROR) << "Failed to unlink " << path;
+      }
+    }
+  }
+}
+
+}  // namespace
+
+void bootCompletedCleanup() {
+  UnmountDanglingMounts();
+  RemoveOrphanedApexes();
 }
 
 int unmountAll() {

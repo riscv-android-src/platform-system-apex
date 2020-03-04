@@ -58,6 +58,8 @@ cc_defaults {
   shared_libs: [
     "libbinder",
     "libselinux",
+    "liblog",
+    "liblogwrap",
   ],
   static_libs: [
     "libapex",

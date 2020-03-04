@@ -33,10 +33,11 @@ class CheckpointInterface;
 
 android::base::Result<void> resumeRollbackIfNeeded();
 
+// Keep it for now to make otapreopt_chroot keep happy.
+// TODO(b/137086602): remove this function.
 android::base::Result<void> scanPackagesDirAndActivate(
     const char* apex_package_dir);
 void scanStagedSessionsDirAndStage();
-
 android::base::Result<void> preinstallPackages(
     const std::vector<std::string>& paths) WARN_UNUSED;
 android::base::Result<void> postinstallPackages(
@@ -79,11 +80,13 @@ android::base::Result<ino_t> snapshotCeData(const int user_id,
 android::base::Result<void> restoreCeData(const int user_id,
                                           const int rollback_id,
                                           const std::string& apex_name);
+android::base::Result<void> destroyDeSnapshots(const int rollback_id);
 
 int onBootstrap();
 void onStart(CheckpointInterface* checkpoint_service);
+void onAllPackagesActivated();
 void onAllPackagesReady();
-void unmountDanglingMounts();
+void bootCompletedCleanup();
 int snapshotOrRestoreDeUserData();
 
 int unmountAll();
