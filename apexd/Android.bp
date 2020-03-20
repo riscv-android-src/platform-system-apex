@@ -1,6 +1,7 @@
 // List of clang-tidy checks that are reported as errors.
 // Please keep this list ordered lexicographically.
 tidy_errors = [
+  "cert-err34-c",
   "google-default-arguments",
   "google-explicit-constructor",
   "google-runtime-int",
@@ -58,6 +59,8 @@ cc_defaults {
   shared_libs: [
     "libbinder",
     "libselinux",
+    "liblog",
+    "liblogwrap",
   ],
   static_libs: [
     "libapex",
@@ -383,3 +386,34 @@ cc_test {
   test_config: "flattened_apex_test_config.xml",
 }
 
+cc_test {
+  name: "apexd_verity_test",
+  defaults: [
+    "apex_flags_defaults",
+    "libapex-deps",
+    "libapexd-deps"
+  ],
+  cflags: [
+    // Otherwise libgmock won't compile.
+    "-Wno-used-but-marked-unused",
+  ],
+  data: [
+    ":apex.apexd_test_no_hashtree",
+    ":apex.apexd_test_no_hashtree_2",
+  ],
+  srcs: ["apexd_verity_test.cpp"],
+  host_supported: false,
+  compile_multilib: "first",
+  static_libs: [
+    "apex_aidl_interface-cpp",
+    "libapex",
+    "libapexd",
+    "libgmock",
+  ],
+  shared_libs: [
+    "libbinder",
+    "libutils",
+  ],
+  test_suites: ["device-tests"],
+  test_config: "apexd_verity_test_config.xml",
+}

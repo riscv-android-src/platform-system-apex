@@ -21,6 +21,7 @@ To print content of an APEX to stdout:
 To extract content of an APEX to the given directory:
   deapexer extract foo.apex dest
 """
+from __future__ import print_function
 
 import argparse
 import os
@@ -33,10 +34,11 @@ import apex_manifest
 
 class ApexImageEntry(object):
 
-  def __init__(self, name, base_dir, permissions, is_directory=False, is_symlink=False):
+  def __init__(self, name, base_dir, permissions, size, is_directory=False, is_symlink=False):
     self._name = name
     self._base_dir = base_dir
     self._permissions = permissions
+    self._size = size
     self._is_directory = is_directory
     self._is_symlink = is_symlink
 
@@ -64,6 +66,10 @@ class ApexImageEntry(object):
   def permissions(self):
     return self._permissions
 
+  @property
+  def size(self):
+    return self._size
+
   def __str__(self):
     ret = ''
     if self._is_directory:
@@ -83,7 +89,7 @@ class ApexImageEntry(object):
     ret += mask_as_string((self._permissions >> 3) & 7)
     ret += mask_as_string(self._permissions & 7)
 
-    return ret + ' ' + self._name
+    return ret + ' ' + self._size + ' ' + self._name
 
 
 class ApexImageDirectory(object):
@@ -110,9 +116,9 @@ class ApexImageDirectory(object):
 
 class Apex(object):
 
-  def __init__(self, apex):
-    self._debugfs = '%s/bin/debugfs' % os.environ['ANDROID_HOST_OUT']
-    self._apex = apex
+  def __init__(self, args):
+    self._debugfs = args.debugfs_path
+    self._apex = args.apex
     self._tempdir = tempfile.mkdtemp()
     # TODO(b/139125405): support flattened APEXes.
     with zipfile.ZipFile(self._apex, 'r') as zip_ref:
@@ -147,7 +153,8 @@ class Apex(object):
       if not name:
         continue
       bits = parts[2]
-      entries.append(ApexImageEntry(name, base_dir=path, permissions=int(bits[3:], 8),
+      size = parts[6]
+      entries.append(ApexImageEntry(name, base_dir=path, permissions=int(bits[3:], 8), size=size,
                                     is_directory=bits[1]=='4', is_symlink=bits[1]=='2'))
     return ApexImageDirectory(path, entries, self)
 
@@ -156,20 +163,26 @@ class Apex(object):
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                universal_newlines=True)
     _, stderr = process.communicate()
-    print(stderr, file=sys.stderr)
+    if process.returncode != 0:
+      print(stderr, file=sys.stderr)
 
 
 def RunList(args):
-  with Apex(args.apex) as apex:
+  with Apex(args) as apex:
     for e in apex.list(is_recursive=True):
-      if e.is_regular_file:
+      if e.is_directory:
+        continue
+      if args.size:
+        print(e.size, e.full_path)
+      else:
         print(e.full_path)
 
 
 def RunExtract(args):
-  with Apex(args.apex) as apex:
-     os.makedirs(args.dest, mode=0o755, exist_ok=True)
-     apex.extract(args.dest)
+  with Apex(args) as apex:
+    if not os.path.exists(args.dest):
+      os.makedirs(args.dest, mode=0o755)
+    apex.extract(args.dest)
 
 
 def RunInfo(args):
@@ -179,10 +192,17 @@ def RunInfo(args):
 
 def main(argv):
   parser = argparse.ArgumentParser()
+
+  debugfs_default = 'debugfs'  # assume in PATH by default
+  if 'ANDROID_HOST_OUT' in os.environ:
+    debugfs_default = '%s/bin/debugfs_static' % os.environ['ANDROID_HOST_OUT']
+  parser.add_argument('--debugfs_path', help='The path to debugfs binary', default=debugfs_default)
+
   subparsers = parser.add_subparsers()
 
   parser_list = subparsers.add_parser('list', help='prints content of an APEX to stdout')
   parser_list.add_argument('apex', type=str, help='APEX file')
+  parser_list.add_argument('--size', help='also show the size of the files', action="store_true")
   parser_list.set_defaults(func=RunList)
 
   parser_extract = subparsers.add_parser('extract', help='extracts content of an APEX to the given '
@@ -194,7 +214,6 @@ def main(argv):
   parser_info = subparsers.add_parser('info', help='prints APEX manifest')
   parser_info.add_argument('apex', type=str, help='APEX file')
   parser_info.set_defaults(func=RunInfo)
-
 
   args = parser.parse_args(argv)
 

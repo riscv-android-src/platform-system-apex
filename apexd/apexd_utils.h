@@ -31,13 +31,14 @@
 #include <android-base/chrono_utils.h>
 #include <android-base/logging.h>
 #include <android-base/result.h>
+#include <android-base/scopeguard.h>
 #include <android-base/strings.h>
 #include <cutils/android_reboot.h>
 
+#include "apex_constants.h"
 #include "string_log.h"
 
 using android::base::ErrnoError;
-using android::base::ErrnoErrorf;
 using android::base::Error;
 using android::base::Result;
 
@@ -117,7 +118,7 @@ Result<std::vector<std::string>> ReadDir(const std::string& path, FilterFn fn) {
       ret.push_back(entry.path());
     }
   });
-  if (!status) {
+  if (!status.ok()) {
     return status.error();
   }
   return ret;
@@ -125,7 +126,7 @@ Result<std::vector<std::string>> ReadDir(const std::string& path, FilterFn fn) {
 
 inline bool IsEmptyDirectory(const std::string& path) {
   auto res = ReadDir(path, [](auto _) { return true; });
-  return res && res->empty();
+  return res.ok() && res->empty();
 }
 
 inline Result<void> createDirIfNeeded(const std::string& path, mode_t mode) {
@@ -156,7 +157,7 @@ inline Result<void> createDirIfNeeded(const std::string& path, mode_t mode) {
 
 inline Result<void> DeleteDirContent(const std::string& path) {
   auto files = ReadDir(path, [](auto _) { return true; });
-  if (!files) {
+  if (!files.ok()) {
     return Error() << "Failed to delete " << path << " : " << files.error();
   }
   for (const std::string& file : *files) {
@@ -165,6 +166,16 @@ inline Result<void> DeleteDirContent(const std::string& path) {
     }
   }
   return {};
+}
+
+inline Result<ino_t> get_path_inode(const std::string& path) {
+  struct stat buf;
+  memset(&buf, 0, sizeof(buf));
+  if (stat(path.c_str(), &buf) != 0) {
+    return ErrnoError() << "Failed to stat " << path;
+  } else {
+    return buf.st_ino;
+  }
 }
 
 inline Result<bool> PathExists(const std::string& path) {
@@ -204,6 +215,20 @@ inline Result<void> WaitForFile(const std::string& path,
     has_slept = true;
   }
   return ErrnoError() << "wait for '" << path << "' timed out and took " << t;
+}
+
+inline Result<std::vector<std::string>> GetDeUserDirs() {
+  namespace fs = std::filesystem;
+  auto filter_fn = [](const std::filesystem::directory_entry& entry) {
+    std::error_code ec;
+    bool result = entry.is_directory(ec);
+    if (ec) {
+      LOG(ERROR) << "Failed to check is_directory : " << ec.message();
+      return false;
+    }
+    return result;
+  };
+  return ReadDir(kDeNDataDir, filter_fn);
 }
 
 }  // namespace apex

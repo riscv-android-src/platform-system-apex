@@ -72,6 +72,19 @@ apex {
   whitelisted_files: "default_shim_whitelist.txt",
 }
 
+apex {
+  name: "com.android.apex.cts.shim.v2_no_hashtree",
+  manifest: "manifest_v2.json",
+  androidManifest: "AndroidManifest.xml",
+  file_contexts: ":apex.test-file_contexts",
+  key: "com.android.apex.cts.shim.key",
+  prebuilts: ["hash_of_dev_null"],
+  apps: ["CtsShimPrebuilt", "CtsShimPrivPrebuilt"],
+  installable: false,
+  whitelisted_files: "default_shim_whitelist.txt",
+  test_only_no_hashtree: true,
+}
+
 genrule {
   name: "generate_empty_hash",
   out: ["hash.txt"],
@@ -159,6 +172,7 @@ genrule {
     ":com.android.apex.cts.shim.v2_additional_file",
     ":com.android.apex.cts.shim.v2_additional_folder",
     ":com.android.apex.cts.shim.v2_different_certificate",
+    ":com.android.apex.cts.shim.v2_no_hashtree",
     ":com.android.apex.cts.shim.v2_signed_bob",
     ":com.android.apex.cts.shim.v2_signed_bob_rot",
     ":com.android.apex.cts.shim.v2_signed_bob_rot_rollback",
@@ -379,4 +393,26 @@ genrule {
     dest: "com.android.apex.cts.shim.v3_signed_bob_rot.apex",
   },
   cmd: "$(location :apksigner) sign --v1-signing-enabled false --v2-signing-enabled false --key $(location :com.android.apex.rotation.key.bob.pk8) --cert $(location :com.android.apex.rotation.key.bob.x509.pem) --lineage $(location :com.android.apex.rotation.key.bob.rot) --out $(out) $(location :com.android.apex.cts.shim.v3)",
+}
+
+// This one is only used in ApexdHostTest and not meant to be installed
+// and hence shouldn't be whitelisted in hash.txt of v1 shim APEX.
+apex {
+  name: "com.android.apex.cts.shim.v2_legacy",
+  manifest: "manifest_v2.json",
+  androidManifest: "AndroidManifest.xml",
+  file_contexts: ":apex.test-file_contexts",
+  key: "com.android.apex.cts.shim.key",
+  prebuilts: ["hash_of_dev_null"],
+  apps: ["CtsShimPrebuilt", "CtsShimPrivPrebuilt"],
+  installable: false,
+  min_sdk_version: "29",
+}
+
+genrule {
+  name: "com.android.apex.cts.shim.v2_no_pb",
+  srcs: [":com.android.apex.cts.shim.v2_legacy"],
+  out: ["com.android.apex.cts.shim.v2_no_pb.apex"],
+  tools: ["zip2zip"],
+  cmd: "$(location zip2zip) -i $(in) -x apex_manifest.pb -o $(out)",
 }

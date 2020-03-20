@@ -29,6 +29,7 @@ apex {
     prebuilts: ["sample_prebuilt_file"],
     key: "com.android.apex.test_package.key",
     installable: false,
+    min_sdk_version: "29",  // test requires hashtree to be present.
 }
 
 apex {

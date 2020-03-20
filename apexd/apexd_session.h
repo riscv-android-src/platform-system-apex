@@ -28,8 +28,7 @@
 namespace android {
 namespace apex {
 
-static const std::string kApexSessionsDir =
-    std::string(kApexDataDir) + "/sessions";
+static const std::string kApexSessionsDir = "/metadata/apex/sessions";
 
 class ApexSession {
  public:
@@ -45,16 +44,20 @@ class ApexSession {
   ::apex::proto::SessionState::State GetState() const;
   int GetId() const;
   std::string GetBuildFingerprint() const;
+  std::string GetCrashingNativeProcess() const;
   bool IsFinalized() const;
   bool HasRollbackEnabled() const;
   bool IsRollback() const;
   int GetRollbackId() const;
+  const google::protobuf::RepeatedPtrField<std::string> GetApexNames() const;
 
   void SetChildSessionIds(const std::vector<int>& child_session_ids);
   void SetBuildFingerprint(const std::string& fingerprint);
   void SetHasRollbackEnabled(const bool enabled);
   void SetIsRollback(const bool is_rollback);
   void SetRollbackId(const int rollback_id);
+  void SetCrashingNativeProcess(const std::string& crashing_process);
+  void AddApexName(const std::string& apex_name);
 
   android::base::Result<void> UpdateStateAndCommit(
       const ::apex::proto::SessionState::State& state);

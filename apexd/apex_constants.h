@@ -28,14 +28,22 @@ static constexpr const char* kApexBackupDir = "/data/apex/backup";
 static constexpr const char* kApexHashTreeDir = "/data/apex/hashtree";
 static constexpr const char* kApexPackageSystemDir = "/system/apex";
 static constexpr const char* kApexPackageSystemExtDir = "/system_ext/apex";
+static constexpr const char* kApexPackageVendorDir = "/vendor/apex";
 static const std::vector<std::string> kApexPackageBuiltinDirs = {
     kApexPackageSystemDir,
     kApexPackageSystemExtDir,
     "/product/apex",
-    "/vendor/apex",
+    kApexPackageVendorDir,
 };
 static constexpr const char* kApexRoot = "/apex";
 static constexpr const char* kStagedSessionsDir = "/data/app-staging";
+
+static constexpr const char* kApexDataSubDir = "apexdata";
+static constexpr const char* kApexSnapshotSubDir = "apexrollback";
+
+static constexpr const char* kDeSysDataDir = "/data/misc";
+static constexpr const char* kDeNDataDir = "/data/misc_de";
+static constexpr const char* kCeDataDir = "/data/misc_ce";
 
 static constexpr const char* kApexPackageSuffix = ".apex";
 

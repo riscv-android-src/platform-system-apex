@@ -12,86 +12,76 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-java_test_host {
-    name: "timezone_data_e2e_tests",
-
-    srcs:  ["src/**/TimezoneDataHostTest.java"],
-
+java_defaults {
+    name: "apex_e2e_test_defaults",
     libs: ["tradefed"],
-
     static_libs: [
         "apex_e2e_base_test",
+    ],
+}
+
+java_test_host {
+    name: "adbd_e2e_tests",
+    srcs:  ["src/**/AdbdHostTest.java"],
+    defaults: ["apex_e2e_test_defaults"],
+    data: [
+        ":test_com.android.adbd",
+    ],
+    test_config: "adbd-e2e-tests.xml",
+    test_suites: ["general-tests"],
+}
+
+java_test_host {
+    name: "timezone_data_e2e_tests",
+    srcs:  ["src/**/TimezoneDataHostTest.java"],
+    defaults: ["apex_e2e_test_defaults"],
+    static_libs: [
         "platformprotos",
     ],
-
     data: [
         ":test1_com.android.tzdata",
     ],
-
     test_config: "timezone-data-e2e-tests.xml",
-
     test_suites: ["general-tests"],
 }
 
 java_test_host {
     name: "media_e2e_tests",
-
     srcs:  ["src/**/MediaHostTest.java"],
-
-    libs: ["tradefed"],
-
-    static_libs: ["apex_e2e_base_test"],
-
+    defaults: ["apex_e2e_test_defaults"],
     data: [
         ":test_com.android.media",
     ],
-
     test_config: "media-e2e-tests.xml",
-
     test_suites: ["general-tests"],
 }
 
 java_test_host {
     name: "media_swcodec_e2e_tests",
-
     srcs:  ["src/**/MediaSwCodecHostTest.java"],
-
-    libs: ["tradefed"],
-
-    static_libs: ["apex_e2e_base_test"],
-
+    defaults: ["apex_e2e_test_defaults"],
     data: [
         ":test_com.android.media.swcodec",
     ],
-
     test_config: "media-swcodec-e2e-tests.xml",
-
     test_suites: ["general-tests"],
 }
 
 java_test_host {
     name: "conscrypt_e2e_tests",
-
     srcs:  ["src/**/ConscryptHostTest.java"],
-
-    libs: ["tradefed"],
-
-    static_libs: ["apex_e2e_base_test"],
-
+    defaults: ["apex_e2e_test_defaults"],
     data: [
         ":test_com.android.conscrypt",
     ],
-
     test_config: "conscrypt-e2e-tests.xml",
-
     test_suites: ["general-tests"],
 }
 
 java_test_host {
     name: "neuralnetworks_e2e_tests",
     srcs:  ["src/**/NeuralNetworksHostTest.java"],
-    libs: ["tradefed"],
-    static_libs: ["apex_e2e_base_test"],
+    defaults: ["apex_e2e_test_defaults"],
     data: [
         ":test_com.android.neuralnetworks",
     ],
@@ -101,33 +91,33 @@ java_test_host {
 
 java_test_host {
     name: "ipsec_e2e_tests",
-
     srcs:  ["src/**/IpSecHostTest.java"],
-
-    libs: ["tradefed"],
-
-    static_libs: ["apex_e2e_base_test"],
-
+    defaults: ["apex_e2e_test_defaults"],
     data: [
         ":test_com.android.ipsec",
     ],
-
     test_config: "ipsec-e2e-tests.xml",
+    test_suites: ["general-tests"],
+}
 
+java_test_host {
+    name: "sdkextensions_e2e_tests",
+    srcs:  ["src/**/ApiExtensionsHostTest.java"],
+    libs: ["tradefed"],
+    static_libs: ["apex_e2e_base_test"],
+    data: [
+        ":test_com.android.sdkext",
+    ],
+    test_config: "sdkextensions-e2e-tests.xml",
     test_suites: ["general-tests"],
 }
 
 java_test_host {
     name: "apex_targetprep_tests",
-
     libs: ["tradefed"],
-
     srcs:  ["src/**/ApexTargetPrepTest.java"],
-
     data: [":StagedInstallTestApexV2"],
-
     test_config: "apex-targetprep-tests.xml",
-
     test_suites: ["general-tests"],
 }
 
@@ -210,6 +200,7 @@ java_test_host {
     data: [
         "testdata/trigger_watchdog.rc",
         "testdata/trigger_watchdog.sh",
+        "testdata/trigger_reboot.sh",
         ":com.android.apex.cts.shim.v2_prebuilt",
     ],
 }
@@ -236,4 +227,21 @@ java_test_host {
     test_config: "module-test-utils-tests.xml",
     test_suites: ["general-tests"],
     data: [":com.android.apex.cts.shim.v2_prebuilt"],
+}
+
+java_test_host {
+    name: "apexd_host_tests",
+    srcs:  ["src/**/ApexdHostTest.java"],
+    libs: ["tradefed"],
+    static_libs: [
+        "module_test_util",
+        "truth-prebuilt",
+        "apex_manifest_proto_java",
+    ],
+    test_config: "apexd-host-tests.xml",
+    test_suites: ["general-tests"],
+    data: [
+        ":apex.apexd_test_v2",
+        ":com.android.apex.cts.shim.v2_no_pb",
+    ],
 }
