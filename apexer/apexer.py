@@ -154,6 +154,17 @@ def ParseArgs(argv):
       '--build_info',
       required=False,
       help='Build information file to be used for default values.')
+  parser.add_argument(
+      '--payload_only',
+      action='store_true',
+      help='Outputs the payload image/zip only.'
+  )
+  parser.add_argument(
+      '--unsigned_payload_only',
+      action='store_true',
+      help="""Outputs the unsigned payload image/zip only. Also, setting this flag implies 
+                                    --payload_only is set too."""
+  )
   return parser.parse_args(argv)
 
 
@@ -278,8 +289,11 @@ def ValidateArgs(args):
     print(args.output + ' already exists. Use --force to overwrite.')
     return False
 
+  if args.unsigned_payload_only:
+    args.payload_only = True;
+
   if args.payload_type == 'image':
-    if not args.key:
+    if not args.key and not args.unsigned_payload_only:
       print('Missing --key {keyfile} argument!')
       return False
 
@@ -317,6 +331,16 @@ def ValidateArgs(args):
       if build_info.min_sdk_version:
         args.min_sdk_version = build_info.min_sdk_version
 
+  if not args.override_apk_package_name:
+    if build_info is not None:
+      if build_info.override_apk_package_name:
+        args.override_apk_package_name = build_info.override_apk_package_name
+
+  if not args.logging_parent:
+    if build_info is not None:
+      if build_info.logging_parent:
+        args.logging_parent = build_info.logging_parent
+
   return True
 
 def GenerateBuildInfo(args):
@@ -341,6 +365,12 @@ def GenerateBuildInfo(args):
 
   if args.no_hashtree:
     build_info.no_hashtree = True
+
+  if args.override_apk_package_name:
+    build_info.override_apk_package_name = args.override_apk_package_name
+
+  if args.logging_parent:
+    build_info.logging_parent = args.logging_parent
 
   return build_info
 
@@ -432,9 +462,10 @@ def CreateApex(args, work_dir):
     copyfile(args.manifest_json, os.path.join(manifests_dir, 'apex_manifest.json'))
 
   if args.payload_type == 'image':
-    key_name = os.path.basename(os.path.splitext(args.key)[0])
-    if args.do_not_check_keyname:
+    if args.do_not_check_keyname or args.unsigned_payload_only:
       key_name = manifest_apex.name
+    else:
+      key_name = os.path.basename(os.path.splitext(args.key)[0])
 
     if manifest_apex.name != key_name:
       print("package name '" + manifest_apex.name +
@@ -498,6 +529,12 @@ def CreateApex(args, work_dir):
     cmd.append(img_file)
     RunCommand(cmd, args.verbose, {'E2FSPROGS_FAKE_TIME': '1'})
 
+    if args.unsigned_payload_only:
+      shutil.copyfile(img_file, args.output)
+      if (args.verbose):
+        print('Created (unsigned payload only) ' + args.output)
+      return True
+
     cmd = ['avbtool']
     cmd.append('add_hashtree_footer')
     cmd.append('--do_not_generate_fec')
@@ -540,6 +577,12 @@ def CreateApex(args, work_dir):
     cmd.extend(['-C', manifests_dir])
     cmd.extend(['-D', manifests_dir])
     RunCommand(cmd, args.verbose)
+
+  if args.payload_only:
+    shutil.copyfile(img_file, args.output)
+    if (args.verbose):
+      print('Created (payload only) ' + args.output)
+    return True
 
   # package the image file and APEX manifest as an APK.
   # The AndroidManifest file is automatically generated if not given.
