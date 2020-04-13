@@ -168,6 +168,16 @@ inline Result<void> DeleteDirContent(const std::string& path) {
   return {};
 }
 
+inline Result<void> DeleteDir(const std::string& path) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::remove_all(path, ec);
+  if (ec) {
+    return Error() << "Failed to delete path " << path << " : " << ec.message();
+  }
+  return {};
+}
+
 inline Result<ino_t> get_path_inode(const std::string& path) {
   struct stat buf;
   memset(&buf, 0, sizeof(buf));
@@ -217,7 +227,7 @@ inline Result<void> WaitForFile(const std::string& path,
   return ErrnoError() << "wait for '" << path << "' timed out and took " << t;
 }
 
-inline Result<std::vector<std::string>> GetDeUserDirs() {
+inline Result<std::vector<std::string>> GetSubdirs(const std::string& path) {
   namespace fs = std::filesystem;
   auto filter_fn = [](const std::filesystem::directory_entry& entry) {
     std::error_code ec;
@@ -228,7 +238,11 @@ inline Result<std::vector<std::string>> GetDeUserDirs() {
     }
     return result;
   };
-  return ReadDir(kDeNDataDir, filter_fn);
+  return ReadDir(path, filter_fn);
+}
+
+inline Result<std::vector<std::string>> GetDeUserDirs() {
+  return GetSubdirs(kDeNDataDir);
 }
 
 }  // namespace apex

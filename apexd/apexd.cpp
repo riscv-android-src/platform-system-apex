@@ -37,6 +37,7 @@
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/macros.h>
+#include <android-base/parseint.h>
 #include <android-base/properties.h>
 #include <android-base/scopeguard.h>
 #include <android-base/stringprintf.h>
@@ -51,6 +52,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/loop.h>
+#include <stdlib.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
@@ -76,6 +78,7 @@ using android::base::ErrnoError;
 using android::base::Error;
 using android::base::GetProperty;
 using android::base::Join;
+using android::base::ParseUint;
 using android::base::ReadFully;
 using android::base::Result;
 using android::base::StartsWith;
@@ -1193,9 +1196,11 @@ Result<void> scanPackagesDirAndActivate(const char* apex_package_dir) {
  */
 Result<void> snapshotDataDirectory(const std::string& base_dir,
                                    const int rollback_id,
-                                   const std::string& apex_name) {
-  auto rollback_path = StringPrintf("%s/%s/%d", base_dir.c_str(),
-                                    kApexSnapshotSubDir, rollback_id);
+                                   const std::string& apex_name,
+                                   bool pre_restore = false) {
+  auto rollback_path =
+      StringPrintf("%s/%s/%d%s", base_dir.c_str(), kApexSnapshotSubDir,
+                   rollback_id, pre_restore ? kPreRestoreSuffix : "");
   const Result<void> result = createDirIfNeeded(rollback_path, 0700);
   if (!result.ok()) {
     return Error() << "Failed to create snapshot directory for rollback "
@@ -1215,10 +1220,11 @@ Result<void> snapshotDataDirectory(const std::string& base_dir,
  */
 Result<void> restoreDataDirectory(const std::string& base_dir,
                                   const int rollback_id,
-                                  const std::string& apex_name) {
-  auto from_path =
-      StringPrintf("%s/%s/%d/%s", base_dir.c_str(), kApexSnapshotSubDir,
-                   rollback_id, apex_name.c_str());
+                                  const std::string& apex_name,
+                                  bool pre_restore = false) {
+  auto from_path = StringPrintf(
+      "%s/%s/%d%s/%s", base_dir.c_str(), kApexSnapshotSubDir, rollback_id,
+      pre_restore ? kPreRestoreSuffix : "", apex_name.c_str());
   auto to_path = StringPrintf("%s/%s/%s", base_dir.c_str(), kApexDataSubDir,
                               apex_name.c_str());
   const Result<void> result = ReplaceFiles(from_path, to_path);
@@ -1228,8 +1234,8 @@ Result<void> restoreDataDirectory(const std::string& base_dir,
   return RestoreconPath(to_path);
 }
 
-void snapshotOrRestoreIfNeeded(const std::string& base_dir,
-                               const ApexSession& session) {
+void snapshotOrRestoreDeIfNeeded(const std::string& base_dir,
+                                 const ApexSession& session) {
   if (session.HasRollbackEnabled()) {
     for (const auto& apex_name : session.GetApexNames()) {
       Result<void> result =
@@ -1241,7 +1247,11 @@ void snapshotOrRestoreIfNeeded(const std::string& base_dir,
     }
   } else if (session.IsRollback()) {
     for (const auto& apex_name : session.GetApexNames()) {
-      // TODO: Back up existing files in case rollback is reverted.
+      if (!gInFsCheckpointMode) {
+        // Snapshot before restore so this rollback can be reverted.
+        snapshotDataDirectory(base_dir, session.GetRollbackId(), apex_name,
+                              true /* pre_restore */);
+      }
       Result<void> result =
           restoreDataDirectory(base_dir, session.GetRollbackId(), apex_name);
       if (!result.ok()) {
@@ -1256,7 +1266,7 @@ void snapshotOrRestoreDeSysData() {
   auto sessions = ApexSession::GetSessionsInState(SessionState::ACTIVATED);
 
   for (const ApexSession& session : sessions) {
-    snapshotOrRestoreIfNeeded(kDeSysDataDir, session);
+    snapshotOrRestoreDeIfNeeded(kDeSysDataDir, session);
   }
 }
 
@@ -1272,7 +1282,7 @@ int snapshotOrRestoreDeUserData() {
 
   for (const ApexSession& session : sessions) {
     for (const auto& user_dir : *user_dirs) {
-      snapshotOrRestoreIfNeeded(user_dir, session);
+      snapshotOrRestoreDeIfNeeded(user_dir, session);
     }
   }
 
@@ -1329,17 +1339,9 @@ Result<void> migrateSessionsDirIfNeeded() {
 
 Result<void> destroySnapshots(const std::string& base_dir,
                               const int rollback_id) {
-  namespace fs = std::filesystem;
   auto path = StringPrintf("%s/%s/%d", base_dir.c_str(), kApexSnapshotSubDir,
                            rollback_id);
-
-  std::error_code error_code;
-  fs::remove_all(path, error_code);
-  if (error_code) {
-    return Error() << "Failed to delete snapshots at " << path << " : "
-                   << error_code.message();
-  }
-  return {};
+  return DeleteDir(path);
 }
 
 Result<void> destroyDeSnapshots(const int rollback_id) {
@@ -1354,6 +1356,98 @@ Result<void> destroyDeSnapshots(const int rollback_id) {
     destroySnapshots(user_dir, rollback_id);
   }
 
+  return {};
+}
+
+void restorePreRestoreSnapshotsIfPresent(const std::string& base_dir,
+                                         const ApexSession& session) {
+  auto pre_restore_snapshot_path =
+      StringPrintf("%s/%s/%d%s", base_dir.c_str(), kApexSnapshotSubDir,
+                   session.GetRollbackId(), kPreRestoreSuffix);
+  if (PathExists(pre_restore_snapshot_path)) {
+    for (const auto& apex_name : session.GetApexNames()) {
+      Result<void> result = restoreDataDirectory(
+          base_dir, session.GetRollbackId(), apex_name, true /* pre_restore */);
+      if (!result) {
+        LOG(ERROR) << "Restore of pre-restore snapshot failed for " << apex_name
+                   << ": " << result.error();
+      }
+    }
+
+    Result<void> result = DeleteDir(pre_restore_snapshot_path);
+    if (!result) {
+      LOG(ERROR) << "Deletion of pre-restore snapshot failed: "
+                 << result.error();
+    }
+  }
+}
+
+void restoreDePreRestoreSnapshotsIfPresent(const ApexSession& session) {
+  restorePreRestoreSnapshotsIfPresent(kDeSysDataDir, session);
+
+  auto user_dirs = GetDeUserDirs();
+  if (!user_dirs) {
+    LOG(ERROR) << "Error reading user dirs to restore pre-restore snapshots"
+               << user_dirs.error();
+  }
+
+  for (const auto& user_dir : *user_dirs) {
+    restorePreRestoreSnapshotsIfPresent(user_dir, session);
+  }
+}
+
+void deleteDePreRestoreSnapshots(const std::string& base_dir,
+                                 const ApexSession& session) {
+  auto pre_restore_snapshot_path =
+      StringPrintf("%s/%s/%d%s", base_dir.c_str(), kApexSnapshotSubDir,
+                   session.GetRollbackId(), kPreRestoreSuffix);
+  Result<void> result = DeleteDir(pre_restore_snapshot_path);
+  if (!result) {
+    LOG(ERROR) << "Deletion of pre-restore snapshot failed: " << result.error();
+  }
+}
+
+void deleteDePreRestoreSnapshots(const ApexSession& session) {
+  deleteDePreRestoreSnapshots(kDeSysDataDir, session);
+
+  auto user_dirs = GetDeUserDirs();
+  if (!user_dirs) {
+    LOG(ERROR) << "Error reading user dirs to delete pre-restore snapshots"
+               << user_dirs.error();
+  }
+
+  for (const auto& user_dir : *user_dirs) {
+    deleteDePreRestoreSnapshots(user_dir, session);
+  }
+}
+
+/**
+ * Deletes all credential-encrypted snapshots for the given user, except for
+ * those listed in retain_rollback_ids.
+ */
+Result<void> destroyCeSnapshotsNotSpecified(
+    int user_id, const std::vector<int>& retain_rollback_ids) {
+  auto snapshot_root =
+      StringPrintf("%s/%d/%s", kCeDataDir, user_id, kApexSnapshotSubDir);
+  auto snapshot_dirs = GetSubdirs(snapshot_root);
+  if (!snapshot_dirs) {
+    return Error() << "Error reading snapshot dirs " << snapshot_dirs.error();
+  }
+
+  for (const auto& snapshot_dir : *snapshot_dirs) {
+    uint snapshot_id;
+    bool parse_ok = ParseUint(
+        std::filesystem::path(snapshot_dir).filename().c_str(), &snapshot_id);
+    if (parse_ok &&
+        std::find(retain_rollback_ids.begin(), retain_rollback_ids.end(),
+                  snapshot_id) == retain_rollback_ids.end()) {
+      Result<void> result = DeleteDir(snapshot_dir);
+      if (!result) {
+        return Error() << "Destroy CE snapshot failed for " << snapshot_dir
+                       << " : " << result.error();
+      }
+    }
+  }
   return {};
 }
 
@@ -1657,6 +1751,12 @@ Result<void> revertActiveSessions(const std::string& crashing_native_process) {
   }
 
   for (auto& session : activeSessions) {
+    if (!gInFsCheckpointMode && session.IsRollback()) {
+      // If snapshots have already been restored, undo that by restoring the
+      // pre-restore snapshot.
+      restoreDePreRestoreSnapshotsIfPresent(session);
+    }
+
     auto status = session.UpdateStateAndCommit(SessionState::REVERTED);
     if (!status) {
       LOG(WARNING) << "Failed to mark session " << session
@@ -1874,13 +1974,19 @@ void onStart(CheckpointInterface* checkpoint_service) {
 
   // Now also scan and activate APEXes from pre-installed directories.
   for (const auto& dir : kApexPackageBuiltinDirs) {
-    // TODO(b/123622800): if activation failed, revert and reboot.
-    status = scanPackagesDirAndActivate(dir.c_str());
-    if (!status) {
+    auto scan_status = ScanApexFiles(dir.c_str());
+    if (!scan_status.ok()) {
+      LOG(ERROR) << "Failed to scan APEX packages from " << dir << " : "
+                 << scan_status.error();
+      if (auto revert = revertActiveSessionsAndReboot(""); !revert.ok()) {
+        LOG(ERROR) << "Failed to revert : " << revert.error();
+      }
+    }
+    if (auto activate = ActivateApexPackages(*scan_status); !activate.ok()) {
       // This should never happen. Like **really** never.
       // TODO: should we kill apexd in this case?
       LOG(ERROR) << "Failed to activate packages from " << dir << " : "
-                 << status.error();
+                 << activate.error();
     }
   }
 
@@ -2016,6 +2122,9 @@ Result<void> markStagedSessionSuccessful(const int session_id) {
     if (!cleanup_status.ok()) {
       return Error() << "Failed to mark session " << *session
                      << " as successful : " << cleanup_status.error();
+    }
+    if (session->IsRollback() && !gInFsCheckpointMode) {
+      deleteDePreRestoreSnapshots(*session);
     }
     return session->UpdateStateAndCommit(SessionState::SUCCESS);
   } else {
