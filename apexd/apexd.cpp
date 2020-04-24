@@ -101,6 +101,7 @@ namespace {
 // These should be in-sync with system/sepolicy/public/property_contexts
 static constexpr const char* kApexStatusSysprop = "apexd.status";
 static constexpr const char* kApexStatusStarting = "starting";
+static constexpr const char* kApexStatusActivated = "activated";
 static constexpr const char* kApexStatusReady = "ready";
 
 static constexpr const char* kBuildFingerprintSysprop = "ro.build.fingerprint";
@@ -1879,13 +1880,7 @@ Result<void> monitorBuiltinDirs() {
   return {};
 }
 
-void onStart(CheckpointInterface* checkpoint_service) {
-  LOG(INFO) << "Marking APEXd as starting";
-  if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusStarting)) {
-    PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
-                << kApexStatusStarting;
-  }
-
+void initialize(CheckpointInterface* checkpoint_service) {
   if (checkpoint_service != nullptr) {
     gVoldService = checkpoint_service;
     Result<bool> supports_fs_checkpoints =
@@ -1907,6 +1902,22 @@ void onStart(CheckpointInterface* checkpoint_service) {
     }
   }
 
+  Result<void> status = collectPreinstalledData(kApexPackageBuiltinDirs);
+  if (!status.ok()) {
+    LOG(ERROR) << "Failed to collect APEX keys : " << status.error();
+    return;
+  }
+
+  gMountedApexes.PopulateFromMounts();
+}
+
+void onStart() {
+  LOG(INFO) << "Marking APEXd as starting";
+  if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusStarting)) {
+    PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
+                << kApexStatusStarting;
+  }
+
   // Ask whether we should revert any active sessions; this can happen if
   // we've exceeded the retry count on a device that supports filesystem
   // checkpointing.
@@ -1923,18 +1934,10 @@ void onStart(CheckpointInterface* checkpoint_service) {
     }
   }
 
-  Result<void> status = collectPreinstalledData(kApexPackageBuiltinDirs);
-  if (!status.ok()) {
-    LOG(ERROR) << "Failed to collect APEX keys : " << status.error();
-    return;
-  }
-
-  gMountedApexes.PopulateFromMounts();
-
   // Activate APEXes from /data/apex. If one in the directory is newer than the
   // system one, the new one will eclipse the old one.
   scanStagedSessionsDirAndStage();
-  status = resumeRevertIfNeeded();
+  auto status = resumeRevertIfNeeded();
   if (!status.ok()) {
     LOG(ERROR) << "Failed to resume revert : " << status.error();
   }
@@ -1999,8 +2002,21 @@ void onStart(CheckpointInterface* checkpoint_service) {
   }
 }
 
+void onAllPackagesActivated() {
+  // Set a system property to let other components know that APEXs are
+  // activated, but are not yet ready to be used. init is expected to wait
+  // for this status before performing configuration based on activated
+  // apexes. Other components that need to use APEXs should wait for the
+  // ready state instead.
+  LOG(INFO) << "Marking APEXd as activated";
+  if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusActivated)) {
+    PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
+                << kApexStatusActivated;
+  }
+}
+
 void onAllPackagesReady() {
-  // Set a system property to let other components to know that APEXs are
+  // Set a system property to let other components know that APEXs are
   // correctly mounted and ready to be used. Before using any file from APEXs,
   // they can query this system property to ensure that they are okay to
   // access. Or they may have a on-property trigger to delay a task until
@@ -2203,6 +2219,11 @@ int unmountAll() {
     }
   });
   return ret;
+}
+
+bool isBooting() {
+  auto status = GetProperty(kApexStatusSysprop, "");
+  return status != kApexStatusReady && status != kApexStatusActivated;
 }
 
 }  // namespace apex
