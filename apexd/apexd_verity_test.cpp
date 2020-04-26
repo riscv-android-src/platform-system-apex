@@ -25,6 +25,7 @@
 #include <gtest/gtest.h>
 
 #include "apex_file.h"
+#include "apex_preinstalled_data.h"
 #include "apexd_test_utils.h"
 #include "apexd_verity.h"
 
@@ -44,6 +45,7 @@ static std::string GetTestFile(const std::string& name) {
 }
 
 TEST(ApexdVerityTest, ReusesHashtree) {
+  ASSERT_TRUE(IsOk(collectPreinstalledData({"/system_ext/apex"})));
   TemporaryDir td;
 
   auto apex = ApexFile::Open(GetTestFile("apex.apexd_test_no_hashtree.apex"));
@@ -76,6 +78,7 @@ TEST(ApexdVerityTest, ReusesHashtree) {
 }
 
 TEST(ApexdVerityTest, RegenerateHashree) {
+  ASSERT_TRUE(IsOk(collectPreinstalledData({"/system_ext/apex"})));
   TemporaryDir td;
 
   auto apex = ApexFile::Open(GetTestFile("apex.apexd_test_no_hashtree.apex"));
@@ -114,9 +117,3 @@ TEST(ApexdVerityTest, RegenerateHashree) {
 
 }  // namespace apex
 }  // namespace android
-
-int main(int argc, char** argv) {
-  android::base::InitLogging(argv, &android::base::StderrLogger);
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}
