@@ -51,23 +51,19 @@ prebuilt_etc {
 apex {
   name: "com.android.apex.cts.shim.v3",
   manifest: "manifest_v3.json",
-  androidManifest: "AndroidManifest.xml",
   file_contexts: "apex.test",
   key: "com.android.apex.cts.shim.key",
   prebuilts: ["hash_of_dev_null"],
   installable: false,
-  whitelisted_files: "default_shim_whitelist.txt",
 }
 
 apex {
   name: "com.android.apex.cts.shim.v2",
   manifest: "manifest_v2.json",
-  androidManifest: "AndroidManifest.xml",
   file_contexts: "apex.test",
   key: "com.android.apex.cts.shim.key",
   prebuilts: ["hash_of_dev_null"],
   installable: false,
-  whitelisted_files: "default_shim_whitelist.txt",
 }
 
 genrule {
@@ -88,7 +84,6 @@ prebuilt_etc {
 apex {
   name: "com.android.apex.cts.shim.v2_wrong_sha",
   manifest: "manifest_v2.json",
-  androidManifest: "AndroidManifest.xml",
   file_contexts: "apex.test",
   key: "com.android.apex.cts.shim.key",
   prebuilts: ["empty_hash"],
@@ -105,7 +100,6 @@ prebuilt_etc {
 apex {
   name: "com.android.apex.cts.shim.v2_additional_file",
   manifest: "manifest_v2.json",
-  androidManifest: "AndroidManifest.xml",
   file_contexts: "apex.test",
   key: "com.android.apex.cts.shim.key",
   prebuilts: ["hash_of_dev_null", "apex_shim_additional_file"],
@@ -123,7 +117,6 @@ prebuilt_etc {
 apex {
   name: "com.android.apex.cts.shim.v2_additional_folder",
   manifest: "manifest_v2.json",
-  androidManifest: "AndroidManifest.xml",
   file_contexts: "apex.test",
   key: "com.android.apex.cts.shim.key",
   prebuilts: ["hash_of_dev_null", "apex_shim_additional_folder"],
@@ -133,7 +126,6 @@ apex {
 apex {
   name: "com.android.apex.cts.shim.v2_with_pre_install_hook",
   manifest: "manifest_v2_with_pre_install_hook.json",
-  androidManifest: "AndroidManifest.xml",
   file_contexts: "apex.test",
   key: "com.android.apex.cts.shim.key",
   prebuilts: ["hash_of_dev_null"],
@@ -143,7 +135,6 @@ apex {
 apex {
   name: "com.android.apex.cts.shim.v2_with_post_install_hook",
   manifest: "manifest_v2_with_post_install_hook.json",
-  androidManifest: "AndroidManifest.xml",
   file_contexts: "apex.test",
   key: "com.android.apex.cts.shim.key",
   prebuilts: ["hash_of_dev_null"],
@@ -156,15 +147,9 @@ genrule {
     ":com.android.apex.cts.shim.v2",
     ":com.android.apex.cts.shim.v2_additional_file",
     ":com.android.apex.cts.shim.v2_additional_folder",
-    ":com.android.apex.cts.shim.v2_different_certificate",
-    ":com.android.apex.cts.shim.v2_signed_bob",
-    ":com.android.apex.cts.shim.v2_signed_bob_rot",
-    ":com.android.apex.cts.shim.v2_signed_eve",
     ":com.android.apex.cts.shim.v2_with_pre_install_hook",
     ":com.android.apex.cts.shim.v2_with_post_install_hook",
     ":com.android.apex.cts.shim.v3",
-    ":com.android.apex.cts.shim.v3_signed_bob",
-    ":com.android.apex.cts.shim.v3_signed_bob_rot",
   ],
   out: ["hash.txt"],
   cmd: "sha512sum -b $(in) | cut -d' ' -f1 | tee $(out)",
@@ -180,12 +165,10 @@ prebuilt_etc {
 apex {
   name: "com.android.apex.cts.shim.v1",
   manifest: "manifest.json",
-  androidManifest: "AndroidManifest.xml",
   file_contexts: "apex.test",
   key: "com.android.apex.cts.shim.key",
   prebuilts: ["hash_v1"],
   installable: false,
-  whitelisted_files: "default_shim_whitelist.txt",
 }
 
 genrule {
@@ -216,173 +199,4 @@ apex {
   key: "com.android.apex.cts.shim_not_pre_installed.key",
   prebuilts: ["hash_of_dev_null"],
   installable: false,
-}
-
-apex {
-  name: "com.android.apex.cts.shim.v2_different_certificate",
-  manifest: "manifest_v2.json",
-  androidManifest: "AndroidManifest.xml",
-  file_contexts: "apex.test",
-  key: "com.android.apex.cts.shim.key",
-  prebuilts: ["hash_of_dev_null"],
-  installable: false,
-  certificate: ":com.android.apex.cts.shim.debug.cert",
-}
-
-android_app_certificate {
-  name: "com.android.apex.cts.shim.debug.cert",
-  certificate: "com.android.apex.cts.shim.debug.cert",
-}
-
-// Build rules to build shim apex with rotated keys
-
-// We name the original key used to sign cts.shim.v1 package as alice.
-// We then create a second key called bob. The second key bob is used to rotate the
-// original key alice.
-
-// Create private key bob in pem format
-genrule {
-  name: "com.android.apex.rotation.key.bob.pem",
-  out: ["bob.pem"],
-  cmd: "openssl req -x509 -newkey rsa:4096 -nodes -days 999999 -subj '/DN=/EMAILADDRESS=android@android.com/CN=Android/OU=Android/O=Android/L=Mountain View/ST=California/C=US' -keyout $(out)",
-}
-
-// Converts bob's private key to pk8 format
-genrule {
-  name: "com.android.apex.rotation.key.bob.pk8",
-  srcs: [":com.android.apex.rotation.key.bob.pem"],
-  out: ["bob.pk8"],
-  cmd: "openssl pkcs8 -topk8 -inform PEM -outform DER -in $(in) -out $(out) -nocrypt",
-}
-
-// Extract bob's public key from its private key
-genrule {
-    name: "com.android.apex.rotation.key.bob.x509.pem",
-    srcs: [":com.android.apex.rotation.key.bob.pem"],
-    out: ["bob.x509.pem"],
-    cmd: "openssl req -x509 -key $(in) -newkey rsa:4096 -nodes -days 999999 -subj '/DN=/EMAILADDRESS=android@android.com/CN=Android/OU=Android/O=Android/L=Mountain View/ST=California/C=US' -out $(out)",
-}
-
-// Create lineage file for rotating alice to bob
-genrule {
-  name: "com.android.apex.rotation.key.bob.rot",
-  srcs: [
-    "alice.pk8",
-    "alice.x509.pem",
-    ":com.android.apex.rotation.key.bob.pk8",
-    ":com.android.apex.rotation.key.bob.x509.pem",
-  ],
-  out: ["bob.rot"],
-  tools: [":apksigner"],
-  cmd: "$(location :apksigner) rotate --out $(out) --old-signer --key $(location alice.pk8) --cert $(location alice.x509.pem) --new-signer --key $(location :com.android.apex.rotation.key.bob.pk8) --cert $(location :com.android.apex.rotation.key.bob.x509.pem)",
-}
-
-// Create another key called eve
-genrule {
-  name: "com.android.apex.rotation.key.eve.pem",
-  out: ["eve.pem"],
-  cmd: "openssl req -x509 -newkey rsa:4096 -nodes -days 999999 -subj '/DN=/EMAILADDRESS=android@android.com/CN=Android/OU=Android/O=Android/L=Mountain View/ST=California/C=US' -keyout $(out)",
-}
-
-// Converts eve's private key to pk8 format
-genrule {
-  name: "com.android.apex.rotation.key.eve.pk8",
-  srcs: [":com.android.apex.rotation.key.eve.pem"],
-  out: ["eve.pk8"],
-  cmd: "openssl pkcs8 -topk8 -inform PEM -outform DER -in $(in) -out $(out) -nocrypt",
-}
-
-// Extract eve's public key from its private key
-genrule {
-    name: "com.android.apex.rotation.key.eve.x509.pem",
-    srcs: [":com.android.apex.rotation.key.eve.pem"],
-    out: ["eve.x509.pem"],
-    cmd: "openssl req -x509 -key $(in) -newkey rsa:4096 -nodes -days 999999 -subj '/DN=/EMAILADDRESS=android@android.com/CN=Android/OU=Android/O=Android/L=Mountain View/ST=California/C=US' -out $(out)",
-}
-
-// v2 cts shim package signed by bob, without lineage
-genrule {
-  name: "com.android.apex.cts.shim.v2_signed_bob",
-  out: ["com.android.apex.cts.shim.v2_signed_bob"],
-  tools: [":apksigner"],
-  srcs: [
-    ":com.android.apex.cts.shim.v2",
-    ":com.android.apex.rotation.key.bob.x509.pem",
-    ":com.android.apex.rotation.key.bob.pk8",
-  ],
-  dist: {
-    targets: ["com.android.apex.cts.shim.v2_signed_bob"],
-    dest: "com.android.apex.cts.shim.v2_signed_bob.apex",
-  },
-  cmd: "$(location :apksigner) sign --v1-signing-enabled false --v2-signing-enabled false --key $(location :com.android.apex.rotation.key.bob.pk8) --cert $(location :com.android.apex.rotation.key.bob.x509.pem) --out $(out) $(location :com.android.apex.cts.shim.v2)",
-}
-
-// v2 cts shim package signed by bob + lineage
-genrule {
-  name: "com.android.apex.cts.shim.v2_signed_bob_rot",
-  out: ["com.android.apex.cts.shim.v2_signed_bob_rot"],
-  tools: [":apksigner"],
-  srcs: [
-    ":com.android.apex.cts.shim.v2",
-    ":com.android.apex.rotation.key.bob.x509.pem",
-    ":com.android.apex.rotation.key.bob.pk8",
-    ":com.android.apex.rotation.key.bob.rot",
-  ],
-  dist: {
-    targets: ["com.android.apex.cts.shim.v2_signed_bob_rot"],
-    dest: "com.android.apex.cts.shim.v2_signed_bob_rot.apex",
-  },
-  cmd: "$(location :apksigner) sign --v1-signing-enabled false --v2-signing-enabled false --key $(location :com.android.apex.rotation.key.bob.pk8) --cert $(location :com.android.apex.rotation.key.bob.x509.pem) --lineage $(location :com.android.apex.rotation.key.bob.rot) --out $(out) $(location :com.android.apex.cts.shim.v2)",
-}
-
-// v2 cts shim package signed by eve
-genrule {
-  name: "com.android.apex.cts.shim.v2_signed_eve",
-  out: ["com.android.apex.cts.shim.v2_signed_eve"],
-  tools: [":apksigner"],
-  srcs: [
-    ":com.android.apex.cts.shim.v2",
-    ":com.android.apex.rotation.key.eve.x509.pem",
-    ":com.android.apex.rotation.key.eve.pk8",
-  ],
-  dist: {
-    targets: ["com.android.apex.cts.shim.v2_signed_eve"],
-    dest: "com.android.apex.cts.shim.v2_signed_eve.apex",
-  },
-  cmd: "$(location :apksigner) sign --v1-signing-enabled false --v2-signing-enabled false --key $(location :com.android.apex.rotation.key.eve.pk8) --cert $(location :com.android.apex.rotation.key.eve.x509.pem) --out $(out) $(location :com.android.apex.cts.shim.v2)",
-}
-
-// v3 cts shim package signed by bob
-genrule {
-  name: "com.android.apex.cts.shim.v3_signed_bob",
-  out: ["com.android.apex.cts.shim.v3_signed_bob"],
-  tools: [":apksigner"],
-  srcs: [
-    ":com.android.apex.cts.shim.v3",
-    ":com.android.apex.rotation.key.bob.x509.pem",
-    ":com.android.apex.rotation.key.bob.pk8",
-  ],
-  dist: {
-    targets: ["com.android.apex.cts.shim.v3_signed_bob"],
-    dest: "com.android.apex.cts.shim.v3_signed_bob.apex",
-  },
-  cmd: "$(location :apksigner) sign --v1-signing-enabled false --v2-signing-enabled false --key $(location :com.android.apex.rotation.key.bob.pk8) --cert $(location :com.android.apex.rotation.key.bob.x509.pem) --out $(out) $(location :com.android.apex.cts.shim.v3)",
-}
-
-// v3 cts shim package signed by bob + lineage
-genrule {
-  name: "com.android.apex.cts.shim.v3_signed_bob_rot",
-  out: ["com.android.apex.cts.shim.v3_signed_bob_rot"],
-  tools: [":apksigner"],
-  srcs: [
-    ":com.android.apex.cts.shim.v3",
-    ":com.android.apex.rotation.key.bob.x509.pem",
-    ":com.android.apex.rotation.key.bob.pk8",
-    ":com.android.apex.rotation.key.bob.rot",
-  ],
-  dist: {
-    targets: ["com.android.apex.cts.shim.v3_signed_bob_rot"],
-    dest: "com.android.apex.cts.shim.v3_signed_bob_rot.apex",
-  },
-  cmd: "$(location :apksigner) sign --v1-signing-enabled false --v2-signing-enabled false --key $(location :com.android.apex.rotation.key.bob.pk8) --cert $(location :com.android.apex.rotation.key.bob.x509.pem) --lineage $(location :com.android.apex.rotation.key.bob.rot) --out $(out) $(location :com.android.apex.cts.shim.v3)",
 }

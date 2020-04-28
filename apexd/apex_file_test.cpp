@@ -24,9 +24,7 @@
 #include <ziparchive/zip_archive.h>
 
 #include "apex_file.h"
-#include "apex_preinstalled_data.h"
-
-using android::base::Result;
+#include "apex_key.h"
 
 static std::string testDataDir = android::base::GetExecutableDirectory() + "/";
 
@@ -36,8 +34,8 @@ namespace {
 
 TEST(ApexFileTest, GetOffsetOfSimplePackage) {
   const std::string filePath = testDataDir + "apex.apexd_test.apex";
-  Result<ApexFile> apexFile = ApexFile::Open(filePath);
-  ASSERT_TRUE(apexFile);
+  StatusOr<ApexFile> apexFile = ApexFile::Open(filePath);
+  ASSERT_TRUE(apexFile.Ok());
 
   int32_t zip_image_offset;
   size_t zip_image_size;
@@ -49,7 +47,7 @@ TEST(ApexFileTest, GetOffsetOfSimplePackage) {
         android::base::make_scope_guard([&handle]() { CloseArchive(handle); });
 
     ZipEntry entry;
-    rc = FindEntry(handle, "apex_payload.img", &entry);
+    rc = FindEntry(handle, ZipString("apex_payload.img"), &entry);
     ASSERT_EQ(0, rc);
 
     zip_image_offset = entry.offset;
@@ -64,47 +62,49 @@ TEST(ApexFileTest, GetOffsetOfSimplePackage) {
 
 TEST(ApexFileTest, GetOffsetMissingFile) {
   const std::string filePath = testDataDir + "missing.apex";
-  Result<ApexFile> apexFile = ApexFile::Open(filePath);
-  ASSERT_FALSE(apexFile);
+  StatusOr<ApexFile> apexFile = ApexFile::Open(filePath);
+  ASSERT_FALSE(apexFile.Ok());
   EXPECT_NE(std::string::npos,
-            apexFile.error().message().find("Failed to open package"))
-      << apexFile.error();
+            apexFile.ErrorMessage().find("Failed to open package"))
+      << apexFile.ErrorMessage();
 }
 
 TEST(ApexFileTest, GetApexManifest) {
   const std::string filePath = testDataDir + "apex.apexd_test.apex";
-  Result<ApexFile> apexFile = ApexFile::Open(filePath);
-  ASSERT_TRUE(apexFile);
+  StatusOr<ApexFile> apexFile = ApexFile::Open(filePath);
+  ASSERT_TRUE(apexFile.Ok());
   EXPECT_EQ("com.android.apex.test_package", apexFile->GetManifest().name());
   EXPECT_EQ(1u, apexFile->GetManifest().version());
 }
 
 TEST(ApexFileTest, VerifyApexVerity) {
   const std::string filePath = testDataDir + "apex.apexd_test.apex";
-  Result<ApexFile> apexFile = ApexFile::Open(filePath);
-  ASSERT_TRUE(apexFile) << apexFile.error();
+  StatusOr<ApexFile> apexFile = ApexFile::Open(filePath);
+  ASSERT_TRUE(apexFile.Ok()) << apexFile.ErrorMessage();
 
   auto verity_or = apexFile->VerifyApexVerity();
-  ASSERT_TRUE(verity_or) << verity_or.error();
+  ASSERT_TRUE(verity_or.Ok()) << verity_or.ErrorMessage();
 
   const ApexVerityData& data = *verity_or;
   EXPECT_NE(nullptr, data.desc.get());
-  EXPECT_EQ(std::string("368a22e64858647bc45498e92f749f85482ac468"
-                        "50ca7ec8071f49dfa47a243c"),
+  EXPECT_EQ(std::string("1772301d454698dd155205b7851959c625d8a3e6"
+                        "d39360122693bad804b70007"),
             data.salt);
-  EXPECT_EQ(std::string("705d8ec15be38fe416ed75045056434132758008"),
+  EXPECT_EQ(std::string("f6139829a01059be55b13e09c4fddbb5565a8626"),
             data.root_digest);
 }
 
 // TODO: May consider packaging a debug key in debug builds (again).
-TEST(ApexFileTest, DISABLED_VerifyApexVerityNoKeyDir) {
+#if 0
+TEST(ApexFileTest, VerifyApexVerityNoKeyDir) {
   const std::string filePath = testDataDir + "apex.apexd_test.apex";
-  Result<ApexFile> apexFile = ApexFile::Open(filePath);
-  ASSERT_TRUE(apexFile) << apexFile.error();
+  StatusOr<ApexFile> apexFile = ApexFile::Open(filePath);
+  ASSERT_TRUE(apexFile.Ok()) << apexFile.ErrorMessage();
 
-  auto verity_or = apexFile->VerifyApexVerity();
-  ASSERT_FALSE(verity_or);
+  auto verity_or = apexFile->VerifyApexVerity({"/tmp/"});
+  ASSERT_FALSE(verity_or.Ok());
 }
+#endif
 
 // TODO(jiyong): re-enable this test. This test is disabled because the build
 // system now always bundles the public key that was used to sign the APEX.
@@ -112,19 +112,21 @@ TEST(ApexFileTest, DISABLED_VerifyApexVerityNoKeyDir) {
 // As a result, the verification is always successful (and thus test fails).
 // In order to re-enable this test, we have to manually create an APEX
 // where public key is not bundled.
-TEST(ApexFileTest, DISABLED_VerifyApexVerityNoKeyInst) {
+#if 0
+TEST(ApexFileTest, VerifyApexVerityNoKeyInst) {
   const std::string filePath = testDataDir + "apex.apexd_test_no_inst_key.apex";
-  Result<ApexFile> apexFile = ApexFile::Open(filePath);
-  ASSERT_TRUE(apexFile) << apexFile.error();
+  StatusOr<ApexFile> apexFile = ApexFile::Open(filePath);
+  ASSERT_TRUE(apexFile.Ok()) << apexFile.ErrorMessage();
 
   auto verity_or = apexFile->VerifyApexVerity();
-  ASSERT_FALSE(verity_or);
+  ASSERT_FALSE(verity_or.Ok());
 }
+#endif
 
 TEST(ApexFileTest, GetBundledPublicKey) {
   const std::string filePath = testDataDir + "apex.apexd_test.apex";
-  Result<ApexFile> apexFile = ApexFile::Open(filePath);
-  ASSERT_TRUE(apexFile) << apexFile.error();
+  StatusOr<ApexFile> apexFile = ApexFile::Open(filePath);
+  ASSERT_TRUE(apexFile.Ok());
 
   const std::string keyPath =
       testDataDir + "apexd_testdata/com.android.apex.test_package.avbpubkey";

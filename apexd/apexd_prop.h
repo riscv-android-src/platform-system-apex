@@ -17,13 +17,12 @@
 #ifndef ANDROID_APEXD_APEXD_PROP_H_
 #define ANDROID_APEXD_APEXD_PROP_H_
 
-#include <android-base/result.h>
+#include "status_or.h"
 
 namespace android {
 namespace apex {
 
-void waitForBootStatus(android::base::Result<void> (&rollback_fn)(),
-                       void (&complete_fn)());
+void waitForBootStatus(Status (&rollback_fn)(), void (&complete_fn)());
 
 }  // namespace apex
 }  // namespace android

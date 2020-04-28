@@ -17,9 +17,8 @@
 #ifndef ANDROID_APEXD_APEX_MANIFEST_H_
 #define ANDROID_APEXD_APEX_MANIFEST_H_
 
-#include <android-base/result.h>
-
 #include "apex_manifest.pb.h"
+#include "status_or.h"
 
 #include <string>
 
@@ -28,14 +27,10 @@ using ::apex::proto::ApexManifest;
 namespace android {
 namespace apex {
 // Parses and validates APEX manifest.
-android::base::Result<ApexManifest> ParseManifest(const std::string& content);
-// Parses and validates APEX manifest (in JSON format);
-android::base::Result<ApexManifest> ParseManifestJson(
-    const std::string& content);
+StatusOr<ApexManifest> ParseManifest(const std::string& content);
 // Returns package id of an ApexManifest
 std::string GetPackageId(const ApexManifest& apex_manifest);
-// Reads and parses APEX manifest from the file on disk.
-android::base::Result<ApexManifest> ReadManifest(const std::string& path);
+
 }  // namespace apex
 }  // namespace android
 

@@ -88,18 +88,6 @@ java_test_host {
 }
 
 java_test_host {
-    name: "neuralnetworks_e2e_tests",
-    srcs:  ["src/**/NeuralNetworksHostTest.java"],
-    libs: ["tradefed"],
-    static_libs: ["apex_e2e_base_test"],
-    data: [
-        ":test_com.android.neuralnetworks",
-    ],
-    test_config: "neuralnetworks-e2e-tests.xml",
-    test_suites: ["general-tests"],
-}
-
-java_test_host {
     name: "apex_targetprep_tests",
 
     libs: ["tradefed"],
@@ -115,25 +103,36 @@ java_test_host {
 
 java_library_host {
     name: "apex_e2e_base_test",
-    srcs: ["src/**/ApexE2EBaseHostTest.java"],
-    static_libs: [
-        "module_test_util",
-    ],
-    libs: [
-        "tradefed",
-    ],
-}
-
-java_library_host {
-    name: "module_test_util",
-    srcs: ["util/**/ModuleTestUtils.java"],
-    libs: ["tradefed", "truth-prebuilt"],
+    srcs: ["src/**/ApexE2EBaseHostTest.java","src/**/ApexTestUtils.java"],
+    libs: ["tradefed"],
 }
 
 apex {
     name: "apex.test",
     manifest: "testdata/apex_manifest.json",
     prebuilts: ["sample_prebuilt_file"],
+    key: "apex.test.key",
+    certificate: ":apex.test.certificate",
+    installable: false,
+}
+
+// This target is not consumed by anyone. It's a sanity
+// check for the build features.
+apex {
+    name: "apex_test_build_features",
+    file_contexts: "apex.test",
+    manifest: "testdata/apex_manifest.json",
+    androidManifest: "testdata/AndroidManifest.xml",
+    binaries: ["surfaceflinger", "vold"],
+    multilib: {
+        prefer32: {
+            binaries: ["dex2oat"],
+        },
+    },
+    native_shared_libs: ["libc", "libcutils"],
+    java_libs: ["conscrypt"],
+    prebuilts: ["sample_prebuilt_file", "apex.test.ld.config.txt", "apex.test.init.rc"],
+    compile_multilib: "both",
     key: "apex.test.key",
     certificate: ":apex.test.certificate",
     installable: false,
@@ -169,53 +168,4 @@ prebuilt_etc {
     src: "testdata/init.rc",
     filename: "init.rc",
     installable: false,
-}
-
-cc_binary {
-    name: "sample_prefer32_binary",
-    srcs: ["sample_prefer32_binary.cc"],
-    target: {
-        android: {
-            compile_multilib: "prefer32",
-        },
-    },
-}
-
-java_test_host {
-    name: "apex_rollback_tests",
-    srcs:  ["src/**/ApexRollbackTests.java", "src/**/ApexTestUtils.java"],
-    libs: ["tradefed", "truth-prebuilt"],
-    static_libs: ["module_test_util"],
-    test_config: "apex-rollback-tests.xml",
-    test_suites: ["general-tests"],
-
-    data: [
-        "testdata/trigger_watchdog.rc",
-        "testdata/trigger_watchdog.sh",
-        ":com.android.apex.cts.shim.v2_prebuilt",
-    ],
-}
-
-java_test_host {
-    name: "apex_remount_tests",
-    srcs:  ["src/**/ApexRemountTest.java"],
-    libs: ["tradefed"],
-    static_libs: [
-        "module_test_util",
-        "truth-prebuilt",
-        "apex_manifest_proto_java",
-    ],
-    test_config: "apex-remount-tests.xml",
-
-    data: [":com.android.apex.cts.shim.v2_prebuilt"],
-}
-
-java_test_host {
-    name: "module_test_utils_tests",
-    srcs:  ["src/**/ModuleTestUtilsTest.java"],
-    libs: ["tradefed", "truth-prebuilt"],
-    static_libs: ["module_test_util"],
-    test_config: "module-test-utils-tests.xml",
-    test_suites: ["general-tests"],
-    data: [":com.android.apex.cts.shim.v2_prebuilt"],
 }

@@ -16,13 +16,13 @@
 
 package com.android.tests.apex;
 
-import com.android.tests.util.ModuleTestUtils;
 import com.android.tradefed.config.Option;
 import com.android.tradefed.config.Option.Importance;
 import com.android.tradefed.device.DeviceNotAvailableException;
 import com.android.tradefed.device.ITestDevice.ApexInfo;
 import com.android.tradefed.log.LogUtil.CLog;
 import com.android.tradefed.testtype.junit4.BaseHostJUnit4Test;
+import com.android.tradefed.util.CommandResult;
 
 import org.junit.After;
 import org.junit.Assert;
@@ -30,18 +30,26 @@ import org.junit.Before;
 
 import java.io.File;
 import java.io.IOException;
+import java.time.Duration;
 import java.util.Set;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 /**
  * Base test to check if Apex can be staged, activated and uninstalled successfully.
  */
 public abstract class ApexE2EBaseHostTest extends BaseHostJUnit4Test {
-    private static final String SUPPORT_APEX_UPDATE_PROPERTY = "ro.apex.updatable";
+    private static final Duration WAIT_FOR_SESSION_READY_TTL = Duration.ofSeconds(10);
+    private static final Duration SLEEP_FOR = Duration.ofMillis(200);
 
     protected static final String OPTION_APEX_FILE_NAME = "apex_file_name";
 
+    protected final Pattern mIsSessionReadyPattern = Pattern.compile("isStagedSessionReady = true");
+    protected final Pattern mIsSessionAppliedPattern =
+            Pattern.compile("isStagedSessionApplied = true;");
+
     /* protected so that derived tests can have access to test utils automatically */
-    protected final ModuleTestUtils mUtils = new ModuleTestUtils(this);
+    protected final ApexTestUtils mUtils = new ApexTestUtils(this);
 
     @Option(name = OPTION_APEX_FILE_NAME,
             description = "The file name of the apex module.",
@@ -49,16 +57,9 @@ public abstract class ApexE2EBaseHostTest extends BaseHostJUnit4Test {
             mandatory = true
     )
     protected String mApexFileName = null;
-    protected boolean mApexUpdatable = true;
 
     @Before
     public synchronized void setUp() throws Exception {
-        if (getDevice().getProperty(SUPPORT_APEX_UPDATE_PROPERTY).equals("false")) {
-            mApexUpdatable = false;
-            CLog.i("Apex updating is not supported on this device. Skipping setup().");
-            return;
-        }
-        mUtils.abandonActiveStagedSession();
         uninstallApex();
     }
 
@@ -68,21 +69,37 @@ public abstract class ApexE2EBaseHostTest extends BaseHostJUnit4Test {
     public void doTestStageActivateUninstallApexPackage()
                                 throws DeviceNotAvailableException, IOException {
 
-        if (!mApexUpdatable) {
-            CLog.i("Apex updating is not supported on this device. Skipping test.");
-            return;
-        }
-
         File testAppFile = mUtils.getTestFile(mApexFileName);
         CLog.i("Found test apex file: " + testAppFile.getAbsoluteFile());
 
         // Install apex package
-        String installResult = getDevice().installPackage(testAppFile, false, "--wait");
+        String installResult = getDevice().installPackage(testAppFile, false);
         Assert.assertNull(
                 String.format("failed to install test app %s. Reason: %s",
                     mApexFileName, installResult),
                 installResult);
 
+        // TODO: implement wait for session ready logic inside PackageManagerShellCommand instead.
+        boolean sessionReady = false;
+        Duration spentWaiting = Duration.ZERO;
+        while (spentWaiting.compareTo(WAIT_FOR_SESSION_READY_TTL) < 0) {
+            CommandResult res = getDevice().executeShellV2Command("pm get-stagedsessions");
+            Assert.assertEquals("", res.getStderr());
+            sessionReady = Stream.of(res.getStdout().split("\n")).anyMatch(this::isReadyNotApplied);
+            if (sessionReady) {
+                CLog.i("Done waiting after " + spentWaiting);
+                break;
+            }
+            try {
+                Thread.sleep(SLEEP_FOR.toMillis());
+                spentWaiting = spentWaiting.plus(SLEEP_FOR);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
+        }
+        Assert.assertTrue("Staged session wasn't ready in " + WAIT_FOR_SESSION_READY_TTL,
+                sessionReady);
         ApexInfo testApexInfo = mUtils.getApexInfo(testAppFile);
         Assert.assertNotNull(testApexInfo);
 
@@ -97,6 +114,12 @@ public abstract class ApexE2EBaseHostTest extends BaseHostJUnit4Test {
         additionalCheck();
     }
 
+    private boolean isReadyNotApplied(String sessionInfo) {
+        boolean isReady = mIsSessionReadyPattern.matcher(sessionInfo).find();
+        boolean isApplied = mIsSessionAppliedPattern.matcher(sessionInfo).find();
+        return isReady && !isApplied;
+    }
+
     /**
      * Do some additional check, invoked by doTestStageActivateUninstallApexPackage.
      */
@@ -104,11 +127,6 @@ public abstract class ApexE2EBaseHostTest extends BaseHostJUnit4Test {
 
     @After
     public void tearDown() throws Exception {
-        if (!mApexUpdatable) {
-            CLog.i("Apex updating is not supported on this device. Skipping teardown().");
-            return;
-        }
-        mUtils.abandonActiveStagedSession();
         uninstallApex();
     }
 

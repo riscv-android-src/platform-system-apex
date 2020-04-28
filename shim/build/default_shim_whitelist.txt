@@ -1,2 +1,0 @@
-./apex_manifest.json
-./etc/hash.txt

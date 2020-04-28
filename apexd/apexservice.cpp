@@ -23,7 +23,6 @@
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
-#include <android-base/result.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <binder/IPCThreadState.h>
@@ -33,15 +32,12 @@
 #include <binder/Status.h>
 #include <utils/String16.h>
 
-#include "apex_file.h"
-#include "apex_preinstalled_data.h"
 #include "apexd.h"
 #include "apexd_session.h"
+#include "status.h"
 #include "string_log.h"
 
 #include <android/apex/BnApexService.h>
-
-using android::base::Result;
 
 namespace android {
 namespace apex {
@@ -57,12 +53,17 @@ class ApexService : public BnApexService {
 
   ApexService(){};
 
-  BinderStatus stagePackages(const std::vector<std::string>& paths) override;
+  BinderStatus stagePackage(const std::string& packageTmpPath,
+                            bool* aidl_return) override;
+  BinderStatus stagePackages(const std::vector<std::string>& paths,
+                             bool* aidl_return) override;
   BinderStatus unstagePackages(const std::vector<std::string>& paths) override;
   BinderStatus submitStagedSession(int session_id,
                                    const std::vector<int>& child_session_ids,
-                                   ApexInfoList* apex_info_list) override;
-  BinderStatus markStagedSessionReady(int session_id) override;
+                                   ApexInfoList* apex_info_list,
+                                   bool* aidl_return) override;
+  BinderStatus markStagedSessionReady(int session_id,
+                                      bool* aidl_return) override;
   BinderStatus markStagedSessionSuccessful(int session_id) override;
   BinderStatus getSessions(std::vector<ApexSessionInfo>* aidl_return) override;
   BinderStatus getStagedSessionInfo(
@@ -99,7 +100,19 @@ BinderStatus CheckDebuggable(const std::string& name) {
   return BinderStatus::ok();
 }
 
-BinderStatus ApexService::stagePackages(const std::vector<std::string>& paths) {
+BinderStatus ApexService::stagePackage(const std::string& packageTmpPath,
+                                       bool* aidl_return) {
+  BinderStatus debugCheck = CheckDebuggable("stagePackage");
+  if (!debugCheck.isOk()) {
+    return debugCheck;
+  }
+  std::vector<std::string> tmp;
+  tmp.push_back(packageTmpPath);
+  return stagePackages(tmp, aidl_return);
+}
+
+BinderStatus ApexService::stagePackages(const std::vector<std::string>& paths,
+                                        bool* aidl_return) {
   BinderStatus debugCheck = CheckDebuggable("stagePackages");
   if (!debugCheck.isOk()) {
     return debugCheck;
@@ -107,73 +120,73 @@ BinderStatus ApexService::stagePackages(const std::vector<std::string>& paths) {
   LOG(DEBUG) << "stagePackages() received by ApexService, paths "
              << android::base::Join(paths, ',');
 
-  Result<void> res = ::android::apex::stagePackages(paths);
+  *aidl_return = false;
+  Status res = ::android::apex::stagePackages(paths);
 
-  if (res) {
+  if (res.Ok()) {
+    *aidl_return = true;
     return BinderStatus::ok();
   }
 
   // TODO: Get correct binder error status.
   LOG(ERROR) << "Failed to stage " << android::base::Join(paths, ',') << ": "
-             << res.error();
-  return BinderStatus::fromExceptionCode(
-      BinderStatus::EX_ILLEGAL_ARGUMENT,
-      String8(res.error().message().c_str()));
+             << res.ErrorMessage();
+  return BinderStatus::fromExceptionCode(BinderStatus::EX_ILLEGAL_ARGUMENT,
+                                         String8(res.ErrorMessage().c_str()));
 }
 
 BinderStatus ApexService::unstagePackages(
     const std::vector<std::string>& paths) {
-  Result<void> res = ::android::apex::unstagePackages(paths);
-  if (res) {
+  Status res = ::android::apex::unstagePackages(paths);
+  if (res.Ok()) {
     return BinderStatus::ok();
   }
 
   // TODO: Get correct binder error status.
   LOG(ERROR) << "Failed to unstage " << android::base::Join(paths, ',') << ": "
-             << res.error();
-  return BinderStatus::fromExceptionCode(
-      BinderStatus::EX_ILLEGAL_ARGUMENT,
-      String8(res.error().message().c_str()));
+             << res.ErrorMessage();
+  return BinderStatus::fromExceptionCode(BinderStatus::EX_ILLEGAL_ARGUMENT,
+                                         String8(res.ErrorMessage().c_str()));
 }
 
 BinderStatus ApexService::submitStagedSession(
     int session_id, const std::vector<int>& child_session_ids,
-    ApexInfoList* apex_info_list) {
+    ApexInfoList* apex_info_list, bool* aidl_return) {
   LOG(DEBUG) << "submitStagedSession() received by ApexService, session id "
-             << session_id << " child sessions: ["
-             << android::base::Join(child_session_ids, ',') << "]";
+             << session_id;
 
-  Result<std::vector<ApexFile>> packages =
+  StatusOr<std::vector<ApexFile>> packages =
       ::android::apex::submitStagedSession(session_id, child_session_ids);
-  if (!packages) {
+  if (!packages.Ok()) {
+    *aidl_return = false;
     LOG(ERROR) << "Failed to submit session id " << session_id << ": "
-               << packages.error();
-    return BinderStatus::fromExceptionCode(
-        BinderStatus::EX_SERVICE_SPECIFIC,
-        String8(packages.error().message().c_str()));
+               << packages.ErrorMessage();
+    return BinderStatus::ok();
   }
 
   for (const auto& package : *packages) {
     ApexInfo out;
-    out.moduleName = package.GetManifest().name();
-    out.modulePath = package.GetPath();
+    out.packageName = package.GetManifest().name();
+    out.packagePath = package.GetPath();
     out.versionCode = package.GetManifest().version();
     apex_info_list->apexInfos.push_back(out);
   }
+  *aidl_return = true;
   return BinderStatus::ok();
 }
 
-BinderStatus ApexService::markStagedSessionReady(int session_id) {
+BinderStatus ApexService::markStagedSessionReady(int session_id,
+                                                 bool* aidl_return) {
   LOG(DEBUG) << "markStagedSessionReady() received by ApexService, session id "
              << session_id;
-  Result<void> success = ::android::apex::markStagedSessionReady(session_id);
-  if (!success) {
+  Status success = ::android::apex::markStagedSessionReady(session_id);
+  if (!success.Ok()) {
+    *aidl_return = false;
     LOG(ERROR) << "Failed to mark session id " << session_id
-               << " as ready: " << success.error();
-    return BinderStatus::fromExceptionCode(
-        BinderStatus::EX_SERVICE_SPECIFIC,
-        String8(success.error().message().c_str()));
+               << " as ready: " << success.ErrorMessage();
+    return BinderStatus::ok();
   }
+  *aidl_return = true;
   return BinderStatus::ok();
 }
 
@@ -181,13 +194,12 @@ BinderStatus ApexService::markStagedSessionSuccessful(int session_id) {
   LOG(DEBUG)
       << "markStagedSessionSuccessful() received by ApexService, session id "
       << session_id;
-  Result<void> ret = ::android::apex::markStagedSessionSuccessful(session_id);
-  if (!ret) {
+  Status ret = ::android::apex::markStagedSessionSuccessful(session_id);
+  if (!ret.Ok()) {
     LOG(ERROR) << "Failed to mark session " << session_id
-               << " as SUCCESS: " << ret.error();
-    return BinderStatus::fromExceptionCode(
-        BinderStatus::EX_ILLEGAL_ARGUMENT,
-        String8(ret.error().message().c_str()));
+               << " as SUCCESS: " << ret.ErrorMessage();
+    return BinderStatus::fromExceptionCode(BinderStatus::EX_ILLEGAL_ARGUMENT,
+                                           String8(ret.ErrorMessage().c_str()));
   }
   return BinderStatus::ok();
 }
@@ -246,30 +258,31 @@ void convertToApexSessionInfo(const ApexSession& session,
 
 static ApexInfo getApexInfo(const ApexFile& package) {
   ApexInfo out;
-  out.moduleName = package.GetManifest().name();
-  out.modulePath = package.GetPath();
+  out.packageName = package.GetManifest().name();
+  out.packagePath = package.GetPath();
   out.versionCode = package.GetManifest().version();
   out.versionName = package.GetManifest().versionname();
-  out.isFactory = package.IsBuiltin();
-  out.isActive = false;
-  Result<std::string> preinstalledPath =
-      getApexPreinstalledPath(package.GetManifest().name());
-  if (preinstalledPath) {
-    out.preinstalledModulePath = *preinstalledPath;
-  }
   return out;
 }
 
 static std::string toString(const ApexInfo& package) {
   std::string msg = StringLog()
-                    << "Module: " << package.moduleName
+                    << "Package: " << package.packageName
                     << " Version: " << package.versionCode
                     << " VersionName: " << package.versionName
-                    << " Path: " << package.modulePath
+                    << " Path: " << package.packagePath
                     << " IsActive: " << std::boolalpha << package.isActive
                     << " IsFactory: " << std::boolalpha << package.isFactory
                     << std::endl;
   return msg;
+}
+
+static bool contains(const std::vector<ApexFile>& list,
+                     const ApexFile& apexFile) {
+  return std::find_if(list.begin(), list.end(),
+                      [&apexFile](const ApexFile& listFile) {
+                        return apexFile.GetPath() == listFile.GetPath();
+                      }) != list.end();
 }
 
 BinderStatus ApexService::getSessions(
@@ -289,7 +302,7 @@ BinderStatus ApexService::getStagedSessionInfo(
   LOG(DEBUG) << "getStagedSessionInfo() received by ApexService, session id "
              << session_id;
   auto session = ApexSession::GetSession(session_id);
-  if (!session) {
+  if (!session.Ok()) {
     // Unknown session.
     ClearSessionInfo(apex_session_info);
     apex_session_info->isUnknown = true;
@@ -310,17 +323,17 @@ BinderStatus ApexService::activatePackage(const std::string& packagePath) {
   LOG(DEBUG) << "activatePackage() received by ApexService, path "
              << packagePath;
 
-  Result<void> res = ::android::apex::activatePackage(packagePath);
+  Status res = ::android::apex::activatePackage(packagePath);
 
-  if (res) {
+  if (res.Ok()) {
     return BinderStatus::ok();
   }
 
   // TODO: Get correct binder error status.
-  LOG(ERROR) << "Failed to activate " << packagePath << ": " << res.error();
-  return BinderStatus::fromExceptionCode(
-      BinderStatus::EX_ILLEGAL_ARGUMENT,
-      String8(res.error().message().c_str()));
+  LOG(ERROR) << "Failed to activate " << packagePath << ": "
+             << res.ErrorMessage();
+  return BinderStatus::fromExceptionCode(BinderStatus::EX_ILLEGAL_ARGUMENT,
+                                         String8(res.ErrorMessage().c_str()));
 }
 
 BinderStatus ApexService::deactivatePackage(const std::string& packagePath) {
@@ -332,17 +345,17 @@ BinderStatus ApexService::deactivatePackage(const std::string& packagePath) {
   LOG(DEBUG) << "deactivatePackage() received by ApexService, path "
              << packagePath;
 
-  Result<void> res = ::android::apex::deactivatePackage(packagePath);
+  Status res = ::android::apex::deactivatePackage(packagePath);
 
-  if (res) {
+  if (res.Ok()) {
     return BinderStatus::ok();
   }
 
   // TODO: Get correct binder error status.
-  LOG(ERROR) << "Failed to deactivate " << packagePath << ": " << res.error();
-  return BinderStatus::fromExceptionCode(
-      BinderStatus::EX_ILLEGAL_ARGUMENT,
-      String8(res.error().message().c_str()));
+  LOG(ERROR) << "Failed to deactivate " << packagePath << ": "
+             << res.ErrorMessage();
+  return BinderStatus::fromExceptionCode(BinderStatus::EX_ILLEGAL_ARGUMENT,
+                                         String8(res.ErrorMessage().c_str()));
 }
 
 BinderStatus ApexService::getActivePackages(
@@ -351,6 +364,8 @@ BinderStatus ApexService::getActivePackages(
   for (const auto& package : packages) {
     ApexInfo apexInfo = getApexInfo(package);
     apexInfo.isActive = true;
+    apexInfo.isFactory =
+        ::android::apex::isPathForBuiltinApexes(package.GetPath());
     aidl_return->push_back(std::move(apexInfo));
   }
 
@@ -359,28 +374,40 @@ BinderStatus ApexService::getActivePackages(
 
 BinderStatus ApexService::getActivePackage(const std::string& packageName,
                                            ApexInfo* aidl_return) {
-  Result<ApexFile> apex = ::android::apex::getActivePackage(packageName);
-  if (apex) {
-    *aidl_return = getApexInfo(*apex);
+  StatusOr<ApexFile> apex = ::android::apex::getActivePackage(packageName);
+  if (apex.Ok()) {
+    aidl_return->packageName = apex->GetManifest().name();
+    aidl_return->packagePath = apex->GetPath();
+    aidl_return->versionCode = apex->GetManifest().version();
+    aidl_return->versionName = apex->GetManifest().versionname();
     aidl_return->isActive = true;
+    aidl_return->isFactory =
+        ::android::apex::isPathForBuiltinApexes(apex->GetPath());
   }
+
   return BinderStatus::ok();
 }
 
 BinderStatus ApexService::getAllPackages(std::vector<ApexInfo>* aidl_return) {
-  const auto& active = ::android::apex::getActivePackages();
-  const auto& factory = ::android::apex::getFactoryPackages();
-  for (const ApexFile& pkg : active) {
-    ApexInfo apex_info = getApexInfo(pkg);
-    apex_info.isActive = true;
-    aidl_return->push_back(std::move(apex_info));
+  auto activePackages = ::android::apex::getActivePackages();
+  auto factoryPackages = ::android::apex::getFactoryPackages();
+  for (const ApexFile& factoryFile : factoryPackages) {
+    ApexInfo apexInfo = getApexInfo(factoryFile);
+    apexInfo.isFactory = true;
+    if (contains(activePackages, factoryFile)) {
+      apexInfo.isActive = true;
+    } else {
+      apexInfo.isActive = false;
+    }
+    aidl_return->push_back(std::move(apexInfo));
   }
-  for (const ApexFile& pkg : factory) {
-    const auto& same_path = [&pkg](const auto& o) {
-      return o.GetPath() == pkg.GetPath();
-    };
-    if (std::find_if(active.begin(), active.end(), same_path) == active.end()) {
-      aidl_return->push_back(getApexInfo(pkg));
+
+  for (const ApexFile& activeFile : activePackages) {
+    if (!contains(factoryPackages, activeFile)) {
+      ApexInfo apexInfo = getApexInfo(activeFile);
+      apexInfo.isFactory = false;
+      apexInfo.isActive = true;
+      aidl_return->push_back(std::move(apexInfo));
     }
   }
   return BinderStatus::ok();
@@ -393,17 +420,16 @@ BinderStatus ApexService::preinstallPackages(
     return debugCheck;
   }
 
-  Result<void> res = ::android::apex::preinstallPackages(paths);
-  if (res) {
+  Status res = ::android::apex::preinstallPackages(paths);
+  if (res.Ok()) {
     return BinderStatus::ok();
   }
 
   // TODO: Get correct binder error status.
   LOG(ERROR) << "Failed to preinstall packages "
-             << android::base::Join(paths, ',') << ": " << res.error();
-  return BinderStatus::fromExceptionCode(
-      BinderStatus::EX_ILLEGAL_ARGUMENT,
-      String8(res.error().message().c_str()));
+             << android::base::Join(paths, ',') << ": " << res.ErrorMessage();
+  return BinderStatus::fromExceptionCode(BinderStatus::EX_ILLEGAL_ARGUMENT,
+                                         String8(res.ErrorMessage().c_str()));
 }
 
 BinderStatus ApexService::postinstallPackages(
@@ -413,26 +439,24 @@ BinderStatus ApexService::postinstallPackages(
     return debugCheck;
   }
 
-  Result<void> res = ::android::apex::postinstallPackages(paths);
-  if (res) {
+  Status res = ::android::apex::postinstallPackages(paths);
+  if (res.Ok()) {
     return BinderStatus::ok();
   }
 
   // TODO: Get correct binder error status.
   LOG(ERROR) << "Failed to postinstall packages "
-             << android::base::Join(paths, ',') << ": " << res.error();
-  return BinderStatus::fromExceptionCode(
-      BinderStatus::EX_ILLEGAL_ARGUMENT,
-      String8(res.error().message().c_str()));
+             << android::base::Join(paths, ',') << ": " << res.ErrorMessage();
+  return BinderStatus::fromExceptionCode(BinderStatus::EX_ILLEGAL_ARGUMENT,
+                                         String8(res.ErrorMessage().c_str()));
 }
 
 BinderStatus ApexService::abortActiveSession() {
   LOG(DEBUG) << "abortActiveSession() received by ApexService.";
-  Result<void> res = ::android::apex::abortActiveSession();
-  if (!res) {
-    return BinderStatus::fromExceptionCode(
-        BinderStatus::EX_ILLEGAL_ARGUMENT,
-        String8(res.error().message().c_str()));
+  Status res = ::android::apex::abortActiveSession();
+  if (!res.Ok()) {
+    return BinderStatus::fromExceptionCode(BinderStatus::EX_ILLEGAL_ARGUMENT,
+                                           String8(res.ErrorMessage().c_str()));
   }
   return BinderStatus::ok();
 }
@@ -444,11 +468,10 @@ BinderStatus ApexService::rollbackActiveSession() {
   }
 
   LOG(DEBUG) << "rollbackActiveSession() received by ApexService.";
-  Result<void> res = ::android::apex::rollbackActiveSession();
-  if (!res) {
-    return BinderStatus::fromExceptionCode(
-        BinderStatus::EX_ILLEGAL_ARGUMENT,
-        String8(res.error().message().c_str()));
+  Status res = ::android::apex::rollbackActiveSession();
+  if (!res.Ok()) {
+    return BinderStatus::fromExceptionCode(BinderStatus::EX_ILLEGAL_ARGUMENT,
+                                           String8(res.ErrorMessage().c_str()));
   }
   return BinderStatus::ok();
 }
@@ -460,11 +483,10 @@ BinderStatus ApexService::resumeRollbackIfNeeded() {
   }
 
   LOG(DEBUG) << "resumeRollbackIfNeeded() received by ApexService.";
-  Result<void> res = ::android::apex::resumeRollbackIfNeeded();
-  if (!res) {
-    return BinderStatus::fromExceptionCode(
-        BinderStatus::EX_ILLEGAL_ARGUMENT,
-        String8(res.error().message().c_str()));
+  Status res = ::android::apex::resumeRollbackIfNeeded();
+  if (!res.Ok()) {
+    return BinderStatus::fromExceptionCode(BinderStatus::EX_ILLEGAL_ARGUMENT,
+                                           String8(res.ErrorMessage().c_str()));
   }
   return BinderStatus::ok();
 }
@@ -498,7 +520,7 @@ status_t ApexService::onTransact(uint32_t _aidl_code, const Parcel& _aidl_data,
   return BnApexService::onTransact(_aidl_code, _aidl_data, _aidl_reply,
                                    _aidl_flags);
 }
-status_t ApexService::dump(int fd, const Vector<String16>& /*args*/) {
+status_t ApexService::dump(int fd, const Vector<String16>& args) {
   std::vector<ApexInfo> list;
   BinderStatus status = getActivePackages(&list);
   dprintf(fd, "ACTIVE PACKAGES:\n");
@@ -548,6 +570,8 @@ status_t ApexService::shellCommand(int in, int out, int err,
     }
     log << "ApexService:" << std::endl
         << "  help - display this help" << std::endl
+        << "  stagePackage [packagePath] - stage package from the given path"
+        << std::endl
         << "  stagePackages [packagePath1] ([packagePath2]...) - stage "
            "multiple packages from the given path"
         << std::endl
@@ -584,9 +608,13 @@ status_t ApexService::shellCommand(int in, int out, int err,
 
   const String16& cmd = args[0];
 
-  if (cmd == String16("stagePackages")) {
+  if (cmd == String16("stagePackage") || cmd == String16("stagePackages")) {
     if (args.size() < 2) {
-      print_help(err, "stagePackages requires at least one packagePath");
+      print_help(err, "stagePackage(s) requires at least one packagePath");
+      return BAD_VALUE;
+    }
+    if (args.size() != 2 && cmd == String16("stagePackage")) {
+      print_help(err, "stagePackage requires one packagePath");
       return BAD_VALUE;
     }
     std::vector<std::string> pkgs;
@@ -594,7 +622,8 @@ status_t ApexService::shellCommand(int in, int out, int err,
     for (size_t i = 1; i != args.size(); ++i) {
       pkgs.emplace_back(String8(args[i]).string());
     }
-    BinderStatus status = stagePackages(pkgs);
+    bool ret_value;
+    BinderStatus status = stagePackages(pkgs, &ret_value);
     if (status.isOk()) {
       return OK;
     }
@@ -743,14 +772,20 @@ status_t ApexService::shellCommand(int in, int out, int err,
 
     ApexInfoList list;
     std::vector<int> empty_child_session_ids;
+    bool ret_value;
 
-    BinderStatus status =
-        submitStagedSession(session_id, empty_child_session_ids, &list);
+    BinderStatus status = submitStagedSession(
+        session_id, empty_child_session_ids, &list, &ret_value);
     if (status.isOk()) {
+      if (ret_value) {
         for (const auto& item : list.apexInfos) {
           std::string msg = toString(item);
           dprintf(out, "%s", msg.c_str());
         }
+      } else {
+        std::string msg = StringLog() << "Verification failed." << std::endl;
+        dprintf(out, "%s", msg.c_str());
+      }
       return OK;
     }
     std::string msg = StringLog() << "Failed to submit session: "

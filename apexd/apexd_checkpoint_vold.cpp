@@ -23,22 +23,20 @@
 #include <binder/IServiceManager.h>
 
 using android::sp;
-using android::base::Error;
-using android::base::Errorf;
-using android::base::Result;
 using android::os::IVold;
 
 namespace android {
 namespace apex {
 
-Result<VoldCheckpointInterface> VoldCheckpointInterface::Create() {
+StatusOr<VoldCheckpointInterface> VoldCheckpointInterface::Create() {
   auto voldService =
       defaultServiceManager()->getService(android::String16("vold"));
   if (voldService != nullptr) {
-    return VoldCheckpointInterface(
-        android::interface_cast<android::os::IVold>(voldService));
+    return StatusOr<VoldCheckpointInterface>(VoldCheckpointInterface(
+        android::interface_cast<android::os::IVold>(voldService)));
   }
-  return Errorf("Failed to retrieve vold service.");
+  return StatusOr<VoldCheckpointInterface>::Fail(
+      "Failed to retrieve vold service.");
 }
 
 VoldCheckpointInterface::VoldCheckpointInterface(sp<IVold>&& vold_service) {
@@ -62,51 +60,51 @@ VoldCheckpointInterface::~VoldCheckpointInterface() {
   // Just here to be able to forward-declare IVold.
 }
 
-Result<bool> VoldCheckpointInterface::SupportsFsCheckpoints() {
-  return supports_fs_checkpoints_;
+StatusOr<bool> VoldCheckpointInterface::SupportsFsCheckpoints() {
+  return StatusOr<bool>(supports_fs_checkpoints_);
 }
 
-Result<bool> VoldCheckpointInterface::NeedsCheckpoint() {
+StatusOr<bool> VoldCheckpointInterface::NeedsCheckpoint() {
   if (supports_fs_checkpoints_) {
     bool needs_checkpoint = false;
     android::binder::Status status =
         vold_service_->needsCheckpoint(&needs_checkpoint);
     if (!status.isOk()) {
-      return Error() << status.toString8().c_str();
+      return StatusOr<bool>::Fail(status.toString8().c_str());
     }
-    return needs_checkpoint;
+    return StatusOr<bool>(needs_checkpoint);
   }
-  return false;
+  return StatusOr<bool>(false);
 }
 
-Result<bool> VoldCheckpointInterface::NeedsRollback() {
+StatusOr<bool> VoldCheckpointInterface::NeedsRollback() {
   if (supports_fs_checkpoints_) {
     bool needs_rollback = false;
     android::binder::Status status =
         vold_service_->needsRollback(&needs_rollback);
     if (!status.isOk()) {
-      return Error() << status.toString8().c_str();
+      return StatusOr<bool>::Fail(status.toString8().c_str());
     }
-    return needs_rollback;
+    return StatusOr<bool>(needs_rollback);
   }
-  return false;
+  return StatusOr<bool>(false);
 }
 
-Result<void> VoldCheckpointInterface::StartCheckpoint(int32_t numRetries) {
+Status VoldCheckpointInterface::StartCheckpoint(int32_t numRetries) {
   if (supports_fs_checkpoints_) {
     android::binder::Status status = vold_service_->startCheckpoint(numRetries);
     if (!status.isOk()) {
-      return Error() << status.toString8().c_str();
+      return Status::Fail(status.toString8().c_str());
     }
-    return {};
+    return Status::Success();
   }
-  return Errorf("Device does not support filesystem checkpointing");
+  return Status::Fail("Device does not support filesystem checkpointing");
 }
 
-Result<void> VoldCheckpointInterface::AbortChanges(const std::string& msg,
-                                                   bool retry) {
+Status VoldCheckpointInterface::AbortChanges(const std::string& msg,
+                                             bool retry) {
   vold_service_->abortChanges(msg, retry);
-  return {};
+  return Status::Success();
 }
 
 }  // namespace apex

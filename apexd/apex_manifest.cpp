@@ -15,94 +15,83 @@
  */
 
 #include "apex_manifest.h"
-#include <android-base/file.h>
-#include <android-base/logging.h>
-#include <android-base/strings.h>
-#include "apex_constants.h"
 #include "string_log.h"
+#include <android-base/logging.h>
 
 #include <google/protobuf/util/json_util.h>
+#include <google/protobuf/util/type_resolver_util.h>
 #include <memory>
 #include <string>
 
-using android::base::EndsWith;
-using android::base::Error;
-using android::base::Result;
-using google::protobuf::util::JsonParseOptions;
+using google::protobuf::DescriptorPool;
+using google::protobuf::scoped_ptr;
+using google::protobuf::util::NewTypeResolverForDescriptorPool;
+using google::protobuf::util::TypeResolver;
 
 namespace android {
 namespace apex {
 namespace {
+const char kTypeUrlPrefix[] = "type.googleapis.com";
 
-Result<void> JsonToApexManifestMessage(const std::string& content,
-                                       ApexManifest* apex_manifest) {
-  JsonParseOptions options;
-  options.ignore_unknown_fields = true;
-  auto parse_status = JsonStringToMessage(content, apex_manifest, options);
+std::string GetTypeUrl(const ApexManifest& apex_manifest) {
+  const google::protobuf::Descriptor* message = apex_manifest.GetDescriptor();
+  return std::string(kTypeUrlPrefix) + "/" + message->full_name();
+}
+
+// TODO: JsonStringToMessage is a newly added function in protobuf
+// and is not yet available in the android tree. Replace this function with
+// https://developers.google.com/protocol-buffers/docs/reference/cpp/
+// google.protobuf.util.json_util#JsonStringToMessage.details
+// as and when the android tree gets updated
+StatusOr<ApexManifest> JsonToApexManifestMessage(const std::string& content,
+                                                 ApexManifest& apex_manifest) {
+  scoped_ptr<TypeResolver> resolver(NewTypeResolverForDescriptorPool(
+      kTypeUrlPrefix, DescriptorPool::generated_pool()));
+  std::string binary;
+  auto parse_status = JsonToBinaryString(
+      resolver.get(), GetTypeUrl(apex_manifest), content, &binary);
   if (!parse_status.ok()) {
-    return Error() << "Failed to parse APEX Manifest JSON config: "
-                   << parse_status.error_message().as_string();
+    return StatusOr<ApexManifest>::MakeError(
+        StringLog() << "Failed to parse APEX Manifest JSON config: "
+                    << parse_status.error_message().as_string());
   }
-  return {};
+
+  if (!apex_manifest.ParseFromString(binary)) {
+    return StatusOr<ApexManifest>::MakeError(
+        StringLog() << "Unexpected fields in APEX Manifest JSON config");
+  }
+  return StatusOr<ApexManifest>(apex_manifest);
 }
 
 }  // namespace
 
-Result<ApexManifest> ParseManifestJson(const std::string& content) {
-  ApexManifest apex_manifest;
-  Result<void> parse_manifest_status =
-      JsonToApexManifestMessage(content, &apex_manifest);
-  if (!parse_manifest_status) {
-    return parse_manifest_status.error();
-  }
-
-  // Verifying required fields.
-  // name
-  if (apex_manifest.name().empty()) {
-    return Error() << "Missing required field \"name\" from APEX manifest.";
-  }
-
-  // version
-  if (apex_manifest.version() == 0) {
-    return Error() << "Missing required field \"version\" from APEX manifest.";
-  }
-  return apex_manifest;
-}
-
-Result<ApexManifest> ParseManifest(const std::string& content) {
+StatusOr<ApexManifest> ParseManifest(const std::string& content) {
   ApexManifest apex_manifest;
   std::string err;
-
-  if (!apex_manifest.ParseFromString(content)) {
-    return Error() << "Can't parse APEX manifest.";
+  StatusOr<ApexManifest> parse_manifest_status =
+      JsonToApexManifestMessage(content, apex_manifest);
+  if (!parse_manifest_status.Ok()) {
+    return parse_manifest_status;
   }
 
   // Verifying required fields.
   // name
   if (apex_manifest.name().empty()) {
-    return Error() << "Missing required field \"name\" from APEX manifest.";
+    err = StringLog() << "Missing required field \"name\" from APEX manifest.";
+    return StatusOr<ApexManifest>::MakeError(err);
   }
 
   // version
   if (apex_manifest.version() == 0) {
-    return Error() << "Missing required field \"version\" from APEX manifest.";
+    err =
+        StringLog() << "Missing required field \"version\" from APEX manifest.";
+    return StatusOr<ApexManifest>::MakeError(err);
   }
-  return apex_manifest;
+  return parse_manifest_status;
 }
 
 std::string GetPackageId(const ApexManifest& apexManifest) {
   return apexManifest.name() + "@" + std::to_string(apexManifest.version());
-}
-
-Result<ApexManifest> ReadManifest(const std::string& path) {
-  std::string content;
-  if (!android::base::ReadFileToString(path, &content)) {
-    return Error() << "Failed to read manifest file: " << path;
-  }
-  if (EndsWith(path, kManifestFilenameJson)) {
-    return ParseManifestJson(content);
-  }
-  return ParseManifest(content);
 }
 
 }  // namespace apex

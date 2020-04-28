@@ -21,61 +21,50 @@
 #include <vector>
 
 #include <android-base/macros.h>
-#include <android-base/result.h>
 
 #include "apex_constants.h"
 #include "apex_file.h"
+#include "status.h"
+#include "status_or.h"
 
 namespace android {
 namespace apex {
 
 class CheckpointInterface;
 
-android::base::Result<void> resumeRollbackIfNeeded();
+Status resumeRollbackIfNeeded();
 
-android::base::Result<void> scanPackagesDirAndActivate(
-    const char* apex_package_dir);
+Status scanPackagesDirAndActivate(const char* apex_package_dir);
 void scanStagedSessionsDirAndStage();
 
-android::base::Result<void> preinstallPackages(
-    const std::vector<std::string>& paths) WARN_UNUSED;
-android::base::Result<void> postinstallPackages(
-    const std::vector<std::string>& paths) WARN_UNUSED;
+Status preinstallPackages(const std::vector<std::string>& paths) WARN_UNUSED;
+Status postinstallPackages(const std::vector<std::string>& paths) WARN_UNUSED;
 
-android::base::Result<void> stagePackages(
-    const std::vector<std::string>& tmpPaths) WARN_UNUSED;
-android::base::Result<void> unstagePackages(
-    const std::vector<std::string>& paths) WARN_UNUSED;
+Status stagePackages(const std::vector<std::string>& tmpPaths) WARN_UNUSED;
+Status unstagePackages(const std::vector<std::string>& paths) WARN_UNUSED;
 
-android::base::Result<std::vector<ApexFile>> submitStagedSession(
+StatusOr<std::vector<ApexFile>> submitStagedSession(
     const int session_id,
     const std::vector<int>& child_session_ids) WARN_UNUSED;
-android::base::Result<void> markStagedSessionReady(const int session_id)
-    WARN_UNUSED;
-android::base::Result<void> markStagedSessionSuccessful(const int session_id)
-    WARN_UNUSED;
-android::base::Result<void> rollbackActiveSession();
-android::base::Result<void> rollbackActiveSessionAndReboot();
+Status markStagedSessionReady(const int session_id) WARN_UNUSED;
+Status markStagedSessionSuccessful(const int session_id) WARN_UNUSED;
+Status rollbackActiveSession();
+Status rollbackActiveSessionAndReboot();
 
-android::base::Result<void> activatePackage(const std::string& full_path)
-    WARN_UNUSED;
-android::base::Result<void> deactivatePackage(const std::string& full_path)
-    WARN_UNUSED;
+Status activatePackage(const std::string& full_path) WARN_UNUSED;
+Status deactivatePackage(const std::string& full_path) WARN_UNUSED;
 
 std::vector<ApexFile> getActivePackages();
-android::base::Result<ApexFile> getActivePackage(
-    const std::string& package_name);
+StatusOr<ApexFile> getActivePackage(const std::string& package_name);
 
 std::vector<ApexFile> getFactoryPackages();
 
-android::base::Result<void> abortActiveSession();
+Status abortActiveSession();
 
 int onBootstrap();
 void onStart(CheckpointInterface* checkpoint_service);
 void onAllPackagesReady();
 void unmountDanglingMounts();
-
-int unmountAll();
 
 }  // namespace apex
 }  // namespace android

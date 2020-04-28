@@ -35,8 +35,6 @@
 #include "apexd_utils.h"
 #include "string_log.h"
 
-using android::base::Error;
-using android::base::Result;
 using android::base::StartsWith;
 using android::base::StringPrintf;
 using android::base::unique_fd;
@@ -66,10 +64,11 @@ void LoopbackDeviceUniqueFd::MaybeCloseBad() {
   }
 }
 
-Result<void> configureReadAhead(const std::string& device_path) {
+Status configureReadAhead(const std::string& device_path) {
   auto pos = device_path.find("/dev/block/");
   if (pos != 0) {
-    return Error() << "Device path does not start with /dev/block.";
+    return Status::Fail(StringLog()
+                        << "Device path does not start with /dev/block.");
   }
   pos = device_path.find_last_of('/');
   std::string device_name = device_path.substr(pos + 1, std::string::npos);
@@ -78,27 +77,27 @@ Result<void> configureReadAhead(const std::string& device_path) {
       StringPrintf("/sys/block/%s/queue/read_ahead_kb", device_name.c_str());
   unique_fd sysfs_fd(open(sysfs_device.c_str(), O_RDWR | O_CLOEXEC));
   if (sysfs_fd.get() == -1) {
-    return ErrnoError() << "Failed to open " << sysfs_device;
+    return Status::Fail(PStringLog() << "Failed to open " << sysfs_device);
   }
 
   int ret = TEMP_FAILURE_RETRY(
       write(sysfs_fd.get(), kReadAheadKb, strlen(kReadAheadKb) + 1));
   if (ret < 0) {
-    return ErrnoError() << "Failed to write to " << sysfs_device;
+    return Status::Fail(PStringLog() << "Failed to write to " << sysfs_device);
   }
 
-  return {};
+  return Status::Success();
 }
 
-Result<void> preAllocateLoopDevices(size_t num) {
-  Result<void> loopReady = WaitForFile("/dev/loop-control", 20s);
-  if (!loopReady) {
+Status preAllocateLoopDevices(size_t num) {
+  Status loopReady = WaitForFile("/dev/loop-control", 20s);
+  if (!loopReady.Ok()) {
     return loopReady;
   }
   unique_fd ctl_fd(
       TEMP_FAILURE_RETRY(open("/dev/loop-control", O_RDWR | O_CLOEXEC)));
   if (ctl_fd.get() == -1) {
-    return ErrnoError() << "Failed to open loop-control";
+    return Status::Fail(PStringLog() << "Failed to open loop-control");
   }
 
   // Assumption: loop device ID [0..num) is valid.
@@ -110,7 +109,7 @@ Result<void> preAllocateLoopDevices(size_t num) {
   for (size_t id = 0ul; id < num; ++id) {
     int ret = ioctl(ctl_fd.get(), LOOP_CTL_ADD, id);
     if (ret < 0 && errno != EEXIST) {
-      return ErrnoError() << "Failed LOOP_CTL_ADD";
+      return Status::Fail(PStringLog() << "Failed LOOP_CTL_ADD");
     }
   }
 
@@ -122,36 +121,28 @@ Result<void> preAllocateLoopDevices(size_t num) {
   // even then, we wait 50ms and warning message will be printed (see below
   // createLoopDevice()).
   LOG(INFO) << "Pre-allocated " << num << " loopback devices";
-  return {};
+  return Status::Success();
 }
 
-Result<LoopbackDeviceUniqueFd> createLoopDevice(const std::string& target,
-                                                const int32_t imageOffset,
-                                                const size_t imageSize) {
+StatusOr<LoopbackDeviceUniqueFd> createLoopDevice(const std::string& target,
+                                                  const int32_t imageOffset,
+                                                  const size_t imageSize) {
+  using Failed = StatusOr<LoopbackDeviceUniqueFd>;
   unique_fd ctl_fd(open("/dev/loop-control", O_RDWR | O_CLOEXEC));
   if (ctl_fd.get() == -1) {
-    return ErrnoError() << "Failed to open loop-control";
+    return Failed::MakeError(PStringLog() << "Failed to open loop-control");
   }
 
   int num = ioctl(ctl_fd.get(), LOOP_CTL_GET_FREE);
   if (num == -1) {
-    return ErrnoError() << "Failed LOOP_CTL_GET_FREE";
+    return Failed::MakeError(PStringLog() << "Failed LOOP_CTL_GET_FREE");
   }
 
   std::string device = StringPrintf("/dev/block/loop%d", num);
 
-  /*
-   * Using O_DIRECT will tell the kernel that we want to use Direct I/O
-   * on the underlying file, which we want to do to avoid double caching.
-   * Note that Direct I/O won't be enabled immediately, because the block
-   * size of the underlying block device may not match the default loop
-   * device block size (512); when we call LOOP_SET_BLOCK_SIZE below, the
-   * kernel driver will automatically enable Direct I/O when it sees that
-   * condition is now met.
-   */
-  unique_fd target_fd(open(target.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT));
+  unique_fd target_fd(open(target.c_str(), O_RDONLY | O_CLOEXEC));
   if (target_fd.get() == -1) {
-    return ErrnoError() << "Failed to open " << target;
+    return Failed::MakeError(PStringLog() << "Failed to open " << target);
   }
   LoopbackDeviceUniqueFd device_fd;
   {
@@ -167,14 +158,14 @@ Result<LoopbackDeviceUniqueFd> createLoopDevice(const std::string& target,
       usleep(50000);
     }
     if (sysfs_fd.get() == -1) {
-      return ErrnoError() << "Failed to open " << device;
+      return Failed::MakeError(PStringLog() << "Failed to open " << device);
     }
     device_fd = LoopbackDeviceUniqueFd(std::move(sysfs_fd), device);
     CHECK_NE(device_fd.get(), -1);
   }
 
   if (ioctl(device_fd.get(), LOOP_SET_FD, target_fd.get()) == -1) {
-    return ErrnoError() << "Failed to LOOP_SET_FD";
+    return Failed::MakeError(PStringLog() << "Failed to LOOP_SET_FD");
   }
 
   struct loop_info64 li;
@@ -183,7 +174,7 @@ Result<LoopbackDeviceUniqueFd> createLoopDevice(const std::string& target,
   li.lo_offset = imageOffset;
   li.lo_sizelimit = imageSize;
   if (ioctl(device_fd.get(), LOOP_SET_STATUS64, &li) == -1) {
-    return ErrnoError() << "Failed to LOOP_SET_STATUS64";
+    return Failed::MakeError(PStringLog() << "Failed to LOOP_SET_STATUS64");
   }
 
   if (ioctl(device_fd.get(), BLKFLSBUF, 0) == -1) {
@@ -205,20 +196,27 @@ Result<LoopbackDeviceUniqueFd> createLoopDevice(const std::string& target,
     // To work around this, explicitly flush the block device, which will flush
     // the buffer cache and make sure we actually read the data at the correct
     // offset.
-    return ErrnoError() << "Failed to flush buffers on the loop device";
+    return Failed::MakeError(PStringLog()
+                             << "Failed to flush buffers on the loop device");
   }
 
   // Direct-IO requires the loop device to have the same block size as the
   // underlying filesystem.
   if (ioctl(device_fd.get(), LOOP_SET_BLOCK_SIZE, 4096) == -1) {
     PLOG(WARNING) << "Failed to LOOP_SET_BLOCK_SIZE";
+  } else {
+    if (ioctl(device_fd.get(), LOOP_SET_DIRECT_IO, 1) == -1) {
+      PLOG(WARNING) << "Failed to LOOP_SET_DIRECT_IO";
+      // TODO Eventually we'll want to fail on this; right now we can't because
+      // not all devices have the necessary kernel patches.
+    }
   }
 
-  Result<void> readAheadStatus = configureReadAhead(device);
-  if (!readAheadStatus) {
-    return readAheadStatus.error();
+  Status readAheadStatus = configureReadAhead(device);
+  if (!readAheadStatus.Ok()) {
+    return Failed::MakeError(StringLog() << readAheadStatus.ErrorMessage());
   }
-  return device_fd;
+  return StatusOr<LoopbackDeviceUniqueFd>(std::move(device_fd));
 }
 
 void DestroyLoopDevice(const std::string& path, const DestroyLoopFn& extra) {

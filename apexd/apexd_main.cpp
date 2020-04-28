@@ -18,7 +18,6 @@
 
 #include <strings.h>
 
-#include <ApexProperties.sysprop.h>
 #include <android-base/logging.h>
 
 #include "apexd.h"
@@ -26,6 +25,7 @@
 #include "apexd_prepostinstall.h"
 #include "apexd_prop.h"
 #include "apexservice.h"
+#include "status_or.h"
 
 #include <android-base/properties.h>
 
@@ -47,43 +47,41 @@ int HandleSubcommand(char** argv) {
     return android::apex::onBootstrap();
   }
 
-  if (strcmp("--unmount-all", argv[1]) == 0) {
-    LOG(INFO) << "Unmount all subcommand detected";
-    return android::apex::unmountAll();
-  }
-
   LOG(ERROR) << "Unknown subcommand: " << argv[1];
   return 1;
 }
 
+struct CombinedLogger {
+  android::base::LogdLogger logd;
+
+  CombinedLogger() {}
+
+  void operator()(android::base::LogId id, android::base::LogSeverity severity,
+                  const char* tag, const char* file, unsigned int line,
+                  const char* message) {
+    logd(id, severity, tag, file, line, message);
+    KernelLogger(id, severity, tag, file, line, message);
+  }
+};
+
 }  // namespace
 
 int main(int /*argc*/, char** argv) {
-  android::base::InitLogging(argv, &android::base::KernelLogger);
+  // Use CombinedLogger to also log to the kernel log.
+  android::base::InitLogging(argv, CombinedLogger());
+
+  if (argv[1] != nullptr) {
+    return HandleSubcommand(argv);
+  }
   // TODO: add a -v flag or an external setting to change LogSeverity.
   android::base::SetMinimumLogSeverity(android::base::VERBOSE);
 
-  const bool has_subcommand = argv[1] != nullptr;
-  if (!android::sysprop::ApexProperties::updatable().value_or(false)) {
-    LOG(INFO) << "This device does not support updatable APEX. Exiting";
-    if (!has_subcommand) {
-      // mark apexd as ready so that init can proceed
-      android::apex::onAllPackagesReady();
-      android::base::SetProperty("ctl.stop", "apexd");
-    }
-    return 0;
-  }
-
-  if (has_subcommand) {
-    return HandleSubcommand(argv);
-  }
-
-  android::base::Result<android::apex::VoldCheckpointInterface>
+  android::apex::StatusOr<android::apex::VoldCheckpointInterface>
       vold_service_st = android::apex::VoldCheckpointInterface::Create();
   android::apex::VoldCheckpointInterface* vold_service = nullptr;
-  if (!vold_service_st) {
+  if (!vold_service_st.Ok()) {
     LOG(ERROR) << "Could not retrieve vold service: "
-               << vold_service_st.error();
+               << vold_service_st.ErrorMessage();
   } else {
     vold_service = &*vold_service_st;
   }

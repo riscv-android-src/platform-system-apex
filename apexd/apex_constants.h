@@ -27,13 +27,11 @@ static constexpr const char* kActiveApexPackagesDataDir = "/data/apex/active";
 static constexpr const char* kApexBackupDir = "/data/apex/backup";
 static constexpr const char* kApexPackageSystemDir = "/system/apex";
 static const std::vector<std::string> kApexPackageBuiltinDirs = {
-    kApexPackageSystemDir, "/product/apex", "/vendor/apex"};
+    kApexPackageSystemDir, "/product/apex"};
 static constexpr const char* kApexRoot = "/apex";
 static constexpr const char* kStagedSessionsDir = "/data/app-staging";
 
 static constexpr const char* kApexPackageSuffix = ".apex";
 
-static constexpr const char* kManifestFilenameJson = "apex_manifest.json";
-static constexpr const char* kManifestFilenamePb = "apex_manifest.pb";
 }  // namespace apex
 }  // namespace android
