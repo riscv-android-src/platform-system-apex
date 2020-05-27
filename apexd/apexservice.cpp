@@ -29,8 +29,10 @@
 #include <binder/IPCThreadState.h>
 #include <binder/IResultReceiver.h>
 #include <binder/IServiceManager.h>
+#include <binder/LazyServiceRegistrar.h>
 #include <binder/ProcessState.h>
 #include <binder/Status.h>
+#include <private/android_filesystem_config.h>
 #include <utils/String16.h>
 
 #include "apex_file.h"
@@ -41,6 +43,7 @@
 
 #include <android/apex/BnApexService.h>
 
+using android::base::Join;
 using android::base::Result;
 
 namespace android {
@@ -49,6 +52,16 @@ namespace binder {
 namespace {
 
 using BinderStatus = ::android::binder::Status;
+
+BinderStatus CheckCallerIsRoot(const std::string& name) {
+  uid_t uid = IPCThreadState::self()->getCallingUid();
+  if (uid != AID_ROOT) {
+    std::string msg = "Only root is allowed to call " + name;
+    return BinderStatus::fromExceptionCode(BinderStatus::EX_SECURITY,
+                                           String8(name.c_str()));
+  }
+  return BinderStatus::ok();
+}
 
 class ApexService : public BnApexService {
  public:
@@ -87,6 +100,9 @@ class ApexService : public BnApexService {
   BinderStatus destroyDeSnapshots(int rollback_id) override;
   BinderStatus destroyCeSnapshotsNotSpecified(
       int user_id, const std::vector<int>& retain_rollback_ids) override;
+  BinderStatus remountPackages() override;
+  BinderStatus recollectPreinstalledData(
+      const std::vector<std::string>& paths) override;
 
   status_t dump(int fd, const Vector<String16>& args) override;
 
@@ -524,6 +540,42 @@ BinderStatus ApexService::destroyCeSnapshotsNotSpecified(
   return BinderStatus::ok();
 }
 
+BinderStatus ApexService::remountPackages() {
+  LOG(DEBUG) << "remountPackages() received by ApexService";
+  if (auto debug = CheckDebuggable("remountPackages"); !debug.isOk()) {
+    return debug;
+  }
+  if (auto root = CheckCallerIsRoot("remountPackages"); !root.isOk()) {
+    return root;
+  }
+  if (auto res = ::android::apex::remountPackages(); !res.ok()) {
+    return BinderStatus::fromExceptionCode(
+        BinderStatus::EX_SERVICE_SPECIFIC,
+        String8(res.error().message().c_str()));
+  }
+  return BinderStatus::ok();
+}
+
+BinderStatus ApexService::recollectPreinstalledData(
+    const std::vector<std::string>& paths) {
+  LOG(DEBUG) << "recollectPreinstalledData() received by ApexService, paths: "
+             << Join(paths, ',');
+  if (auto debug = CheckDebuggable("recollectPreinstalledData");
+      !debug.isOk()) {
+    return debug;
+  }
+  if (auto root = CheckCallerIsRoot("recollectPreinstalledData");
+      !root.isOk()) {
+    return root;
+  }
+  if (auto res = ::android::apex::collectPreinstalledData(paths); !res) {
+    return BinderStatus::fromExceptionCode(
+        BinderStatus::EX_SERVICE_SPECIFIC,
+        String8(res.error().message().c_str()));
+  }
+  return BinderStatus::ok();
+}
+
 status_t ApexService::onTransact(uint32_t _aidl_code, const Parcel& _aidl_data,
                                  Parcel* _aidl_reply, uint32_t _aidl_flags) {
   switch (_aidl_code) {
@@ -631,8 +683,20 @@ status_t ApexService::shellCommand(int in, int out, int err,
         << std::endl
         << "  getStagedSessionInfo [sessionId] - displays information about a "
            "given session previously submitted"
+        << std::endl
         << "  submitStagedSession [sessionId] - attempts to submit the "
            "installer session with given id"
+        << std::endl
+        << "  remountPackages - Force apexd to remount active packages. This "
+           "call can be used to speed up development workflow of an APEX "
+           "package. Example of usage:\n"
+           "    1. adb shell stop\n"
+           "    2. adb sync\n"
+           "    3. adb shell cmd -w apexservice remountPackages\n"
+           "    4. adb shell start\n"
+           "\n"
+           "Note: APEX package will be successfully remounted only if there "
+           "are no alive processes holding a reference to it"
         << std::endl;
     dprintf(fd, "%s", log.operator std::string().c_str());
   };
@@ -851,6 +915,17 @@ status_t ApexService::shellCommand(int in, int out, int err,
     return BAD_VALUE;
   }
 
+  if (cmd == String16("remountPackages")) {
+    BinderStatus status = remountPackages();
+    if (status.isOk()) {
+      return OK;
+    }
+    std::string msg = StringLog() << "remountPackages failed: "
+                                  << status.toString8().string() << std::endl;
+    dprintf(err, "%s", msg.c_str());
+    return BAD_VALUE;
+  }
+
   if (cmd == String16("help")) {
     if (args.size() != 1) {
       print_help(err, "Help has no options");
@@ -868,18 +943,24 @@ status_t ApexService::shellCommand(int in, int out, int err,
 
 static constexpr const char* kApexServiceName = "apexservice";
 
-using android::defaultServiceManager;
 using android::IPCThreadState;
 using android::ProcessState;
 using android::sp;
-using android::String16;
+using android::binder::LazyServiceRegistrar;
 
 void CreateAndRegisterService() {
   sp<ProcessState> ps(ProcessState::self());
 
-  // Create binder service and register with servicemanager
+  // Create binder service and register with LazyServiceRegistrar
   sp<ApexService> apexService = new ApexService();
-  defaultServiceManager()->addService(String16(kApexServiceName), apexService);
+  auto lazyRegistrar = LazyServiceRegistrar::getInstance();
+  lazyRegistrar.forcePersist(true);
+  lazyRegistrar.registerService(apexService, kApexServiceName);
+}
+
+void AllowServiceShutdown() {
+  auto lazyRegistrar = LazyServiceRegistrar::getInstance();
+  lazyRegistrar.forcePersist(false);
 }
 
 void StartThreadPool() {

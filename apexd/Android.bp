@@ -178,7 +178,6 @@ cc_defaults {
     "libbase",
     "libcrypto",
     "libcutils",
-    "libjsoncpp",
     "libprotobuf-cpp-full",
     "libziparchive",
   ],
@@ -219,11 +218,6 @@ cc_library_static {
   export_header_lib_headers: [
     "libutils_headers",
   ],
-  product_variables: {
-    debuggable: {
-      cflags: ["-DDEBUG_ALLOW_BUNDLED_KEY"],
-    },
-  },
 }
 
 genrule {
@@ -310,6 +304,7 @@ cc_test {
   ],
   shared_libs: [
     "libbinder",
+    "libfs_mgr",
     "libutils",
   ],
   test_suites: ["device-tests"],
@@ -334,3 +329,9 @@ cc_test {
   test_config: "flattened_apex_test_config.xml",
 }
 
+xsd_config {
+  name: "apex-info-list",
+  srcs: ["ApexInfoList.xsd"],
+  package_name: "com.android.apex",
+  api_dir: "apex-info-list-api",
+}
