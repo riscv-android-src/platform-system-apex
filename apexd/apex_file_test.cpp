@@ -80,6 +80,7 @@ TEST(ApexFileTest, GetApexManifest) {
 }
 
 TEST(ApexFileTest, VerifyApexVerity) {
+  ASSERT_RESULT_OK(collectPreinstalledData({"/system_ext/apex"}));
   const std::string filePath = testDataDir + "apex.apexd_test.apex";
   Result<ApexFile> apexFile = ApexFile::Open(filePath);
   ASSERT_RESULT_OK(apexFile);
@@ -92,8 +93,10 @@ TEST(ApexFileTest, VerifyApexVerity) {
   EXPECT_EQ(std::string("368a22e64858647bc45498e92f749f85482ac468"
                         "50ca7ec8071f49dfa47a243c"),
             data.salt);
-  EXPECT_EQ(std::string("705d8ec15be38fe416ed75045056434132758008"),
-            data.root_digest);
+  EXPECT_EQ(
+      std::string(
+          "8e841019e41e8c40bca6dd6304cbf163ea257ba0a268304832c4105eba1c2747"),
+      data.root_digest);
 }
 
 // TODO: May consider packaging a debug key in debug builds (again).
@@ -106,13 +109,7 @@ TEST(ApexFileTest, DISABLED_VerifyApexVerityNoKeyDir) {
   ASSERT_FALSE(verity_or.ok());
 }
 
-// TODO(jiyong): re-enable this test. This test is disabled because the build
-// system now always bundles the public key that was used to sign the APEX.
-// In debuggable build, the bundled public key is used as the last fallback.
-// As a result, the verification is always successful (and thus test fails).
-// In order to re-enable this test, we have to manually create an APEX
-// where public key is not bundled.
-TEST(ApexFileTest, DISABLED_VerifyApexVerityNoKeyInst) {
+TEST(ApexFileTest, VerifyApexVerityNoKeyInst) {
   const std::string filePath = testDataDir + "apex.apexd_test_no_inst_key.apex";
   Result<ApexFile> apexFile = ApexFile::Open(filePath);
   ASSERT_RESULT_OK(apexFile);
@@ -138,9 +135,3 @@ TEST(ApexFileTest, GetBundledPublicKey) {
 }  // namespace
 }  // namespace apex
 }  // namespace android
-
-int main(int argc, char** argv) {
-  android::base::InitLogging(argv, &android::base::StderrLogger);
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}

@@ -42,7 +42,7 @@ interface IApexService {
 
    /**
     * Restores the snapshot of the CE apex data directory for the given user and
-    * apex.
+    * apex. Note the snapshot will be deleted after restoration succeeded.
     */
    void restoreCeData(int user_id, int rollback_id, in @utf8InCpp String apex_name);
 
@@ -95,4 +95,31 @@ interface IApexService {
     * functional on user builds.
     */
    void resumeRevertIfNeeded();
+   /**
+    * Forces apexd to remount all active packages.
+    *
+    * This call is mostly useful for speeding up development of APEXes.
+    * Instead of going through a full APEX installation that requires a reboot,
+    * developers can incorporate this method in much faster `adb sync` based
+    * workflow:
+    *
+    * 1. adb shell stop
+    * 2. adb sync
+    * 3. adb shell cmd -w apexservice remountPackages
+    * 4. adb shell start
+    *
+    * Note, that for an APEX package will be successfully remounted only if
+    * there are no alive processes holding a reference to it.
+    *
+    * Not meant for use outside of testing. This call will not be functional
+    * on user builds. Only root is allowed to call this method.
+    */
+   void remountPackages();
+   /**
+    * Forces apexd to recollect pre-installed data from the given |paths|.
+    *
+    * Not meant for use outside of testing. This call will not be functional
+    * on user builds. Only root is allowed to call this method.
+    */
+   void recollectPreinstalledData(in @utf8InCpp List<String> paths);
 }

@@ -54,6 +54,17 @@ int HandleSubcommand(char** argv) {
 
   if (strcmp("--snapshotde", argv[1]) == 0) {
     LOG(INFO) << "Snapshot DE subcommand detected";
+    // Need to know if checkpointing is enabled so that a prerestore snapshot
+    // can be taken if it's not.
+    android::base::Result<android::apex::VoldCheckpointInterface>
+        vold_service_st = android::apex::VoldCheckpointInterface::Create();
+    if (!vold_service_st.ok()) {
+      LOG(ERROR) << "Could not retrieve vold service: "
+                 << vold_service_st.error();
+    } else {
+      android::apex::initializeVold(&*vold_service_st);
+    }
+
     int result = android::apex::snapshotOrRestoreDeUserData();
 
     if (result == 0) {
@@ -69,6 +80,20 @@ int HandleSubcommand(char** argv) {
   return 1;
 }
 
+void InstallSigtermSignalHandler() {
+  struct sigaction action = {};
+  action.sa_handler = [](int /*signal*/) {
+    // Handle SIGTERM gracefully.
+    // By default, when SIGTERM is received a process will exit with non-zero
+    // exit code, which will trigger reboot_on_failure handler if one is
+    // defined. This doesn't play well with userspace reboot which might
+    // terminate apexd with SIGTERM if apexd was running at the moment of
+    // userspace reboot, hence this custom handler to exit gracefully.
+    _exit(0);
+  };
+  sigaction(SIGTERM, &action, nullptr);
+}
+
 }  // namespace
 
 int main(int /*argc*/, char** argv) {
@@ -76,13 +101,14 @@ int main(int /*argc*/, char** argv) {
   // TODO: add a -v flag or an external setting to change LogSeverity.
   android::base::SetMinimumLogSeverity(android::base::VERBOSE);
 
+  InstallSigtermSignalHandler();
+
   const bool has_subcommand = argv[1] != nullptr;
   if (!android::sysprop::ApexProperties::updatable().value_or(false)) {
     LOG(INFO) << "This device does not support updatable APEX. Exiting";
     if (!has_subcommand) {
       // mark apexd as activated so that init can proceed
       android::apex::onAllPackagesActivated();
-      android::base::SetProperty("ctl.stop", "apexd");
     } else if (strcmp("--snapshotde", argv[1]) == 0) {
       // mark apexd as ready
       android::apex::onAllPackagesReady();
@@ -103,22 +129,30 @@ int main(int /*argc*/, char** argv) {
   } else {
     vold_service = &*vold_service_st;
   }
+  android::apex::initialize(vold_service);
 
-  android::apex::migrateSessionsDirIfNeeded();
-  android::apex::onStart(vold_service);
+  bool booting = android::apex::isBooting();
+  if (booting) {
+    android::apex::migrateSessionsDirIfNeeded();
+    android::apex::onStart();
+  }
   android::apex::binder::CreateAndRegisterService();
   android::apex::binder::StartThreadPool();
 
-  // Notify other components (e.g. init) that all APEXs are correctly mounted
-  // and activated (but are not yet ready to be used).
-  // Configuration based on activated APEXs may be performed at this point, but
-  // use of APEXs themselves should wait for the ready status instead, which
-  // is set when the "--snapshotde" subcommand is received and snapshot/restore
-  // is complete.
-  android::apex::onAllPackagesActivated();
+  if (booting) {
+    // Notify other components (e.g. init) that all APEXs are correctly mounted
+    // and activated (but are not yet ready to be used). Configuration based on
+    // activated APEXs may be performed at this point, but use of APEXs
+    // themselves should wait for the ready status instead, which is set when
+    // the "--snapshotde" subcommand is received and snapshot/restore is
+    // complete.
+    android::apex::onAllPackagesActivated();
+    android::apex::waitForBootStatus(
+        android::apex::revertActiveSessionsAndReboot,
+        android::apex::bootCompletedCleanup);
+  }
 
-  android::apex::waitForBootStatus(android::apex::revertActiveSessionsAndReboot,
-                                   android::apex::bootCompletedCleanup);
+  android::apex::binder::AllowServiceShutdown();
 
   android::apex::binder::JoinThreadPool();
   return 1;

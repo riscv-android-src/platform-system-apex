@@ -40,6 +40,7 @@
 #include <android-base/strings.h>
 #include <android/os/IVold.h>
 #include <binder/IServiceManager.h>
+#include <fs_mgr_overlayfs.h>
 #include <fstab/fstab.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -85,6 +86,7 @@ using ::testing::Contains;
 using ::testing::EndsWith;
 using ::testing::HasSubstr;
 using ::testing::Not;
+using ::testing::SizeIs;
 using ::testing::UnorderedElementsAre;
 using ::testing::UnorderedElementsAreArray;
 
@@ -99,7 +101,7 @@ class ApexServiceTest : public ::testing::Test {
     using android::IServiceManager;
 
     sp<IServiceManager> sm = android::defaultServiceManager();
-    sp<IBinder> binder = sm->getService(String16("apexservice"));
+    sp<IBinder> binder = sm->waitForService(String16("apexservice"));
     if (binder != nullptr) {
       service_ = android::interface_cast<IApexService>(binder);
     }
@@ -121,6 +123,7 @@ class ApexServiceTest : public ::testing::Test {
         vold_service_->supportsCheckpoint(&supports_fs_checkpointing_);
     ASSERT_TRUE(IsOk(status));
     CleanUp();
+    service_->recollectPreinstalledData(kApexPackageBuiltinDirs);
   }
 
   void TearDown() override { CleanUp(); }
@@ -136,12 +139,29 @@ class ApexServiceTest : public ::testing::Test {
 
   static bool IsSelinuxEnforced() { return 0 != security_getenforce(); }
 
-  Result<bool> IsActive(const std::string& name, int64_t version) {
+  Result<bool> IsActive(const std::string& name) {
+    std::vector<ApexInfo> list;
+    android::binder::Status status = service_->getActivePackages(&list);
+    if (!status.isOk()) {
+      return Error() << "Failed to check if " << name
+                     << " is active : " << status.exceptionMessage().c_str();
+    }
+    for (const ApexInfo& apex : list) {
+      if (apex.moduleName == name) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  Result<bool> IsActive(const std::string& name, int64_t version,
+                        const std::string& path) {
     std::vector<ApexInfo> list;
     android::binder::Status status = service_->getActivePackages(&list);
     if (status.isOk()) {
       for (const ApexInfo& p : list) {
-        if (p.moduleName == name && p.versionCode == version) {
+        if (p.moduleName == name && p.versionCode == version &&
+            p.modulePath == path) {
           return true;
         }
       }
@@ -277,9 +297,8 @@ class ApexServiceTest : public ::testing::Test {
         "-f",
         file,
     };
-    std::string error_msg;
-    int res = ForkAndRun(args, &error_msg);
-    CHECK_EQ(0, res) << error_msg;
+    auto res = ForkAndRun(args);
+    CHECK(res.ok()) << res.error();
 
     std::string data;
     CHECK(android::base::ReadFileToString(file, &data));
@@ -507,7 +526,8 @@ Result<void> ReadDevice(const std::string& block_device) {
   static constexpr size_t kBufSize = 1024 * kBlockSize;
   std::vector<uint8_t> buffer(kBufSize);
 
-  unique_fd fd(TEMP_FAILURE_RETRY(open(block_device.c_str(), O_RDONLY)));
+  unique_fd fd(
+      TEMP_FAILURE_RETRY(open(block_device.c_str(), O_RDONLY | O_CLOEXEC)));
   if (fd.get() == -1) {
     return ErrnoError() << "Can't open " << block_device;
   }
@@ -548,6 +568,16 @@ std::vector<std::string> ListSlavesOfDmDevice(const std::string& name) {
     EXPECT_TRUE(IsOk(st));
   }
   return slaves;
+}
+
+Result<void> CopyFile(const std::string& from, const std::string& to,
+                      const fs::copy_options& options) {
+  std::error_code ec;
+  if (!fs::copy_file(from, to, options)) {
+    return Error() << "Failed to copy file " << from << " to " << to << " : "
+                   << ec.message();
+  }
+  return {};
 }
 
 }  // namespace
@@ -598,13 +628,7 @@ TEST_F(ApexServiceTest, StageFailAccess) {
   EXPECT_NE(std::string::npos, error.find("I/O error")) << error;
 }
 
-// TODO(jiyong): re-enable this test. This test is disabled because the build
-// system now always bundles the public key that was used to sign the APEX.
-// In debuggable build, the bundled public key is used as the last fallback.
-// As a result, the verification is always successful (and thus test fails).
-// In order to re-enable this test, we have to manually create an APEX
-// where public key is not bundled.
-TEST_F(ApexServiceTest, DISABLED_StageFailKey) {
+TEST_F(ApexServiceTest, StageFailKey) {
   PrepareTestApexForInstall installer(
       GetTestFile("apex.apexd_test_no_inst_key.apex"));
   if (!installer.Prepare()) {
@@ -619,21 +643,8 @@ TEST_F(ApexServiceTest, DISABLED_StageFailKey) {
   // May contain one of two errors.
   std::string error = st.exceptionMessage().c_str();
 
-  constexpr const char* kExpectedError1 = "Failed to get realpath of ";
-  const size_t pos1 = error.find(kExpectedError1);
-  constexpr const char* kExpectedError2 =
-      "/etc/security/apex/com.android.apex.test_package.no_inst_key";
-  const size_t pos2 = error.find(kExpectedError2);
-
-  constexpr const char* kExpectedError3 =
-      "Error verifying "
-      "/data/app-staging/apexservice_tmp/apex.apexd_test_no_inst_key.apex: "
-      "couldn't verify public key: Failed to compare the bundled public key "
-      "with key";
-  const size_t pos3 = error.find(kExpectedError3);
-
-  const size_t npos = std::string::npos;
-  EXPECT_TRUE((pos1 != npos && pos2 != npos) || pos3 != npos) << error;
+  ASSERT_THAT(error, HasSubstr("No preinstalled data found for package "
+                               "com.android.apex.test_package.no_inst_key"));
 }
 
 TEST_F(ApexServiceTest, StageSuccess) {
@@ -708,7 +719,7 @@ TEST_F(ApexServiceTest, SubmitStagedSessionFailDoesNotLeakTempVerityDevices) {
   }
 }
 
-TEST_F(ApexServiceTest, StageSuccess_ClearsPreviouslyActivePackage) {
+TEST_F(ApexServiceTest, StageSuccessClearsPreviouslyActivePackage) {
   PrepareTestApexForInstall installer1(GetTestFile("apex.apexd_test_v2.apex"));
   PrepareTestApexForInstall installer2(
       GetTestFile("apex.apexd_test_different_app.apex"));
@@ -863,9 +874,12 @@ TEST_F(ApexServiceTest, RestoreCeData) {
       "/data/misc_ce/0/apexdata/apex.apexd_test/oldfile.txt"));
   ASSERT_FALSE(RegularFileExists(
       "/data/misc_ce/0/apexdata/apex.apexd_test/newfile.txt"));
+  // The snapshot should be deleted after restoration.
+  ASSERT_FALSE(
+      DirExists("/data/misc_ce/0/apexrollback/123456/apex.apexd_test"));
 }
 
-TEST_F(ApexServiceTest, DestroyDeSnapshots_DeSys) {
+TEST_F(ApexServiceTest, DestroyDeSnapshotsDeSys) {
   CreateDir("/data/misc/apexrollback/123456");
   CreateDir("/data/misc/apexrollback/123456/my.apex");
   CreateFile("/data/misc/apexrollback/123456/my.apex/hello.txt");
@@ -883,7 +897,7 @@ TEST_F(ApexServiceTest, DestroyDeSnapshots_DeSys) {
   ASSERT_FALSE(DirExists("/data/misc/apexrollback/123456"));
 }
 
-TEST_F(ApexServiceTest, DestroyDeSnapshots_DeUser) {
+TEST_F(ApexServiceTest, DestroyDeSnapshotsDeUser) {
   CreateDir("/data/misc_de/0/apexrollback/123456");
   CreateDir("/data/misc_de/0/apexrollback/123456/my.apex");
   CreateFile("/data/misc_de/0/apexrollback/123456/my.apex/hello.txt");
@@ -957,7 +971,10 @@ class ApexServiceActivationTest : public ApexServiceTest {
 
     {
       // Check package is not active.
-      Result<bool> active = IsActive(installer_->package, installer_->version);
+      std::string path = stage_package ? installer_->test_installed_file
+                                       : installer_->test_file;
+      Result<bool> active =
+          IsActive(installer_->package, installer_->version, path);
       ASSERT_TRUE(IsOk(active));
       ASSERT_FALSE(*active);
     }
@@ -1034,7 +1051,8 @@ TEST_F(ApexServiceActivationSuccessTest, Activate) {
 
   {
     // Check package is active.
-    Result<bool> active = IsActive(installer_->package, installer_->version);
+    Result<bool> active = IsActive(installer_->package, installer_->version,
+                                   installer_->test_installed_file);
     ASSERT_TRUE(IsOk(active));
     ASSERT_TRUE(*active) << Join(GetActivePackagesStrings(), ',');
   }
@@ -1164,7 +1182,8 @@ TEST_F(ApexServiceNoHashtreeApexActivationTest, Activate) {
       << GetDebugStr(installer_.get());
   {
     // Check package is active.
-    Result<bool> active = IsActive(installer_->package, installer_->version);
+    Result<bool> active = IsActive(installer_->package, installer_->version,
+                                   installer_->test_installed_file);
     ASSERT_TRUE(IsOk(active));
     ASSERT_TRUE(*active) << Join(GetActivePackagesStrings(), ',');
   }
@@ -1192,7 +1211,8 @@ TEST_F(ApexServiceNoHashtreeApexActivationTest,
       << GetDebugStr(installer_.get());
   {
     // Check package is active.
-    Result<bool> active = IsActive(installer_->package, installer_->version);
+    Result<bool> active = IsActive(installer_->package, installer_->version,
+                                   installer_->test_installed_file);
     ASSERT_TRUE(IsOk(active));
     ASSERT_TRUE(*active) << Join(GetActivePackagesStrings(), ',');
   }
@@ -1308,7 +1328,7 @@ TEST_F(ApexServiceTest, NoHashtreeApexStagePackagesMovesHashtree) {
   auto read_fn = [](const std::string& path) -> std::vector<uint8_t> {
     static constexpr size_t kBufSize = 4096;
     std::vector<uint8_t> buffer(kBufSize);
-    unique_fd fd(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY)));
+    unique_fd fd(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY | O_CLOEXEC)));
     if (fd.get() == -1) {
       PLOG(ERROR) << "Failed to open " << path;
       ADD_FAILURE();
@@ -1386,7 +1406,7 @@ TEST_F(ApexServiceTest, NoPackagesAreBothActiveAndInactive) {
       activePackagesStrings.begin(), activePackagesStrings.end(),
       inactivePackagesStrings.begin(), inactivePackagesStrings.end(),
       std::back_inserter(intersection));
-  ASSERT_EQ(intersection.size(), 0UL);
+  ASSERT_THAT(intersection, SizeIs(0));
 }
 
 TEST_F(ApexServiceTest, GetAllPackages) {
@@ -1594,7 +1614,8 @@ class ApexServicePrePostInstallTest : public ApexServiceTest {
 
     // Ensure that the package is neither active nor mounted.
     for (const InstallerUPtr& installer : installers) {
-      Result<bool> active = IsActive(installer->package, installer->version);
+      Result<bool> active = IsActive(installer->package, installer->version,
+                                     installer->test_file);
       ASSERT_TRUE(IsOk(active));
       EXPECT_FALSE(*active);
     }
@@ -2063,7 +2084,7 @@ TEST_F(ApexServiceTest, BackupActivePackagesZeroActivePackages) {
 
   // Make sure that /data/apex/active exists and is empty
   ASSERT_TRUE(
-      IsOk(createDirIfNeeded(std::string(kActiveApexPackagesDataDir), 0750)));
+      IsOk(createDirIfNeeded(std::string(kActiveApexPackagesDataDir), 0755)));
   auto active_pkgs = ReadEntireDir(kActiveApexPackagesDataDir);
   ASSERT_TRUE(IsOk(active_pkgs));
   ASSERT_EQ(0u, active_pkgs->size());
@@ -2147,6 +2168,18 @@ TEST_F(ApexServiceTest, UnstagePackagesFail) {
               UnorderedElementsAre(installer1.test_installed_file));
 }
 
+TEST_F(ApexServiceTest, UnstagePackagesFailPreInstalledApex) {
+  auto status = service_->unstagePackages(
+      {"/system/apex/com.android.apex.cts.shim.apex"});
+  ASSERT_FALSE(IsOk(status));
+  const std::string& error_message =
+      std::string(status.exceptionMessage().c_str());
+  ASSERT_THAT(error_message,
+              HasSubstr("Can't uninstall pre-installed apex "
+                        "/system/apex/com.android.apex.cts.shim.apex"));
+  ASSERT_TRUE(RegularFileExists("/system/apex/com.android.apex.cts.shim.apex"));
+}
+
 class ApexServiceRevertTest : public ApexServiceTest {
  protected:
   void SetUp() override { ApexServiceTest::SetUp(); }
@@ -2171,7 +2204,7 @@ class ApexServiceRevertTest : public ApexServiceTest {
     // First check that /data/apex/active exists and has correct permissions.
     struct stat sd;
     ASSERT_EQ(0, stat(kActiveApexPackagesDataDir, &sd));
-    ASSERT_EQ(0750u, sd.st_mode & ALLPERMS);
+    ASSERT_EQ(0755u, sd.st_mode & ALLPERMS);
 
     // Now read content and check it contains expected values.
     auto active_pkgs = ReadEntireDir(kActiveApexPackagesDataDir);
@@ -2668,6 +2701,99 @@ TEST_F(ApexServiceTest, SubmitStagedSessionCorruptApexFails) {
   ASSERT_FALSE(IsOk(service_->submitStagedSession(params, &list)));
 }
 
+TEST_F(ApexServiceTest, RemountPackagesPackageOnSystemChanged) {
+  static constexpr const char* kSystemPath =
+      "/system_ext/apex/apex.apexd_test.apex";
+  static constexpr const char* kPackageName = "com.android.apex.test_package";
+  if (!fs_mgr_overlayfs_is_setup()) {
+    GTEST_SKIP() << "/system_ext is not overlayed into read-write";
+  }
+  if (auto res = IsActive(kPackageName); !res.ok()) {
+    FAIL() << res.error();
+  } else {
+    ASSERT_FALSE(*res) << kPackageName << " is active";
+  }
+  ASSERT_EQ(0, access(kSystemPath, F_OK))
+      << "Failed to stat " << kSystemPath << " : " << strerror(errno);
+  ASSERT_TRUE(IsOk(service_->activatePackage(kSystemPath)));
+  std::string backup_path = GetTestFile("apex.apexd_test.apexd.bak");
+  // Copy original /system_ext apex file. We will need to restore it after test
+  // runs.
+  ASSERT_RESULT_OK(CopyFile(kSystemPath, backup_path, fs::copy_options::none));
+
+  // Make sure we cleanup after ourselves.
+  auto deleter = android::base::make_scope_guard([&]() {
+    if (auto ret = service_->deactivatePackage(kSystemPath); !ret.isOk()) {
+      LOG(ERROR) << ret.exceptionMessage();
+    }
+    auto ret = CopyFile(backup_path, kSystemPath,
+                        fs::copy_options::overwrite_existing);
+    if (!ret.ok()) {
+      LOG(ERROR) << ret.error();
+    }
+  });
+
+  // Copy v2 version to /system_ext/apex/ and then call remountPackages.
+  PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"));
+  if (!installer.Prepare()) {
+    FAIL() << GetDebugStr(&installer);
+  }
+  ASSERT_RESULT_OK(CopyFile(installer.test_file, kSystemPath,
+                            fs::copy_options::overwrite_existing));
+  // Don't check that remountPackages succeeded. Most likely it will fail, but
+  // it should still remount our test apex.
+  service_->remountPackages();
+
+  // Check that v2 is now active.
+  auto active_apex = GetActivePackage("com.android.apex.test_package");
+  ASSERT_RESULT_OK(active_apex);
+  ASSERT_EQ(2u, active_apex->versionCode);
+  // Sanity check that module path didn't change.
+  ASSERT_EQ(kSystemPath, active_apex->modulePath);
+}
+
+TEST_F(ApexServiceActivationSuccessTest, RemountPackagesPackageOnDataChanged) {
+  ASSERT_TRUE(IsOk(service_->activatePackage(installer_->test_installed_file)))
+      << GetDebugStr(installer_.get());
+  // Copy v2 version to /data/apex/active and then call remountPackages.
+  PrepareTestApexForInstall installer2(GetTestFile("apex.apexd_test_v2.apex"));
+  if (!installer2.Prepare()) {
+    FAIL() << GetDebugStr(&installer2);
+  }
+  ASSERT_RESULT_OK(CopyFile(installer2.test_file,
+                            installer_->test_installed_file,
+                            fs::copy_options::overwrite_existing));
+  // Don't check that remountPackages succeeded. Most likely it will fail, but
+  // it should still remount our test apex.
+  service_->remountPackages();
+
+  // Check that v2 is now active.
+  auto active_apex = GetActivePackage("com.android.apex.test_package");
+  ASSERT_RESULT_OK(active_apex);
+  ASSERT_EQ(2u, active_apex->versionCode);
+  // Sanity check that module path didn't change.
+  ASSERT_EQ(installer_->test_installed_file, active_apex->modulePath);
+}
+
+TEST_F(ApexServiceTest,
+       SubmitStagedSessionFailsManifestMismatchCleansUpHashtree) {
+  PrepareTestApexForInstall installer(
+      GetTestFile("apex.apexd_test_no_hashtree_manifest_mismatch.apex"),
+      "/data/app-staging/session_83", "staging_data_file");
+  if (!installer.Prepare()) {
+    return;
+  }
+
+  ApexInfoList list;
+  ApexSessionParams params;
+  params.sessionId = 83;
+  ASSERT_FALSE(IsOk(service_->submitStagedSession(params, &list)));
+  std::string hashtree_file = std::string(kApexHashTreeDir) + "/" +
+                              installer.package + "@" +
+                              std::to_string(installer.version) + ".new";
+  ASSERT_FALSE(RegularFileExists(hashtree_file));
+}
+
 class LogTestToLogcat : public ::testing::EmptyTestEventListener {
   void OnTestStart(const ::testing::TestInfo& test_info) override {
 #ifdef __ANDROID__
@@ -2676,9 +2802,9 @@ class LogTestToLogcat : public ::testing::EmptyTestEventListener {
     using base::StringPrintf;
     base::LogdLogger l;
     std::string msg =
-        StringPrintf("=== %s::%s (%s:%d)", test_info.test_case_name(),
+        StringPrintf("=== %s::%s (%s:%d)", test_info.test_suite_name(),
                      test_info.name(), test_info.file(), test_info.line());
-    l(LogId::MAIN, LogSeverity::INFO, "apexservice_test", __FILE__, __LINE__,
+    l(LogId::MAIN, LogSeverity::INFO, "ApexTestCases", __FILE__, __LINE__,
       msg.c_str());
 #else
     UNUSED(test_info);

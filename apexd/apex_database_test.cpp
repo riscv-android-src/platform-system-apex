@@ -35,6 +35,7 @@ TEST(MountedApexDataTest, LinearOrder) {
   constexpr const char* kDm[] = {"dm1", "dm2", "dm3"};
   constexpr const char* kHashtreeLoopName[] = {"hash-loop1", "hash-loop2",
                                                "hash-loop3"};
+  // NOLINTNEXTLINE(bugprone-sizeof-expression)
   constexpr size_t kCount = arraysize(kLoopName) * arraysize(kPath) *
                             arraysize(kMount) * arraysize(kDm);
 
@@ -258,9 +259,3 @@ TEST(MountedApexDataTest, NoDuplicateDm) {
 }  // namespace
 }  // namespace apex
 }  // namespace android
-
-int main(int argc, char** argv) {
-  android::base::InitLogging(argv, &android::base::StderrLogger);
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}
