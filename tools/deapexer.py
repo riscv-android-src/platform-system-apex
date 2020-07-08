@@ -183,6 +183,7 @@ def RunExtract(args):
     if not os.path.exists(args.dest):
       os.makedirs(args.dest, mode=0o755)
     apex.extract(args.dest)
+    shutil.rmtree(os.path.join(args.dest, "lost+found"))
 
 
 def RunInfo(args):
@@ -193,7 +194,7 @@ def RunInfo(args):
 def main(argv):
   parser = argparse.ArgumentParser()
 
-  debugfs_default = 'debugfs'  # assume in PATH by default
+  debugfs_default = None
   if 'ANDROID_HOST_OUT' in os.environ:
     debugfs_default = '%s/bin/debugfs_static' % os.environ['ANDROID_HOST_OUT']
   parser.add_argument('--debugfs_path', help='The path to debugfs binary', default=debugfs_default)
@@ -216,6 +217,11 @@ def main(argv):
   parser_info.set_defaults(func=RunInfo)
 
   args = parser.parse_args(argv)
+
+  if not args.debugfs_path:
+    print('ANDROID_HOST_OUT environment variable is not defined, --debugfs_path must be set',
+          file=sys.stderr)
+    sys.exit(1)
 
   args.func(args)
 

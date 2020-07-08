@@ -297,9 +297,8 @@ class ApexServiceTest : public ::testing::Test {
         "-f",
         file,
     };
-    std::string error_msg;
-    int res = ForkAndRun(args, &error_msg);
-    CHECK_EQ(0, res) << error_msg;
+    auto res = ForkAndRun(args);
+    CHECK(res.ok()) << res.error();
 
     std::string data;
     CHECK(android::base::ReadFileToString(file, &data));
@@ -527,7 +526,8 @@ Result<void> ReadDevice(const std::string& block_device) {
   static constexpr size_t kBufSize = 1024 * kBlockSize;
   std::vector<uint8_t> buffer(kBufSize);
 
-  unique_fd fd(TEMP_FAILURE_RETRY(open(block_device.c_str(), O_RDONLY)));
+  unique_fd fd(
+      TEMP_FAILURE_RETRY(open(block_device.c_str(), O_RDONLY | O_CLOEXEC)));
   if (fd.get() == -1) {
     return ErrnoError() << "Can't open " << block_device;
   }
@@ -628,13 +628,7 @@ TEST_F(ApexServiceTest, StageFailAccess) {
   EXPECT_NE(std::string::npos, error.find("I/O error")) << error;
 }
 
-// TODO(jiyong): re-enable this test. This test is disabled because the build
-// system now always bundles the public key that was used to sign the APEX.
-// In debuggable build, the bundled public key is used as the last fallback.
-// As a result, the verification is always successful (and thus test fails).
-// In order to re-enable this test, we have to manually create an APEX
-// where public key is not bundled.
-TEST_F(ApexServiceTest, DISABLED_StageFailKey) {
+TEST_F(ApexServiceTest, StageFailKey) {
   PrepareTestApexForInstall installer(
       GetTestFile("apex.apexd_test_no_inst_key.apex"));
   if (!installer.Prepare()) {
@@ -649,21 +643,8 @@ TEST_F(ApexServiceTest, DISABLED_StageFailKey) {
   // May contain one of two errors.
   std::string error = st.exceptionMessage().c_str();
 
-  constexpr const char* kExpectedError1 = "Failed to get realpath of ";
-  const size_t pos1 = error.find(kExpectedError1);
-  constexpr const char* kExpectedError2 =
-      "/etc/security/apex/com.android.apex.test_package.no_inst_key";
-  const size_t pos2 = error.find(kExpectedError2);
-
-  constexpr const char* kExpectedError3 =
-      "Error verifying "
-      "/data/app-staging/apexservice_tmp/apex.apexd_test_no_inst_key.apex: "
-      "couldn't verify public key: Failed to compare the bundled public key "
-      "with key";
-  const size_t pos3 = error.find(kExpectedError3);
-
-  const size_t npos = std::string::npos;
-  EXPECT_TRUE((pos1 != npos && pos2 != npos) || pos3 != npos) << error;
+  ASSERT_THAT(error, HasSubstr("No preinstalled data found for package "
+                               "com.android.apex.test_package.no_inst_key"));
 }
 
 TEST_F(ApexServiceTest, StageSuccess) {
@@ -738,7 +719,7 @@ TEST_F(ApexServiceTest, SubmitStagedSessionFailDoesNotLeakTempVerityDevices) {
   }
 }
 
-TEST_F(ApexServiceTest, StageSuccess_ClearsPreviouslyActivePackage) {
+TEST_F(ApexServiceTest, StageSuccessClearsPreviouslyActivePackage) {
   PrepareTestApexForInstall installer1(GetTestFile("apex.apexd_test_v2.apex"));
   PrepareTestApexForInstall installer2(
       GetTestFile("apex.apexd_test_different_app.apex"));
@@ -802,7 +783,6 @@ TEST_F(ApexServiceTest, MultiStageSuccess) {
   }
   ASSERT_EQ(std::string("com.android.apex.test_package"), installer.package);
 
-  // TODO: Add second test. Right now, just use a separate version.
   PrepareTestApexForInstall installer2(GetTestFile("apex.apexd_test_v2.apex"));
   if (!installer2.Prepare()) {
     return;
@@ -898,7 +878,7 @@ TEST_F(ApexServiceTest, RestoreCeData) {
       DirExists("/data/misc_ce/0/apexrollback/123456/apex.apexd_test"));
 }
 
-TEST_F(ApexServiceTest, DestroyDeSnapshots_DeSys) {
+TEST_F(ApexServiceTest, DestroyDeSnapshotsDeSys) {
   CreateDir("/data/misc/apexrollback/123456");
   CreateDir("/data/misc/apexrollback/123456/my.apex");
   CreateFile("/data/misc/apexrollback/123456/my.apex/hello.txt");
@@ -916,7 +896,7 @@ TEST_F(ApexServiceTest, DestroyDeSnapshots_DeSys) {
   ASSERT_FALSE(DirExists("/data/misc/apexrollback/123456"));
 }
 
-TEST_F(ApexServiceTest, DestroyDeSnapshots_DeUser) {
+TEST_F(ApexServiceTest, DestroyDeSnapshotsDeUser) {
   CreateDir("/data/misc_de/0/apexrollback/123456");
   CreateDir("/data/misc_de/0/apexrollback/123456/my.apex");
   CreateFile("/data/misc_de/0/apexrollback/123456/my.apex/hello.txt");
@@ -1347,7 +1327,7 @@ TEST_F(ApexServiceTest, NoHashtreeApexStagePackagesMovesHashtree) {
   auto read_fn = [](const std::string& path) -> std::vector<uint8_t> {
     static constexpr size_t kBufSize = 4096;
     std::vector<uint8_t> buffer(kBufSize);
-    unique_fd fd(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY)));
+    unique_fd fd(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY | O_CLOEXEC)));
     if (fd.get() == -1) {
       PLOG(ERROR) << "Failed to open " << path;
       ADD_FAILURE();
@@ -2001,6 +1981,42 @@ TEST_F(ApexServiceTest, AbortStagedSessionActivatedFail) {
   expected2.isStaged = true;
   ASSERT_THAT(sessions, UnorderedElementsAre(SessionInfoEq(expected1),
                                              SessionInfoEq(expected2)));
+}
+
+// Only finalized sessions should be deleted on DeleteFinalizedSessions()
+TEST_F(ApexServiceTest, DeleteFinalizedSessions) {
+  // Fetch list of all session state
+  std::vector<SessionState::State> states;
+  for (int i = SessionState::State_MIN; i < SessionState::State_MAX; i++) {
+    if (!SessionState::State_IsValid(i)) {
+      continue;
+    }
+    states.push_back(SessionState::State(i));
+  }
+
+  // For every session state, create a new session. This is to verify we only
+  // delete sessions in final state.
+  auto nonFinalSessions = 0u;
+  for (auto i = 0u; i < states.size(); i++) {
+    auto session = ApexSession::CreateSession(230 + i);
+    SessionState::State state = states[i];
+    ASSERT_TRUE(IsOk(session->UpdateStateAndCommit(state)));
+    if (!session->IsFinalized()) {
+      nonFinalSessions++;
+    }
+  }
+  std::vector<ApexSession> sessions = ApexSession::GetSessions();
+  ASSERT_EQ(states.size(), sessions.size());
+
+  // Now try cleaning up all finalized sessions
+  ApexSession::DeleteFinalizedSessions();
+  sessions = ApexSession::GetSessions();
+  ASSERT_EQ(nonFinalSessions, sessions.size());
+
+  // Verify only finalized sessions have been deleted
+  for (auto& session : sessions) {
+    ASSERT_FALSE(session.IsFinalized());
+  }
 }
 
 TEST_F(ApexServiceTest, BackupActivePackages) {
@@ -2794,6 +2810,25 @@ TEST_F(ApexServiceActivationSuccessTest, RemountPackagesPackageOnDataChanged) {
   ASSERT_EQ(installer_->test_installed_file, active_apex->modulePath);
 }
 
+TEST_F(ApexServiceTest,
+       SubmitStagedSessionFailsManifestMismatchCleansUpHashtree) {
+  PrepareTestApexForInstall installer(
+      GetTestFile("apex.apexd_test_no_hashtree_manifest_mismatch.apex"),
+      "/data/app-staging/session_83", "staging_data_file");
+  if (!installer.Prepare()) {
+    return;
+  }
+
+  ApexInfoList list;
+  ApexSessionParams params;
+  params.sessionId = 83;
+  ASSERT_FALSE(IsOk(service_->submitStagedSession(params, &list)));
+  std::string hashtree_file = std::string(kApexHashTreeDir) + "/" +
+                              installer.package + "@" +
+                              std::to_string(installer.version) + ".new";
+  ASSERT_FALSE(RegularFileExists(hashtree_file));
+}
+
 class LogTestToLogcat : public ::testing::EmptyTestEventListener {
   void OnTestStart(const ::testing::TestInfo& test_info) override {
 #ifdef __ANDROID__
@@ -2802,7 +2837,7 @@ class LogTestToLogcat : public ::testing::EmptyTestEventListener {
     using base::StringPrintf;
     base::LogdLogger l;
     std::string msg =
-        StringPrintf("=== %s::%s (%s:%d)", test_info.test_case_name(),
+        StringPrintf("=== %s::%s (%s:%d)", test_info.test_suite_name(),
                      test_info.name(), test_info.file(), test_info.line());
     l(LogId::MAIN, LogSeverity::INFO, "ApexTestCases", __FILE__, __LINE__,
       msg.c_str());

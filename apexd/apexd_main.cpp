@@ -17,6 +17,7 @@
 #define LOG_TAG "apexd"
 
 #include <strings.h>
+#include <sys/stat.h>
 
 #include <ApexProperties.sysprop.h>
 #include <android-base/logging.h>
@@ -54,6 +55,17 @@ int HandleSubcommand(char** argv) {
 
   if (strcmp("--snapshotde", argv[1]) == 0) {
     LOG(INFO) << "Snapshot DE subcommand detected";
+    // Need to know if checkpointing is enabled so that a prerestore snapshot
+    // can be taken if it's not.
+    android::base::Result<android::apex::VoldCheckpointInterface>
+        vold_service_st = android::apex::VoldCheckpointInterface::Create();
+    if (!vold_service_st.ok()) {
+      LOG(ERROR) << "Could not retrieve vold service: "
+                 << vold_service_st.error();
+    } else {
+      android::apex::initializeVold(&*vold_service_st);
+    }
+
     int result = android::apex::snapshotOrRestoreDeUserData();
 
     if (result == 0) {
@@ -69,12 +81,33 @@ int HandleSubcommand(char** argv) {
   return 1;
 }
 
+void InstallSigtermSignalHandler() {
+  struct sigaction action = {};
+  action.sa_handler = [](int /*signal*/) {
+    // Handle SIGTERM gracefully.
+    // By default, when SIGTERM is received a process will exit with non-zero
+    // exit code, which will trigger reboot_on_failure handler if one is
+    // defined. This doesn't play well with userspace reboot which might
+    // terminate apexd with SIGTERM if apexd was running at the moment of
+    // userspace reboot, hence this custom handler to exit gracefully.
+    _exit(0);
+  };
+  sigaction(SIGTERM, &action, nullptr);
+}
+
 }  // namespace
 
 int main(int /*argc*/, char** argv) {
   android::base::InitLogging(argv, &android::base::KernelLogger);
-  // TODO: add a -v flag or an external setting to change LogSeverity.
+  // TODO(b/158468454): add a -v flag or an external setting to change severity.
   android::base::SetMinimumLogSeverity(android::base::VERBOSE);
+
+  // set umask to 022 so that files/dirs created are accessible to other
+  // processes e.g.) apex-info-file.xml is supposed to be read by other
+  // processes
+  umask(022);
+
+  InstallSigtermSignalHandler();
 
   const bool has_subcommand = argv[1] != nullptr;
   if (!android::sysprop::ApexProperties::updatable().value_or(false)) {
@@ -82,7 +115,6 @@ int main(int /*argc*/, char** argv) {
     if (!has_subcommand) {
       // mark apexd as activated so that init can proceed
       android::apex::onAllPackagesActivated();
-      android::base::SetProperty("ctl.stop", "apexd");
     } else if (strcmp("--snapshotde", argv[1]) == 0) {
       // mark apexd as ready
       android::apex::onAllPackagesReady();
