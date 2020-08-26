@@ -783,7 +783,6 @@ TEST_F(ApexServiceTest, MultiStageSuccess) {
   }
   ASSERT_EQ(std::string("com.android.apex.test_package"), installer.package);
 
-  // TODO: Add second test. Right now, just use a separate version.
   PrepareTestApexForInstall installer2(GetTestFile("apex.apexd_test_v2.apex"));
   if (!installer2.Prepare()) {
     return;
@@ -1982,6 +1981,42 @@ TEST_F(ApexServiceTest, AbortStagedSessionActivatedFail) {
   expected2.isStaged = true;
   ASSERT_THAT(sessions, UnorderedElementsAre(SessionInfoEq(expected1),
                                              SessionInfoEq(expected2)));
+}
+
+// Only finalized sessions should be deleted on DeleteFinalizedSessions()
+TEST_F(ApexServiceTest, DeleteFinalizedSessions) {
+  // Fetch list of all session state
+  std::vector<SessionState::State> states;
+  for (int i = SessionState::State_MIN; i < SessionState::State_MAX; i++) {
+    if (!SessionState::State_IsValid(i)) {
+      continue;
+    }
+    states.push_back(SessionState::State(i));
+  }
+
+  // For every session state, create a new session. This is to verify we only
+  // delete sessions in final state.
+  auto nonFinalSessions = 0u;
+  for (auto i = 0u; i < states.size(); i++) {
+    auto session = ApexSession::CreateSession(230 + i);
+    SessionState::State state = states[i];
+    ASSERT_TRUE(IsOk(session->UpdateStateAndCommit(state)));
+    if (!session->IsFinalized()) {
+      nonFinalSessions++;
+    }
+  }
+  std::vector<ApexSession> sessions = ApexSession::GetSessions();
+  ASSERT_EQ(states.size(), sessions.size());
+
+  // Now try cleaning up all finalized sessions
+  ApexSession::DeleteFinalizedSessions();
+  sessions = ApexSession::GetSessions();
+  ASSERT_EQ(nonFinalSessions, sessions.size());
+
+  // Verify only finalized sessions have been deleted
+  for (auto& session : sessions) {
+    ASSERT_FALSE(session.IsFinalized());
+  }
 }
 
 TEST_F(ApexServiceTest, BackupActivePackages) {

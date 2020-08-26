@@ -35,6 +35,7 @@
 
 #include "apex_database.h"
 #include "apex_file.h"
+#include "apex_manifest.h"
 #include "apexd.h"
 #include "apexd_private.h"
 #include "apexd_utils.h"
@@ -61,11 +62,12 @@ void CloseSTDDescriptors() {
 // Instead of temp mounting inside this fuction, we can make a caller do it.
 // This will align with the plan of extending temp mounting to provide a
 // way to run additional pre-reboot verification of an APEX.
-// TODO(ioffe): pass mount points instead of apex files.
+// TODO(b/158470432): pass mount points instead of apex files.
 template <typename Fn>
 Result<void> StageFnInstall(const std::vector<ApexFile>& apexes, Fn fn,
                             const char* arg, const char* name) {
-  // TODO: Support a session with more than one pre-install hook.
+  // TODO(b/158470023): consider supporting a session with more than one
+  //   pre-install hook.
   int hook_idx = -1;
   for (size_t i = 0; i < apexes.size(); i++) {
     if (!(apexes[i].GetManifest().*fn)().empty()) {
@@ -81,14 +83,6 @@ Result<void> StageFnInstall(const std::vector<ApexFile>& apexes, Fn fn,
   std::vector<MountedApexData> mounted_apexes;
   std::vector<std::string> activation_dirs;
   auto preinstall_guard = android::base::make_scope_guard([&]() {
-    for (const auto& mount : mounted_apexes) {
-      Result<void> st = apexd_private::Unmount(mount);
-      if (!st.ok()) {
-        LOG(ERROR) << "Failed to unmount " << mount.full_path << " from "
-                   << mount.mount_point << " after " << name << ": "
-                   << st.error();
-      }
-    }
     for (const std::string& active_point : activation_dirs) {
       if (0 != rmdir(active_point.c_str())) {
         PLOG(ERROR) << "Could not delete temporary active point "
@@ -98,13 +92,17 @@ Result<void> StageFnInstall(const std::vector<ApexFile>& apexes, Fn fn,
   });
 
   for (const ApexFile& apex : apexes) {
-    // 1) Mount the package.
-    std::string mount_point =
-        apexd_private::GetPackageTempMountPoint(apex.GetManifest());
-
-    auto mount_data = apexd_private::TempMountPackage(apex, mount_point);
+    // 1) Retrieve the mount data if the apex is already temp mounted, temp
+    // mount it otherwise.
+    Result<MountedApexData> mount_data =
+        apexd_private::getTempMountedApexData(apex.GetManifest().name());
     if (!mount_data.ok()) {
-      return mount_data.error();
+      std::string mount_point =
+          apexd_private::GetPackageTempMountPoint(apex.GetManifest());
+      mount_data = apexd_private::TempMountPackage(apex, mount_point);
+      if (!mount_data.ok()) {
+        return mount_data.error();
+      }
     }
     mounted_apexes.push_back(std::move(*mount_data));
 
@@ -112,7 +110,8 @@ Result<void> StageFnInstall(const std::vector<ApexFile>& apexes, Fn fn,
     // activation points will always be already created. Only scenario, when it
     // won't be the case might be apexservice_test. But even then, it might be
     // safer to move active_point creation logic to run after unshare.
-    // TODO(ioffe): move creation of activation points inside RunFnInstall?
+    // TODO(b/158470432): maybe move creation of activation points inside
+    //   RunFnInstall?
     // 2) Ensure there is an activation point, and we will clean it up.
     std::string active_point =
         apexd_private::GetActiveMountPoint(apex.GetManifest());
