@@ -59,8 +59,8 @@
 #include "apexd_session.h"
 #include "apexd_test_utils.h"
 #include "apexd_utils.h"
-
 #include "session_state.pb.h"
+#include "string_log.h"
 
 using apex::proto::SessionState;
 
@@ -1384,7 +1384,13 @@ TEST_F(ApexServiceTest, GetFactoryPackages) {
   ASSERT_TRUE(factoryPackages->size() > 0);
 
   for (const ApexInfo& package : *factoryPackages) {
-    ASSERT_TRUE(isPathForBuiltinApexes(package.modulePath));
+    bool is_builtin = false;
+    for (const auto& dir : kApexPackageBuiltinDirs) {
+      if (StartsWith(package.modulePath, dir)) {
+        is_builtin = true;
+      }
+    }
+    ASSERT_TRUE(is_builtin);
   }
 }
 
@@ -2420,10 +2426,6 @@ TEST_F(ApexServiceRevertTest, RevertFailedStateRevertAttemptFails) {
 }
 
 TEST_F(ApexServiceRevertTest, RevertStoresCrashingNativeProcess) {
-  if (supports_fs_checkpointing_) {
-    GTEST_SKIP() << "Can't run if filesystem checkpointing is enabled";
-  }
-
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"));
   if (!installer.Prepare()) {
     return;
@@ -2734,6 +2736,31 @@ TEST_F(ApexServiceTest, SubmitStagedSessionCorruptApexFails) {
   ApexSessionParams params;
   params.sessionId = 57;
   ASSERT_FALSE(IsOk(service_->submitStagedSession(params, &list)));
+}
+
+TEST_F(ApexServiceTest, SubmitStagedSessionCorruptApexFailsB146895998) {
+  PrepareTestApexForInstall installer(GetTestFile("corrupted_b146895998.apex"),
+                                      "/data/app-staging/session_71",
+                                      "staging_data_file");
+
+  if (!installer.Prepare()) {
+    FAIL() << GetDebugStr(&installer);
+  }
+
+  ApexInfoList list;
+  ApexSessionParams params;
+  params.sessionId = 71;
+  ASSERT_FALSE(IsOk(service_->submitStagedSession(params, &list)));
+}
+
+TEST_F(ApexServiceTest, StageCorruptApexFailsB146895998) {
+  PrepareTestApexForInstall installer(GetTestFile("corrupted_b146895998.apex"));
+
+  if (!installer.Prepare()) {
+    FAIL() << GetDebugStr(&installer);
+  }
+
+  ASSERT_FALSE(IsOk(service_->stagePackages({installer.test_file})));
 }
 
 TEST_F(ApexServiceTest, RemountPackagesPackageOnSystemChanged) {
