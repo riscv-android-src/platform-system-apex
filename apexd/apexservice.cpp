@@ -103,6 +103,7 @@ class ApexService : public BnApexService {
   BinderStatus remountPackages() override;
   BinderStatus recollectPreinstalledData(
       const std::vector<std::string>& paths) override;
+  BinderStatus markBootCompleted() override;
 
   status_t dump(int fd, const Vector<String16>& args) override;
 
@@ -213,6 +214,11 @@ BinderStatus ApexService::markStagedSessionSuccessful(int session_id) {
   return BinderStatus::ok();
 }
 
+BinderStatus ApexService::markBootCompleted() {
+  ::android::apex::onBootCompleted();
+  return BinderStatus::ok();
+}
+
 static void ClearSessionInfo(ApexSessionInfo* session_info) {
   session_info->sessionId = -1;
   session_info->isUnknown = false;
@@ -267,15 +273,16 @@ void convertToApexSessionInfo(const ApexSession& session,
 }
 
 static ApexInfo getApexInfo(const ApexFile& package) {
+  auto& instance = ApexPreinstalledData::GetInstance();
   ApexInfo out;
   out.moduleName = package.GetManifest().name();
   out.modulePath = package.GetPath();
   out.versionCode = package.GetManifest().version();
   out.versionName = package.GetManifest().versionname();
-  out.isFactory = package.IsBuiltin();
+  out.isFactory = instance.IsPreInstalledApex(package);
   out.isActive = false;
   Result<std::string> preinstalledPath =
-      getApexPreinstalledPath(package.GetManifest().name());
+      instance.GetPreinstalledPath(package.GetManifest().name());
   if (preinstalledPath.ok()) {
     out.preinstalledModulePath = *preinstalledPath;
   }
@@ -447,7 +454,7 @@ BinderStatus ApexService::postinstallPackages(
 BinderStatus ApexService::abortStagedSession(int session_id) {
   LOG(DEBUG) << "abortStagedSession() received by ApexService.";
   Result<void> res = ::android::apex::abortStagedSession(session_id);
-  if (!res) {
+  if (!res.ok()) {
     return BinderStatus::fromExceptionCode(
         BinderStatus::EX_ILLEGAL_ARGUMENT,
         String8(res.error().message().c_str()));
@@ -458,7 +465,7 @@ BinderStatus ApexService::abortStagedSession(int session_id) {
 BinderStatus ApexService::revertActiveSessions() {
   LOG(DEBUG) << "revertActiveSessions() received by ApexService.";
   Result<void> res = ::android::apex::revertActiveSessions("");
-  if (!res) {
+  if (!res.ok()) {
     return BinderStatus::fromExceptionCode(
         BinderStatus::EX_ILLEGAL_ARGUMENT,
         String8(res.error().message().c_str()));
@@ -474,7 +481,7 @@ BinderStatus ApexService::resumeRevertIfNeeded() {
 
   LOG(DEBUG) << "resumeRevertIfNeeded() received by ApexService.";
   Result<void> res = ::android::apex::resumeRevertIfNeeded();
-  if (!res) {
+  if (!res.ok()) {
     return BinderStatus::fromExceptionCode(
         BinderStatus::EX_ILLEGAL_ARGUMENT,
         String8(res.error().message().c_str()));
@@ -562,7 +569,8 @@ BinderStatus ApexService::recollectPreinstalledData(
       !root.isOk()) {
     return root;
   }
-  if (auto res = ::android::apex::collectPreinstalledData(paths); !res) {
+  ApexPreinstalledData& instance = ApexPreinstalledData::GetInstance();
+  if (auto res = instance.Initialize(paths); !res) {
     return BinderStatus::fromExceptionCode(
         BinderStatus::EX_SERVICE_SPECIFIC,
         String8(res.error().message().c_str()));

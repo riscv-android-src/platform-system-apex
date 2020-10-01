@@ -33,6 +33,17 @@ apex {
 }
 
 apex {
+    name: "apex.apexd_test_f2fs",
+    manifest: "manifest.json",
+    file_contexts: ":apex.test-file_contexts",
+    prebuilts: ["sample_prebuilt_file"],
+    key: "com.android.apex.test_package.key",
+    installable: false,
+    min_sdk_version: "current",
+    payload_fs_type: "f2fs",
+}
+
+apex {
     name: "apex.apexd_test_no_hashtree",
     manifest: "manifest.json",
     file_contexts: ":apex.test-file_contexts",
@@ -161,6 +172,16 @@ apex {
     installable: false,
 }
 
+apex {
+    name: "apex.apexd_test_f2fs_no_inst_key",
+    manifest: "manifest_no_inst_key.json",
+    file_contexts: ":apex.test-file_contexts",
+    prebuilts: ["sample_prebuilt_file"],
+    key: "com.android.apex.test_package.no_inst_key.key",
+    installable: false,
+    payload_fs_type: "f2fs",
+}
+
 apex_key {
     name: "com.android.apex.test_package_2.key",
     public_key: "com.android.apex.test_package_2.avbpubkey",
@@ -204,4 +225,11 @@ apex {
 prebuilt_etc {
   name: "another_prebuilt_file",
   src: "another_prebuilt_file",
+}
+
+prebuilt_apex {
+  name: "apex.corrupted_b146895998",
+  src: "corrupted_b146895998.apex",
+  filename: "corrupted_b146895998.apex",
+  installable: false,
 }
