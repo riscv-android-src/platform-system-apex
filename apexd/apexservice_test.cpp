@@ -447,21 +447,10 @@ class ApexServiceTest : public ::testing::Test {
 
  private:
   void CleanUp() {
-    auto status = WalkDir(kApexDataDir, [](const fs::directory_entry& p) {
-      std::error_code ec;
-      fs::file_status status = p.status(ec);
-      ASSERT_FALSE(ec) << "Failed to stat " << p.path() << " : "
-                       << ec.message();
-      if (fs::is_directory(status)) {
-        fs::remove_all(p.path(), ec);
-      } else {
-        fs::remove(p.path(), ec);
-      }
-      ASSERT_FALSE(ec) << "Failed to delete " << p.path() << " : "
-                       << ec.message();
-    });
-    fs::remove_all(kApexSessionsDir);
-    ASSERT_TRUE(IsOk(status));
+    CleanDir(kActiveApexPackagesDataDir);
+    CleanDir(kApexBackupDir);
+    CleanDir(kApexHashTreeDir);
+    CleanDir(ApexSession::GetSessionsDir());
 
     DeleteIfExists("/data/misc_ce/0/apexdata/apex.apexd_test");
     DeleteIfExists("/data/misc_ce/0/apexrollback/123456");
