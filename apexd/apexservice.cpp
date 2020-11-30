@@ -103,6 +103,7 @@ class ApexService : public BnApexService {
   BinderStatus remountPackages() override;
   BinderStatus recollectPreinstalledData(
       const std::vector<std::string>& paths) override;
+  BinderStatus markBootCompleted() override;
 
   status_t dump(int fd, const Vector<String16>& args) override;
 
@@ -210,6 +211,11 @@ BinderStatus ApexService::markStagedSessionSuccessful(int session_id) {
         BinderStatus::EX_ILLEGAL_ARGUMENT,
         String8(ret.error().message().c_str()));
   }
+  return BinderStatus::ok();
+}
+
+BinderStatus ApexService::markBootCompleted() {
+  ::android::apex::onBootCompleted();
   return BinderStatus::ok();
 }
 
@@ -527,7 +533,7 @@ BinderStatus ApexService::destroyCeSnapshotsNotSpecified(
   LOG(DEBUG) << "destroyCeSnapshotsNotSpecified() received by ApexService.";
   Result<void> res = ::android::apex::destroyCeSnapshotsNotSpecified(
       user_id, retain_rollback_ids);
-  if (!res) {
+  if (!res.ok()) {
     return BinderStatus::fromExceptionCode(
         BinderStatus::EX_SERVICE_SPECIFIC,
         String8(res.error().message().c_str()));

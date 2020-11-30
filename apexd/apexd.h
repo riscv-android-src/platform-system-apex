@@ -87,8 +87,6 @@ android::base::Result<void> destroyCeSnapshotsNotSpecified(
     int user_id, const std::vector<int>& retain_rollback_ids);
 
 int onBootstrap();
-// Small helper function to tell if device is currently booting.
-bool isBooting();
 // Sets the values of gVoldService and gInFsCheckpointMode.
 void initializeVold(CheckpointInterface* checkpoint_service);
 // Initializes in-memory state (e.g. pre-installed data, activated apexes).
@@ -106,12 +104,13 @@ void onStart();
 // "activated".
 // Must only be called during boot (i.e. apexd.status is not "ready" or
 // "activated").
-void onAllPackagesActivated();
+void onAllPackagesActivated(bool is_bootstrap);
 // Notifies system that apexes are ready by setting apexd.status property to
 // "ready".
 // Must only be called during boot (i.e. apexd.status is not "ready" or
 // "activated").
 void onAllPackagesReady();
+void onBootCompleted();
 void bootCompletedCleanup();
 int snapshotOrRestoreDeUserData();
 
