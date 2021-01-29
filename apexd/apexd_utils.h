@@ -18,9 +18,11 @@
 #define ANDROID_APEXD_APEXD_UTILS_H_
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include <dirent.h>
@@ -125,7 +127,7 @@ inline bool IsEmptyDirectory(const std::string& path) {
   return res.ok() && res->empty();
 }
 
-inline Result<void> createDirIfNeeded(const std::string& path, mode_t mode) {
+inline Result<void> CreateDirIfNeeded(const std::string& path, mode_t mode) {
   struct stat stat_data;
 
   if (stat(path.c_str(), &stat_data) != 0) {
@@ -172,16 +174,6 @@ inline Result<void> DeleteDir(const std::string& path) {
     return Error() << "Failed to delete path " << path << " : " << ec.message();
   }
   return {};
-}
-
-inline Result<ino_t> get_path_inode(const std::string& path) {
-  struct stat buf;
-  memset(&buf, 0, sizeof(buf));
-  if (stat(path.c_str(), &buf) != 0) {
-    return ErrnoError() << "Failed to stat " << path;
-  } else {
-    return buf.st_ino;
-  }
 }
 
 inline Result<bool> PathExists(const std::string& path) {
@@ -241,16 +233,19 @@ inline Result<std::vector<std::string>> GetDeUserDirs() {
   return GetSubdirs(kDeNDataDir);
 }
 
-inline Result<std::vector<std::string>> FindApexFilesByName(
-    const std::string& path) {
-  auto filter_fn = [](const std::filesystem::directory_entry& entry) {
-    std::error_code ec;
-    if (entry.is_regular_file(ec) &&
-        EndsWith(entry.path().filename().string(), kApexPackageSuffix)) {
-      return true;  // APEX file, take.
-    }
-    return false;
-  };
+inline Result<std::vector<std::string>> FindFilesBySuffix(
+    const std::string& path, const std::vector<std::string>& suffix_list) {
+  auto filter_fn =
+      [&suffix_list](const std::filesystem::directory_entry& entry) {
+        for (const std::string& suffix : suffix_list) {
+          std::error_code ec;
+          if (entry.is_regular_file(ec) &&
+              EndsWith(entry.path().filename().string(), suffix)) {
+            return true;  // suffix matches, take.
+          }
+        }
+        return false;
+      };
   return ReadDir(path, filter_fn);
 }
 
@@ -264,7 +259,7 @@ inline Result<std::vector<std::string>> FindApexes(
     }
     if (!*exist) continue;
 
-    const auto& apexes = FindApexFilesByName(path);
+    const auto& apexes = FindFilesBySuffix(path, {kApexPackageSuffix});
     if (!apexes.ok()) {
       return apexes;
     }
@@ -272,6 +267,87 @@ inline Result<std::vector<std::string>> FindApexes(
     result.insert(result.end(), apexes->begin(), apexes->end());
   }
   return result;
+}
+
+// Returns first path between |first_dir| and |second_dir| that correspond to a
+// existing directory. Returns error if neither |first_dir| nor |second_dir|
+// correspond to an existing directory.
+inline Result<std::string> FindFirstExistingDirectory(
+    const std::string& first_dir, const std::string& second_dir) {
+  struct stat stat_buf;
+  if (stat(first_dir.c_str(), &stat_buf) != 0) {
+    PLOG(WARNING) << "Failed to stat " << first_dir;
+    if (stat(second_dir.c_str(), &stat_buf) != 0) {
+      return ErrnoError() << "Failed to stat " << second_dir;
+    }
+    if (!S_ISDIR(stat_buf.st_mode)) {
+      return Error() << second_dir << " is not a directory";
+    }
+    return second_dir;
+  }
+
+  if (S_ISDIR(stat_buf.st_mode)) {
+    return first_dir;
+  }
+  LOG(WARNING) << first_dir << " is not a directory";
+
+  if (stat(second_dir.c_str(), &stat_buf) != 0) {
+    return ErrnoError() << "Failed to stat " << second_dir;
+  }
+  if (!S_ISDIR(stat_buf.st_mode)) {
+    return Error() << second_dir << " is not a directory";
+  }
+  return second_dir;
+}
+
+// Copies all entries under |from| directory to |to| directory, and then them.
+// Leaving |from| empty.
+inline Result<void> MoveDir(const std::string& from, const std::string& to) {
+  struct stat stat_buf;
+  if (stat(to.c_str(), &stat_buf) != 0) {
+    return ErrnoError() << "Failed to stat " << to;
+  }
+  if (!S_ISDIR(stat_buf.st_mode)) {
+    return Error() << to << " is not a directory";
+  }
+
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  auto it = fs::directory_iterator(from, ec);
+  if (ec) {
+    return Error() << "Can't read " << from << " : " << ec.message();
+  }
+
+  for (const auto& end = fs::directory_iterator(); it != end;) {
+    auto from_path = it->path();
+    it.increment(ec);
+    if (ec) {
+      return Error() << "Can't read " << from << " : " << ec.message();
+    }
+    auto to_path = to / from_path.filename();
+    fs::copy(from_path, to_path, fs::copy_options::recursive, ec);
+    if (ec) {
+      return Error() << "Failed to copy " << from_path << " to " << to_path
+                     << " : " << ec.message();
+    }
+    fs::remove_all(from_path, ec);
+    if (ec) {
+      return Error() << "Failed to delete " << from_path << " : "
+                     << ec.message();
+    }
+  }
+  return {};
+}
+
+inline Result<uintmax_t> GetFileSize(const std::string& file_path) {
+  std::error_code ec;
+  auto value = std::filesystem::file_size(file_path, ec);
+  if (ec) {
+    return Error() << "Failed to get file size of " << file_path << " : "
+                   << ec.message();
+  }
+
+  return value;
 }
 
 }  // namespace apex

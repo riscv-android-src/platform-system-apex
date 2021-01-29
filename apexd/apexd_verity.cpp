@@ -79,7 +79,10 @@ Result<void> GenerateHashTree(const ApexFile& apex,
     return Error() << "Invalid image size " << image_size;
   }
 
-  if (lseek(fd, apex.GetImageOffset(), SEEK_SET) == -1) {
+  if (!apex.GetImageOffset()) {
+    return Error() << "Cannot generate HashTree without image offset";
+  }
+  if (lseek(fd, apex.GetImageOffset().value(), SEEK_SET) == -1) {
     return ErrnoError() << "Failed to seek";
   }
 
@@ -151,7 +154,11 @@ Result<std::string> CalculateRootDigest(const std::string& hashtree_file,
 Result<PrepareHashTreeResult> PrepareHashTree(
     const ApexFile& apex, const ApexVerityData& verity_data,
     const std::string& hashtree_file) {
-  if (auto st = createDirIfNeeded(kApexHashTreeDir, 0700); !st.ok()) {
+  if (apex.IsCompressed()) {
+    return Error() << "Cannot prepare HashTree of compressed APEX";
+  }
+
+  if (auto st = CreateDirIfNeeded(kApexHashTreeDir, 0700); !st.ok()) {
     return st.error();
   }
   bool should_regenerate_hashtree = false;

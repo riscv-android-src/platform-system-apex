@@ -24,13 +24,14 @@ To extract content of an APEX to the given directory:
 from __future__ import print_function
 
 import argparse
+import apex_manifest
+import enum
 import os
 import shutil
 import sys
 import subprocess
 import tempfile
 import zipfile
-import apex_manifest
 
 BLOCK_SIZE = 4096
 
@@ -235,9 +236,69 @@ def RunExtract(args):
     shutil.rmtree(os.path.join(args.dest, "lost+found"))
 
 
+class ApexType(enum.Enum):
+  INVALID = 0
+  UNCOMPRESSED = 1
+  COMPRESSED = 2
+
+
+def GetType(apex_path):
+  with zipfile.ZipFile(apex_path, 'r') as zip_file:
+    names = zip_file.namelist()
+    has_payload = 'apex_payload.img' in names
+    has_original_apex = 'original_apex' in names
+    if has_payload and has_original_apex:
+      return ApexType.INVALID
+    if has_payload:
+      return ApexType.UNCOMPRESSED
+    if has_original_apex:
+      return ApexType.COMPRESSED
+    return ApexType.INVALID
+
+
 def RunInfo(args):
-  manifest = apex_manifest.fromApex(args.apex)
-  print(apex_manifest.toJsonString(manifest))
+  if args.print_type:
+    res = GetType(args.apex)
+    if res == ApexType.INVALID:
+      print(args.apex + ' is not a valid apex')
+      sys.exit(1)
+    print(res.name)
+  else:
+    manifest = apex_manifest.fromApex(args.apex)
+    print(apex_manifest.toJsonString(manifest))
+
+
+def RunDecompress(args):
+  """RunDecompress takes path to compressed APEX and decompresses it to
+  produce the original uncompressed APEX at give output path
+
+  See apex_compression_tool.py#RunCompress for details on compressed APEX
+  structure.
+
+  Args:
+      args.input: file path to compressed APEX
+      args.output: file path to where decompressed APEX will be placed
+  Returns:
+      True if decompression was executed successfully, otherwise False
+  """
+  compressed_apex_fp = args.input
+  decompressed_apex_fp = args.output
+
+  if os.path.exists(decompressed_apex_fp):
+    print("Output path '" + decompressed_apex_fp + "' already exists")
+    sys.exit(1)
+
+  with zipfile.ZipFile(compressed_apex_fp, 'r') as zip_obj:
+    if 'original_apex' not in zip_obj.namelist():
+      print(compressed_apex_fp + ' is not a compressed APEX. Missing '
+                                 "'original_apex' file inside it.")
+      sys.exit(1)
+    # Rename original_apex file to what user provided as output filename
+    original_apex_info = zip_obj.getinfo('original_apex')
+    original_apex_info.filename = os.path.basename(decompressed_apex_fp)
+    # Extract the original_apex as desired name
+    zip_obj.extract(original_apex_info,
+                    path=os.path.dirname(decompressed_apex_fp))
 
 
 def main(argv):
@@ -264,7 +325,22 @@ def main(argv):
 
   parser_info = subparsers.add_parser('info', help='prints APEX manifest')
   parser_info.add_argument('apex', type=str, help='APEX file')
+  parser_info.add_argument('--print-type',
+                           help='Prints type of the apex (COMPRESSED or UNCOMPRESSED)',
+                           action='store_true')
   parser_info.set_defaults(func=RunInfo)
+
+  # Handle sub-command "decompress"
+  parser_decompress = subparsers.add_parser('decompress',
+                                            help='decompresses a compressed '
+                                                 'APEX')
+  parser_decompress.add_argument('--input', type=str, required=True,
+                                 help='path to compressed APEX file that '
+                                      'will be decompressed')
+  parser_decompress.add_argument('--output', type=str, required=True,
+                                 help='output directory path where '
+                                      'decompressed APEX will be extracted')
+  parser_decompress.set_defaults(func=RunDecompress)
 
   args = parser.parse_args(argv)
 

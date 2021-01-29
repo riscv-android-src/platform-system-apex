@@ -32,6 +32,8 @@
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/parseint.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 
@@ -40,6 +42,8 @@
 
 using android::base::Basename;
 using android::base::Error;
+using android::base::GetBoolProperty;
+using android::base::ParseUint;
 using android::base::Result;
 using android::base::StartsWith;
 using android::base::StringPrintf;
@@ -81,7 +85,7 @@ void LoopbackDeviceUniqueFd::MaybeCloseBad() {
   }
 }
 
-Result<void> configureReadAhead(const std::string& device_path) {
+Result<void> ConfigureReadAhead(const std::string& device_path) {
   CHECK(StartsWith(device_path, "/dev/"));
   std::string device_name = Basename(device_path);
 
@@ -101,10 +105,10 @@ Result<void> configureReadAhead(const std::string& device_path) {
   return {};
 }
 
-Result<void> preAllocateLoopDevices(size_t num) {
-  Result<void> loopReady = WaitForFile("/dev/loop-control", 20s);
-  if (!loopReady.ok()) {
-    return loopReady;
+Result<void> PreAllocateLoopDevices(size_t num) {
+  Result<void> loop_ready = WaitForFile("/dev/loop-control", 20s);
+  if (!loop_ready.ok()) {
+    return loop_ready;
   }
   unique_fd ctl_fd(
       TEMP_FAILURE_RETRY(open("/dev/loop-control", O_RDWR | O_CLOEXEC)));
@@ -112,13 +116,30 @@ Result<void> preAllocateLoopDevices(size_t num) {
     return ErrnoError() << "Failed to open loop-control";
   }
 
+  bool found = false;
+  size_t start_id = 0;
+  constexpr const char* kLoopPrefix = "loop";
+  WalkDir("/dev/block", [&](const std::filesystem::directory_entry& entry) {
+    std::string devname = entry.path().filename().string();
+    if (StartsWith(devname, kLoopPrefix)) {
+      size_t id;
+      auto parse_ok = ParseUint(
+          devname.substr(std::char_traits<char>::length(kLoopPrefix)), &id);
+      if (parse_ok && id > start_id) {
+        start_id = id;
+        found = true;
+      }
+    }
+  });
+  if (found) ++start_id;
+
   // Assumption: loop device ID [0..num) is valid.
   // This is because pre-allocation happens during bootstrap.
   // Anyway Kernel pre-allocated loop devices
   // as many as CONFIG_BLK_DEV_LOOP_MIN_COUNT,
   // Within the amount of kernel-pre-allocation,
   // LOOP_CTL_ADD will fail with EEXIST
-  for (size_t id = 0ul; id < num; ++id) {
+  for (size_t id = start_id; id < num + start_id; ++id) {
     int ret = ioctl(ctl_fd.get(), LOOP_CTL_ADD, id);
     if (ret < 0 && errno != EEXIST) {
       return ErrnoError() << "Failed LOOP_CTL_ADD";
@@ -131,17 +152,17 @@ Result<void> preAllocateLoopDevices(size_t num) {
   // just optimistally hope that they are all created when we actually
   // access them for activating APEXes. If the dev nodes are not ready
   // even then, we wait 50ms and warning message will be printed (see below
-  // createLoopDevice()).
+  // CreateLoopDevice()).
   LOG(INFO) << "Pre-allocated " << num << " loopback devices";
   return {};
 }
 
-Result<void> configureLoopDevice(const int device_fd, const std::string& target,
-                                 const int32_t imageOffset,
-                                 const size_t imageSize) {
-  static bool useLoopConfigure;
-  static std::once_flag onceFlag;
-  std::call_once(onceFlag, [&]() {
+Result<void> ConfigureLoopDevice(const int device_fd, const std::string& target,
+                                 const int32_t image_offset,
+                                 const size_t image_size) {
+  static bool use_loop_configure;
+  static std::once_flag once_flag;
+  std::call_once(once_flag, [&]() {
     // LOOP_CONFIGURE is a new ioctl in Linux 5.8 (and backported in Android
     // common) that allows atomically configuring a loop device. It is a lot
     // faster than the traditional LOOP_SET_FD/LOOP_SET_STATUS64 combo, but
@@ -152,7 +173,7 @@ Result<void> configureLoopDevice(const int device_fd, const std::string& target,
     config.fd = -1;
     if (ioctl(device_fd, LOOP_CONFIGURE, &config) == -1 && errno == EBADF) {
       // If the IOCTL exists, it will fail with EBADF for the -1 fd
-      useLoopConfigure = true;
+      use_loop_configure = true;
     }
   });
 
@@ -172,7 +193,8 @@ Result<void> configureLoopDevice(const int device_fd, const std::string& target,
     // let's give another try with buffered I/O for EROFS and squashfs
     if (statfs(target.c_str(), &stbuf) != 0 ||
         (stbuf.f_type != EROFS_SUPER_MAGIC_V1 &&
-         stbuf.f_type != SQUASHFS_MAGIC)) {
+         stbuf.f_type != SQUASHFS_MAGIC &&
+         stbuf.f_type != OVERLAYFS_SUPER_MAGIC)) {
       return Error(saved_errno) << "Failed to open " << target;
     }
     LOG(WARNING) << "Fallback to buffered I/O for " << target;
@@ -185,10 +207,10 @@ Result<void> configureLoopDevice(const int device_fd, const std::string& target,
   struct loop_info64 li;
   memset(&li, 0, sizeof(li));
   strlcpy((char*)li.lo_crypt_name, kApexLoopIdPrefix, LO_NAME_SIZE);
-  li.lo_offset = imageOffset;
-  li.lo_sizelimit = imageSize;
+  li.lo_offset = image_offset;
+  li.lo_sizelimit = image_size;
 
-  if (useLoopConfigure) {
+  if (use_loop_configure) {
     struct loop_config config;
     memset(&config, 0, sizeof(config));
     li.lo_flags |= LO_FLAGS_DIRECT_IO;
@@ -241,62 +263,74 @@ Result<void> configureLoopDevice(const int device_fd, const std::string& target,
   return {};
 }
 
-Result<LoopbackDeviceUniqueFd> createLoopDevice(const std::string& target,
-                                                const int32_t imageOffset,
-                                                const size_t imageSize) {
-  unique_fd ctl_fd(open("/dev/loop-control", O_RDWR | O_CLOEXEC));
-  if (ctl_fd.get() == -1) {
-    return ErrnoError() << "Failed to open loop-control";
-  }
-
-  int num = ioctl(ctl_fd.get(), LOOP_CTL_GET_FREE);
-  if (num == -1) {
-    return ErrnoError() << "Failed LOOP_CTL_GET_FREE";
-  }
-
+Result<LoopbackDeviceUniqueFd> WaitForDevice(int num) {
   std::string opened_device;
   const std::vector<std::string> candidate_devices = {
       StringPrintf("/dev/block/loop%d", num),
       StringPrintf("/dev/loop%d", num),
   };
 
-  LoopbackDeviceUniqueFd device_fd;
-  {
-    // See comment on kLoopDeviceRetryAttempts.
-    unique_fd sysfs_fd;
-    for (size_t i = 0; i != kLoopDeviceRetryAttempts; ++i) {
-      for (auto& device : candidate_devices) {
-        sysfs_fd.reset(open(device.c_str(), O_RDWR | O_CLOEXEC));
-        if (sysfs_fd.get() != -1) {
-          opened_device = device;
-          break;
-        }
-      }
-      if (!opened_device.empty()) {
-        break;
-      }
-      PLOG(WARNING) << "Loopback device " << num
-                    << " not ready. Waiting 50ms...";
-      usleep(50000);
+  // apexd-bootstrap runs in parallel with ueventd to optimize boot time. In
+  // rare cases apexd would try attempt to mount an apex before ueventd created
+  // a loop device for it. To work around this we keep polling for loop device
+  // to be created until ueventd's cold boot sequence is done.
+  // See comment on kLoopDeviceRetryAttempts.
+  unique_fd sysfs_fd;
+  bool cold_boot_done = GetBoolProperty("ro.cold_boot_done", false);
+  for (size_t i = 0; i != kLoopDeviceRetryAttempts; ++i) {
+    if (!cold_boot_done) {
+      cold_boot_done = GetBoolProperty("ro.cold_boot_done", false);
     }
-    if (sysfs_fd.get() == -1) {
-      return ErrnoError() << "Failed to open loopback device " << num;
+    for (const auto& device : candidate_devices) {
+      sysfs_fd.reset(open(device.c_str(), O_RDWR | O_CLOEXEC));
+      if (sysfs_fd.get() != -1) {
+        return LoopbackDeviceUniqueFd(std::move(sysfs_fd), device);
+      }
     }
-    device_fd = LoopbackDeviceUniqueFd(std::move(sysfs_fd), opened_device);
-    CHECK_NE(device_fd.get(), -1);
+    PLOG(WARNING) << "Loopback device " << num << " not ready. Waiting 50ms...";
+    usleep(50000);
+    if (!cold_boot_done) {
+      // ueventd hasn't finished cold boot yet, keep trying.
+      i = 0;
+    }
   }
 
-  Result<void> configureStatus =
-      configureLoopDevice(device_fd.get(), target, imageOffset, imageSize);
+  return Error() << "Faled to open loopback device " << num;
+}
+
+Result<LoopbackDeviceUniqueFd> CreateLoopDevice(const std::string& target,
+                                                const int32_t image_offset,
+                                                const size_t image_size) {
+  unique_fd ctl_fd(open("/dev/loop-control", O_RDWR | O_CLOEXEC));
+  if (ctl_fd.get() == -1) {
+    return ErrnoError() << "Failed to open loop-control";
+  }
+
+  static std::mutex mlock;
+  std::lock_guard lock(mlock);
+  int num = ioctl(ctl_fd.get(), LOOP_CTL_GET_FREE);
+  if (num == -1) {
+    return ErrnoError() << "Failed LOOP_CTL_GET_FREE";
+  }
+
+  Result<LoopbackDeviceUniqueFd> loop_device = WaitForDevice(num);
+  if (!loop_device.ok()) {
+    return loop_device.error();
+  }
+  CHECK_NE(loop_device->device_fd.get(), -1);
+
+  Result<void> configureStatus = ConfigureLoopDevice(
+      loop_device->device_fd.get(), target, image_offset, image_size);
   if (!configureStatus.ok()) {
     return configureStatus.error();
   }
 
-  Result<void> readAheadStatus = configureReadAhead(opened_device);
-  if (!readAheadStatus.ok()) {
-    return readAheadStatus.error();
+  Result<void> read_ahead_status = ConfigureReadAhead(loop_device->name);
+  if (!read_ahead_status.ok()) {
+    return read_ahead_status.error();
   }
-  return device_fd;
+
+  return loop_device;
 }
 
 void DestroyLoopDevice(const std::string& path, const DestroyLoopFn& extra) {

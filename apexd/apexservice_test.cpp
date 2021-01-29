@@ -94,6 +94,26 @@ using MountedApexData = MountedApexDatabase::MountedApexData;
 
 namespace fs = std::filesystem;
 
+static void CleanDir(const std::string& dir) {
+  if (access(dir.c_str(), F_OK) != 0 && errno == ENOENT) {
+    LOG(WARNING) << dir << " does not exist";
+    return;
+  }
+  auto status = WalkDir(dir, [](const fs::directory_entry& p) {
+    std::error_code ec;
+    fs::file_status status = p.status(ec);
+    ASSERT_FALSE(ec) << "Failed to stat " << p.path() << " : " << ec.message();
+    if (fs::is_directory(status)) {
+      fs::remove_all(p.path(), ec);
+    } else {
+      fs::remove(p.path(), ec);
+    }
+    ASSERT_FALSE(ec) << "Failed to delete " << p.path() << " : "
+                     << ec.message();
+  });
+  ASSERT_TRUE(IsOk(status));
+}
+
 class ApexServiceTest : public ::testing::Test {
  public:
   ApexServiceTest() {
@@ -447,21 +467,10 @@ class ApexServiceTest : public ::testing::Test {
 
  private:
   void CleanUp() {
-    auto status = WalkDir(kApexDataDir, [](const fs::directory_entry& p) {
-      std::error_code ec;
-      fs::file_status status = p.status(ec);
-      ASSERT_FALSE(ec) << "Failed to stat " << p.path() << " : "
-                       << ec.message();
-      if (fs::is_directory(status)) {
-        fs::remove_all(p.path(), ec);
-      } else {
-        fs::remove(p.path(), ec);
-      }
-      ASSERT_FALSE(ec) << "Failed to delete " << p.path() << " : "
-                       << ec.message();
-    });
-    fs::remove_all(kApexSessionsDir);
-    ASSERT_TRUE(IsOk(status));
+    CleanDir(kActiveApexPackagesDataDir);
+    CleanDir(kApexBackupDir);
+    CleanDir(kApexHashTreeDir);
+    CleanDir(ApexSession::GetSessionsDir());
 
     DeleteIfExists("/data/misc_ce/0/apexdata/apex.apexd_test");
     DeleteIfExists("/data/misc_ce/0/apexrollback/123456");
@@ -840,18 +849,10 @@ TEST_F(ApexServiceTest, SnapshotCeData) {
   ASSERT_TRUE(
       RegularFileExists("/data/misc_ce/0/apexdata/apex.apexd_test/hello.txt"));
 
-  int64_t result;
-  service_->snapshotCeData(0, 123456, "apex.apexd_test", &result);
+  service_->snapshotCeData(0, 123456, "apex.apexd_test");
 
   ASSERT_TRUE(RegularFileExists(
       "/data/misc_ce/0/apexrollback/123456/apex.apexd_test/hello.txt"));
-
-  // Check that the return value is the inode of the snapshot directory.
-  struct stat buf;
-  memset(&buf, 0, sizeof(buf));
-  ASSERT_EQ(0,
-            stat("/data/misc_ce/0/apexrollback/123456/apex.apexd_test", &buf));
-  ASSERT_EQ(int64_t(buf.st_ino), result);
 }
 
 TEST_F(ApexServiceTest, RestoreCeData) {
@@ -912,6 +913,31 @@ TEST_F(ApexServiceTest, DestroyDeSnapshotsDeUser) {
   ASSERT_FALSE(RegularFileExists(
       "/data/misc_de/0/apexrollback/123456/my.apex/hello.txt"));
   ASSERT_FALSE(DirExists("/data/misc_de/0/apexrollback/123456"));
+}
+
+TEST_F(ApexServiceTest, DestroyCeSnapshots) {
+  CreateDir("/data/misc_ce/0/apexrollback/123456");
+  CreateDir("/data/misc_ce/0/apexrollback/123456/apex.apexd_test");
+  CreateFile("/data/misc_ce/0/apexrollback/123456/apex.apexd_test/file.txt");
+
+  CreateDir("/data/misc_ce/0/apexrollback/77777");
+  CreateDir("/data/misc_ce/0/apexrollback/77777/apex.apexd_test");
+  CreateFile("/data/misc_ce/0/apexrollback/77777/apex.apexd_test/thing.txt");
+
+  ASSERT_TRUE(RegularFileExists(
+      "/data/misc_ce/0/apexrollback/123456/apex.apexd_test/file.txt"));
+  ASSERT_TRUE(RegularFileExists(
+      "/data/misc_ce/0/apexrollback/77777/apex.apexd_test/thing.txt"));
+
+  android::binder::Status st = service_->destroyCeSnapshots(0, 123456);
+  ASSERT_TRUE(IsOk(st));
+  // Should be OK if the directory doesn't exist.
+  st = service_->destroyCeSnapshots(1, 123456);
+  ASSERT_TRUE(IsOk(st));
+
+  ASSERT_TRUE(RegularFileExists(
+      "/data/misc_ce/0/apexrollback/77777/apex.apexd_test/thing.txt"));
+  ASSERT_FALSE(DirExists("/data/misc_ce/0/apexrollback/123456"));
 }
 
 TEST_F(ApexServiceTest, DestroyCeSnapshotsNotSpecified) {
@@ -1379,11 +1405,11 @@ TEST_F(ApexServiceTest, NoHashtreeApexStagePackagesMovesHashtree) {
 }
 
 TEST_F(ApexServiceTest, GetFactoryPackages) {
-  Result<std::vector<ApexInfo>> factoryPackages = GetFactoryPackages();
-  ASSERT_TRUE(IsOk(factoryPackages));
-  ASSERT_TRUE(factoryPackages->size() > 0);
+  Result<std::vector<ApexInfo>> factory_packages = GetFactoryPackages();
+  ASSERT_TRUE(IsOk(factory_packages));
+  ASSERT_TRUE(factory_packages->size() > 0);
 
-  for (const ApexInfo& package : *factoryPackages) {
+  for (const ApexInfo& package : *factory_packages) {
     bool is_builtin = false;
     for (const auto& dir : kApexPackageBuiltinDirs) {
       if (StartsWith(package.modulePath, dir)) {
@@ -1395,43 +1421,49 @@ TEST_F(ApexServiceTest, GetFactoryPackages) {
 }
 
 TEST_F(ApexServiceTest, NoPackagesAreBothActiveAndInactive) {
-  Result<std::vector<ApexInfo>> activePackages = GetActivePackages();
-  ASSERT_TRUE(IsOk(activePackages));
-  ASSERT_TRUE(activePackages->size() > 0);
-  Result<std::vector<ApexInfo>> inactivePackages = GetInactivePackages();
-  ASSERT_TRUE(IsOk(inactivePackages));
-  std::vector<std::string> activePackagesStrings =
-      GetPackagesStrings(*activePackages);
-  std::vector<std::string> inactivePackagesStrings =
-      GetPackagesStrings(*inactivePackages);
-  std::sort(activePackagesStrings.begin(), activePackagesStrings.end());
-  std::sort(inactivePackagesStrings.begin(), inactivePackagesStrings.end());
+  Result<std::vector<ApexInfo>> active_packages = GetActivePackages();
+  ASSERT_TRUE(IsOk(active_packages));
+  ASSERT_TRUE(active_packages->size() > 0);
+  Result<std::vector<ApexInfo>> inactive_packages = GetInactivePackages();
+  ASSERT_TRUE(IsOk(inactive_packages));
+  std::vector<std::string> active_packages_strings =
+      GetPackagesStrings(*active_packages);
+  std::vector<std::string> inactive_packages_strings =
+      GetPackagesStrings(*inactive_packages);
+  std::sort(active_packages_strings.begin(), active_packages_strings.end());
+  std::sort(inactive_packages_strings.begin(), inactive_packages_strings.end());
   std::vector<std::string> intersection;
   std::set_intersection(
-      activePackagesStrings.begin(), activePackagesStrings.end(),
-      inactivePackagesStrings.begin(), inactivePackagesStrings.end(),
+      active_packages_strings.begin(), active_packages_strings.end(),
+      inactive_packages_strings.begin(), inactive_packages_strings.end(),
       std::back_inserter(intersection));
   ASSERT_THAT(intersection, SizeIs(0));
 }
 
 TEST_F(ApexServiceTest, GetAllPackages) {
-  Result<std::vector<ApexInfo>> allPackages = GetAllPackages();
-  ASSERT_TRUE(IsOk(allPackages));
-  ASSERT_TRUE(allPackages->size() > 0);
-  Result<std::vector<ApexInfo>> activePackages = GetActivePackages();
-  std::vector<std::string> activeStrings = GetPackagesStrings(*activePackages);
-  Result<std::vector<ApexInfo>> factoryPackages = GetFactoryPackages();
-  std::vector<std::string> factoryStrings =
-      GetPackagesStrings(*factoryPackages);
-  for (ApexInfo& apexInfo : *allPackages) {
-    std::string packageString = GetPackageString(apexInfo);
-    bool shouldBeActive = std::find(activeStrings.begin(), activeStrings.end(),
-                                    packageString) != activeStrings.end();
-    bool shouldBeFactory =
-        std::find(factoryStrings.begin(), factoryStrings.end(),
-                  packageString) != factoryStrings.end();
-    ASSERT_EQ(shouldBeActive, apexInfo.isActive);
-    ASSERT_EQ(shouldBeFactory, apexInfo.isFactory);
+  Result<std::vector<ApexInfo>> all_packages = GetAllPackages();
+  ASSERT_TRUE(IsOk(all_packages));
+  ASSERT_TRUE(all_packages->size() > 0);
+  Result<std::vector<ApexInfo>> active_packages = GetActivePackages();
+  std::vector<std::string> active_strings =
+      GetPackagesStrings(*active_packages);
+  Result<std::vector<ApexInfo>> factory_packages = GetFactoryPackages();
+  std::vector<std::string> factory_strings =
+      GetPackagesStrings(*factory_packages);
+  for (ApexInfo& apexInfo : *all_packages) {
+    std::string package_string = GetPackageString(apexInfo);
+    bool should_be_active =
+        std::find(active_strings.begin(), active_strings.end(),
+                  package_string) != active_strings.end();
+    bool should_be_factory =
+        std::find(factory_strings.begin(), factory_strings.end(),
+                  package_string) != factory_strings.end();
+    ASSERT_EQ(should_be_active, apexInfo.isActive)
+        << package_string << " should " << (should_be_active ? "" : "not ")
+        << "be active";
+    ASSERT_EQ(should_be_factory, apexInfo.isFactory)
+        << package_string << " should " << (should_be_factory ? "" : "not ")
+        << "be factory";
   }
 }
 
@@ -2081,7 +2113,7 @@ TEST_F(ApexServiceTest, BackupActivePackagesClearsPreviousBackup) {
   }
 
   // Make sure /data/apex/backups exists.
-  ASSERT_TRUE(IsOk(createDirIfNeeded(std::string(kApexBackupDir), 0700)));
+  ASSERT_TRUE(IsOk(CreateDirIfNeeded(std::string(kApexBackupDir), 0700)));
   // Create some bogus files in /data/apex/backups.
   std::ofstream old_backup(StringPrintf("%s/file1", kApexBackupDir));
   ASSERT_TRUE(old_backup.good());
@@ -2125,7 +2157,7 @@ TEST_F(ApexServiceTest, BackupActivePackagesZeroActivePackages) {
 
   // Make sure that /data/apex/active exists and is empty
   ASSERT_TRUE(
-      IsOk(createDirIfNeeded(std::string(kActiveApexPackagesDataDir), 0755)));
+      IsOk(CreateDirIfNeeded(std::string(kActiveApexPackagesDataDir), 0755)));
   auto active_pkgs = ReadEntireDir(kActiveApexPackagesDataDir);
   ASSERT_TRUE(IsOk(active_pkgs));
   ASSERT_EQ(0u, active_pkgs->size());
@@ -2140,7 +2172,7 @@ TEST_F(ApexServiceTest, BackupActivePackagesZeroActivePackages) {
   ASSERT_EQ(0u, backups->size());
 }
 
-TEST_F(ApexServiceTest, ActivePackagesFolderDoesNotExist) {
+TEST_F(ApexServiceTest, ActivePackagesDirEmpty) {
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"),
                                       "/data/app-staging/session_41",
                                       "staging_data_file");
@@ -2149,10 +2181,8 @@ TEST_F(ApexServiceTest, ActivePackagesFolderDoesNotExist) {
     return;
   }
 
-  // Make sure that /data/apex/active does not exist
-  std::error_code ec;
-  fs::remove_all(fs::path(kActiveApexPackagesDataDir), ec);
-  ASSERT_FALSE(ec) << "Failed to delete " << kActiveApexPackagesDataDir;
+  // Make sure that /data/apex/active is empty
+  CleanDir(kActiveApexPackagesDataDir);
 
   ApexInfoList list;
   ApexSessionParams params;
@@ -2226,7 +2256,7 @@ class ApexServiceRevertTest : public ApexServiceTest {
   void SetUp() override { ApexServiceTest::SetUp(); }
 
   void PrepareBackup(const std::vector<std::string>& pkgs) {
-    ASSERT_TRUE(IsOk(createDirIfNeeded(std::string(kApexBackupDir), 0700)));
+    ASSERT_TRUE(IsOk(CreateDirIfNeeded(std::string(kApexBackupDir), 0700)));
     for (const auto& pkg : pkgs) {
       PrepareTestApexForInstall installer(pkg);
       ASSERT_TRUE(installer.Prepare()) << " failed to prepare " << pkg;
@@ -2437,7 +2467,10 @@ TEST_F(ApexServiceRevertTest, RevertStoresCrashingNativeProcess) {
   // Make sure /data/apex/active is non-empty.
   ASSERT_TRUE(IsOk(service_->stagePackages({installer.test_file})));
   std::string native_process = "test_process";
-  Result<void> res = ::android::apex::revertActiveSessions(native_process);
+  // TODO(ioffe): this is calling into internals of apexd which makes test quite
+  //  britle. With some refactoring we should be able to call binder api, or
+  //  make this a unit test of apexd.cpp.
+  Result<void> res = ::android::apex::RevertActiveSessions(native_process);
   session = ApexSession::GetSession(1543);
   ASSERT_EQ(session->GetCrashingNativeProcess(), native_process);
 }
@@ -2911,6 +2944,21 @@ TEST_F(ApexServiceActivationNoCode, NoCodeApexIsNotExecutable) {
   EXPECT_TRUE(found_apex_mountpoint);
 }
 
+struct BannedNameProvider {
+  static std::string GetTestName() { return "sharedlibs.apex"; }
+  static std::string GetPackageName() { return "sharedlibs"; }
+};
+
+class ApexServiceActivationBannedName
+    : public ApexServiceActivationTest<BannedNameProvider> {
+ public:
+  ApexServiceActivationBannedName() : ApexServiceActivationTest(false) {}
+};
+
+TEST_F(ApexServiceActivationBannedName, ApexWithBannedNameCannotBeActivated) {
+  ASSERT_FALSE(
+      IsOk(service_->activatePackage(installer_->test_installed_file)));
+}
 }  // namespace apex
 }  // namespace android
 
