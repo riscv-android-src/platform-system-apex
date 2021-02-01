@@ -18,6 +18,7 @@
 #define ANDROID_APEXD_APEXD_UTILS_H_
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -126,7 +127,7 @@ inline bool IsEmptyDirectory(const std::string& path) {
   return res.ok() && res->empty();
 }
 
-inline Result<void> createDirIfNeeded(const std::string& path, mode_t mode) {
+inline Result<void> CreateDirIfNeeded(const std::string& path, mode_t mode) {
   struct stat stat_data;
 
   if (stat(path.c_str(), &stat_data) != 0) {
@@ -173,16 +174,6 @@ inline Result<void> DeleteDir(const std::string& path) {
     return Error() << "Failed to delete path " << path << " : " << ec.message();
   }
   return {};
-}
-
-inline Result<ino_t> get_path_inode(const std::string& path) {
-  struct stat buf;
-  memset(&buf, 0, sizeof(buf));
-  if (stat(path.c_str(), &buf) != 0) {
-    return ErrnoError() << "Failed to stat " << path;
-  } else {
-    return buf.st_ino;
-  }
 }
 
 inline Result<bool> PathExists(const std::string& path) {
@@ -242,16 +233,19 @@ inline Result<std::vector<std::string>> GetDeUserDirs() {
   return GetSubdirs(kDeNDataDir);
 }
 
-inline Result<std::vector<std::string>> FindApexFilesByName(
-    const std::string& path) {
-  auto filter_fn = [](const std::filesystem::directory_entry& entry) {
-    std::error_code ec;
-    if (entry.is_regular_file(ec) &&
-        EndsWith(entry.path().filename().string(), kApexPackageSuffix)) {
-      return true;  // APEX file, take.
-    }
-    return false;
-  };
+inline Result<std::vector<std::string>> FindFilesBySuffix(
+    const std::string& path, const std::vector<std::string>& suffix_list) {
+  auto filter_fn =
+      [&suffix_list](const std::filesystem::directory_entry& entry) {
+        for (const std::string& suffix : suffix_list) {
+          std::error_code ec;
+          if (entry.is_regular_file(ec) &&
+              EndsWith(entry.path().filename().string(), suffix)) {
+            return true;  // suffix matches, take.
+          }
+        }
+        return false;
+      };
   return ReadDir(path, filter_fn);
 }
 
@@ -265,7 +259,7 @@ inline Result<std::vector<std::string>> FindApexes(
     }
     if (!*exist) continue;
 
-    const auto& apexes = FindApexFilesByName(path);
+    const auto& apexes = FindFilesBySuffix(path, {kApexPackageSuffix});
     if (!apexes.ok()) {
       return apexes;
     }
@@ -343,6 +337,17 @@ inline Result<void> MoveDir(const std::string& from, const std::string& to) {
     }
   }
   return {};
+}
+
+inline Result<uintmax_t> GetFileSize(const std::string& file_path) {
+  std::error_code ec;
+  auto value = std::filesystem::file_size(file_path, ec);
+  if (ec) {
+    return Error() << "Failed to get file size of " << file_path << " : "
+                   << ec.message();
+  }
+
+  return value;
 }
 
 }  // namespace apex
