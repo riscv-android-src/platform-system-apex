@@ -1,9 +1,6 @@
 {
   "presubmit": [
     {
-      "name": "apex_rollback_tests"
-    },
-    {
       "name": "apex_targetprep_tests"
     },
     {
@@ -11,6 +8,14 @@
     },
     {
       "name": "timezone_data_e2e_tests"
+    }
+  ],
+  "presubmit-large": [
+    {
+      "name": "apex_rollback_tests"
+    },
+    {
+      "name": "sharedlibs_host_tests"
     }
   ],
   "postsubmit": [
@@ -24,6 +29,9 @@
     {
       "name": "media_swcodec_e2e_tests",
       "keywords": ["primary-device"]
+    },
+    {
+      "name": "apex_compression_platform_tests"
     }
   ],
   "imports": [
