@@ -30,7 +30,6 @@
 #include "apexd_utils.h"
 
 using android::base::GetExecutableDirectory;
-using android::base::RemoveFileIfExists;
 using android::base::Result;
 
 static const std::string kTestDataDir = GetExecutableDirectory() + "/";
@@ -260,37 +259,59 @@ TEST(ApexFileTest, DecompressFailForNormalApex) {
   Result<ApexFile> apex_file = ApexFile::Open(file_path);
   ASSERT_RESULT_OK(apex_file);
 
-  TemporaryFile decompression_file_path;
+  TemporaryFile decompression_file;
 
-  auto result = apex_file->Decompress(decompression_file_path.path);
+  auto result = apex_file->Decompress(decompression_file.path);
   ASSERT_FALSE(result.ok());
   ASSERT_THAT(result.error().message(),
               ::testing::HasSubstr("Cannot decompress an uncompressed APEX"));
 }
 
-TEST(ApexFileTest, DecompressFailIfPublicKeyNotSameAsOriginal) {
-  const std::string compressed_file_path =
-      kTestDataDir +
-      "com.android.apex.compressed_key_mismatch_with_original.capex";
-  Result<ApexFile> compressed_apex_file = ApexFile::Open(compressed_file_path);
-  ASSERT_RESULT_OK(compressed_apex_file);
+TEST(ApexFileTest, DecompressFailIfDecompressionPathExists) {
+  const std::string file_path =
+      kTestDataDir + "com.android.apex.compressed.v1.capex";
+  Result<ApexFile> apex_file = ApexFile::Open(file_path);
 
+  // Attempt to decompress in a path that already exists
   TemporaryFile decompression_file;
-  RemoveFileIfExists(decompression_file.path);
+  auto exists = PathExists(decompression_file.path);
+  ASSERT_RESULT_OK(exists);
+  ASSERT_TRUE(*exists) << decompression_file.path << " does not exist";
 
-  // Compressed APEX should fail to decompress if public key is different than
-  // original APEX
-  auto result = compressed_apex_file->Decompress(decompression_file.path);
+  auto result = apex_file->Decompress(decompression_file.path);
   ASSERT_FALSE(result.ok());
-  ASSERT_THAT(
-      result.error().message(),
-      ::testing::HasSubstr(
-          "Public key of compressed APEX is different than original APEX"));
+  ASSERT_THAT(result.error().message(),
+              ::testing::HasSubstr("Failed to open decompression destination"));
+}
 
-  // The decompressed_file should not exist
-  auto exist = PathExists(decompression_file.path);
-  ASSERT_RESULT_OK(exist);
-  ASSERT_FALSE(*exist);
+TEST(ApexFileTest, GetPathReturnsRealpath) {
+  const std::string real_path = kTestDataDir + "apex.apexd_test.apex";
+  const std::string symlink_path =
+      kTestDataDir + "apex.apexd_test.symlink.apex";
+
+  // In case the link already exists
+  int ret = unlink(symlink_path.c_str());
+  ASSERT_TRUE(ret == 0 || errno == ENOENT)
+      << "failed to unlink " << symlink_path;
+
+  ret = symlink(real_path.c_str(), symlink_path.c_str());
+  ASSERT_EQ(0, ret) << "failed to create symlink at " << symlink_path;
+
+  // Open with the symlink. Realpath is expected.
+  Result<ApexFile> apex_file = ApexFile::Open(symlink_path);
+  ASSERT_RESULT_OK(apex_file);
+  ASSERT_EQ(real_path, apex_file->GetPath());
+}
+
+TEST(ApexFileTest, CompressedSharedLibsApexIsRejected) {
+  const std::string file_path =
+      kTestDataDir + "com.android.apex.compressed_sharedlibs.capex";
+  Result<ApexFile> apex_file = ApexFile::Open(file_path);
+
+  ASSERT_FALSE(apex_file.ok());
+  ASSERT_THAT(apex_file.error().message(),
+              ::testing::HasSubstr("Apex providing sharedlibs shouldn't "
+                                   "be compressed"));
 }
 
 }  // namespace

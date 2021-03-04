@@ -20,6 +20,7 @@ import android.apex.ApexInfo;
 import android.apex.ApexInfoList;
 import android.apex.ApexSessionInfo;
 import android.apex.ApexSessionParams;
+import android.apex.CompressedApexInfoList;
 
 interface IApexService {
    void submitStagedSession(in ApexSessionParams params, out ApexInfoList packages);
@@ -131,5 +132,11 @@ interface IApexService {
    /**
     * Informs apexd that the boot has completed.
     */
-   oneway void markBootCompleted();
+   void markBootCompleted();
+
+   /**
+   * Assuming the provided compressed APEX will be installed on next boot,
+   * calculate how much space will be required for decompression
+   */
+   long calculateSizeForCompressedApex(in CompressedApexInfoList compressed_apex_info_list);
 }
