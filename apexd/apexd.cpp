@@ -278,7 +278,7 @@ Result<DmVerityDevice> createVerityDevice(const std::string& name,
   }
 
   std::string dev_path;
-  if (!dm.CreateDevice(name, table, &dev_path, 500ms)) {
+  if (!dm.CreateDevice(name, table, &dev_path, 2s)) {
     return Errorf("Couldn't create verity device.");
   }
   return DmVerityDevice(name, dev_path);
