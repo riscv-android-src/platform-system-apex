@@ -73,6 +73,7 @@ using android::apex::testing::ApexInfoEq;
 using android::apex::testing::CreateSessionInfo;
 using android::apex::testing::IsOk;
 using android::apex::testing::SessionInfoEq;
+using android::base::ErrnoError;
 using android::base::Join;
 using android::base::ReadFully;
 using android::base::StartsWith;
@@ -82,6 +83,7 @@ using android::dm::DeviceMapper;
 using android::fs_mgr::Fstab;
 using android::fs_mgr::GetEntryForMountPoint;
 using android::fs_mgr::ReadFstabFromFile;
+using ::apex::proto::ApexManifest;
 using ::testing::Contains;
 using ::testing::EndsWith;
 using ::testing::HasSubstr;
@@ -2853,8 +2855,10 @@ TEST_F(ApexServiceTest, RemountPackagesPackageOnSystemChanged) {
   auto active_apex = GetActivePackage("com.android.apex.test_package");
   ASSERT_RESULT_OK(active_apex);
   ASSERT_EQ(2u, active_apex->versionCode);
-  // Sanity check that module path didn't change.
-  ASSERT_EQ(kSystemPath, active_apex->modulePath);
+  // Check that module path didn't change, modulo symlink.
+  std::string realSystemPath;
+  ASSERT_TRUE(android::base::Realpath(kSystemPath, &realSystemPath));
+  ASSERT_EQ(realSystemPath, active_apex->modulePath);
 }
 
 TEST_F(ApexServiceActivationSuccessTest, RemountPackagesPackageOnDataChanged) {
