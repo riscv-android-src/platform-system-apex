@@ -72,6 +72,16 @@ Result<void> ApexFileRepository::ScanBuiltInDir(const std::string& dir) {
       auto level = build_type == "eng" && name == "com.android.art"
                        ? base::ERROR
                        : base::FATAL;
+      // On some development (non-REL) builds the VNDK apex could be in /vendor.
+      // When testing CTS-on-GSI on these builds, there would be two VNDK apexes
+      // in the system, one in /system and one in /vendor.
+      static constexpr char kVndkApexModuleNamePrefix[] = "com.android.vndk.";
+      static constexpr char kPlatformVersionCodenameProperty[] =
+          "ro.build.version.codename";
+      if (android::base::StartsWith(name, kVndkApexModuleNamePrefix) &&
+          GetProperty(kPlatformVersionCodenameProperty, "REL") != "REL") {
+        level = android::base::INFO;
+      }
       LOG(level) << "Found two apex packages " << it->second.GetPath()
                  << " and " << apex_file->GetPath()
                  << " with the same module name " << name;
@@ -160,7 +170,7 @@ Result<const std::string> ApexFileRepository::GetPublicKey(
     const std::string& name) const {
   auto it = pre_installed_store_.find(name);
   if (it == pre_installed_store_.end()) {
-    return Error() << "No preinstalled data found for package " << name;
+    return Error() << "No preinstalled apex found for package " << name;
   }
   return it->second.GetBundledPublicKey();
 }
@@ -176,8 +186,23 @@ Result<const std::string> ApexFileRepository::GetPreinstalledPath(
   return it->second.GetPath();
 }
 
+// TODO(b/179497746): remove this method when we add api for fetching ApexFile
+//  by name
+Result<const std::string> ApexFileRepository::GetDataPath(
+    const std::string& name) const {
+  auto it = data_store_.find(name);
+  if (it == data_store_.end()) {
+    return Error() << "No data apex found for package " << name;
+  }
+  return it->second.GetPath();
+}
+
 bool ApexFileRepository::HasPreInstalledVersion(const std::string& name) const {
   return pre_installed_store_.find(name) != pre_installed_store_.end();
+}
+
+bool ApexFileRepository::HasDataVersion(const std::string& name) const {
+  return data_store_.find(name) != data_store_.end();
 }
 
 // ApexFile is considered a decompressed APEX if it is a hard link of file in
