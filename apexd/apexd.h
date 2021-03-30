@@ -32,7 +32,25 @@
 namespace android {
 namespace apex {
 
+// A structure containing all the values that might need to be injected for
+// testing (e.g. apexd status property, etc.)
+//
+// Ideally we want to introduce Apexd class and use dependency injection for
+// such values, but that will require a sizeable refactoring. For the time being
+// this config should do the trick.
+struct ApexdConfig {
+  const char* apex_status_sysprop;
+  const char* active_apex_data_dir;
+};
+
+static constexpr const ApexdConfig kDefaultConfig = {
+    kApexStatusSysprop,
+    kActiveApexPackagesDataDir,
+};
+
 class CheckpointInterface;
+
+void SetConfig(const ApexdConfig& config);
 
 android::base::Result<void> ResumeRevertIfNeeded();
 
@@ -159,11 +177,14 @@ android::base::Result<void> ReserveSpaceForCompressedApex(
     int64_t size, const std::string& dest_dir);
 
 // Activates apexes in otapreot_chroot environment.
-// TODO(b/181182967): support compressed apexes.
+// TODO(b/172911822): support compressed apexes.
 // TODO(b/181182967): probably also need to support flattened apexes.
 int OnOtaChrootBootstrap(
     const std::vector<std::string>& built_in_dirs = kApexPackageBuiltinDirs,
     const std::string& apex_data_dir = kActiveApexPackagesDataDir);
+
+android::apex::MountedApexDatabase& GetApexDatabaseForTesting();
+
 }  // namespace apex
 }  // namespace android
 
