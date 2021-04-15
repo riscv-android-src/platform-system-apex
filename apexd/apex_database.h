@@ -197,7 +197,14 @@ class MountedApexDatabase {
     }
   }
 
-  void PopulateFromMounts();
+  void PopulateFromMounts(const std::string& active_apex_dir,
+                          const std::string& apex_hash_tree_dir);
+
+  // Resets state of the database. Should only be used in testing.
+  inline void Reset() REQUIRES(!mounted_apexes_mutex_) {
+    std::lock_guard lock(mounted_apexes_mutex_);
+    mounted_apexes_.clear();
+  }
 
  private:
   // A map from package name to mounted apexes.
