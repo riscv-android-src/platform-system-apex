@@ -1180,6 +1180,18 @@ Result<void> ActivatePackageImpl(const ApexFile& apex_file,
     return Errorf("Package name {} is not allowed.", manifest.name());
   }
 
+  // Validate upgraded shim apex
+  if (shim::IsShimApex(apex_file) &&
+      !ApexFileRepository::GetInstance().IsPreInstalledApex(apex_file)) {
+    // This is not cheap for shim apex, but it is fine here since we have
+    // upgraded shim apex only during CTS tests.
+    Result<void> result = VerifyPackageBoot(apex_file);
+    if (!result.ok()) {
+      LOG(ERROR) << "Failed to validate shim apex: " << apex_file.GetPath();
+      return result;
+    }
+  }
+
   // See whether we think it's active, and do not allow to activate the same
   // version. Also detect whether this is the highest version.
   // We roll this into a single check.
@@ -1567,13 +1579,12 @@ Result<void> ActivateApexPackages(const std::vector<ApexFileRef>& apexes,
 // A fallback function in case some of the apexes failed to activate. For all
 // such apexes that were coming from /data partition we will attempt to activate
 // their corresponding pre-installed copies.
-Result<void> ActivateMissingApexes(
-    const std::vector<std::reference_wrapper<const ApexFile>>& apexes,
-    bool is_ota_chroot) {
+Result<void> ActivateMissingApexes(const std::vector<ApexFileRef>& apexes,
+                                   bool is_ota_chroot) {
   LOG(INFO) << "Trying to activate pre-installed versions of missing apexes";
   const auto& file_repository = ApexFileRepository::GetInstance();
   const auto& activated_apexes = GetActivePackagesMap();
-  std::vector<std::reference_wrapper<const ApexFile>> fallback_apexes;
+  std::vector<ApexFileRef> fallback_apexes;
   for (const auto& apex_ref : apexes) {
     const auto& apex = apex_ref.get();
     if (apex.GetManifest().providesharedapexlibs()) {
@@ -1591,22 +1602,28 @@ Result<void> ActivateMissingApexes(
       fallback_apexes.push_back(file_repository.GetPreInstalledApex(name));
     }
   }
+
+  // Process compressed APEX, if any
+  std::vector<ApexFileRef> compressed_apex;
+  for (auto it = fallback_apexes.begin(); it != fallback_apexes.end();) {
+    if (it->get().IsCompressed()) {
+      compressed_apex.emplace_back(*it);
+      it = fallback_apexes.erase(it);
+    } else {
+      it++;
+    }
+  }
+  std::vector<ApexFile> decompressed_apex;
+  if (!compressed_apex.empty()) {
+    decompressed_apex = ProcessCompressedApex(compressed_apex);
+    for (const ApexFile& apex_file : decompressed_apex) {
+      fallback_apexes.emplace_back(std::cref(apex_file));
+    }
+  }
   return ActivateApexPackages(fallback_apexes, is_ota_chroot);
 }
 
 }  // namespace
-
-// TODO(b/179497746): Avoid scanning APEX here
-Result<void> ScanPackagesDirAndActivate(const char* apex_package_dir) {
-  auto apexes = ScanApexFiles(apex_package_dir);
-  if (!apexes.ok()) {
-    return apexes.error();
-  }
-  std::vector<ApexFileRef> apexes_ref;
-  std::transform(apexes->begin(), apexes->end(), std::back_inserter(apexes_ref),
-                 [](const auto& x) { return std::cref(x); });
-  return ActivateApexPackages(apexes_ref, /* is_ota_chroot= */ false);
-}
 
 /**
  * Snapshots data from base_dir/apexdata/<apex name> to
@@ -2007,9 +2024,19 @@ Result<void> StagePackages(const std::vector<std::string>& tmp_paths) {
   //       it will open ApexFiles multiple times.
 
   // 1) Verify all packages.
-  auto verify_status = VerifyPackages(tmp_paths, VerifyPackageBoot);
-  if (!verify_status.ok()) {
-    return verify_status.error();
+  Result<std::vector<ApexFile>> apex_files = OpenApexFiles(tmp_paths);
+  if (!apex_files.ok()) {
+    return apex_files.error();
+  }
+  for (const ApexFile& apex_file : *apex_files) {
+    if (shim::IsShimApex(apex_file)) {
+      // Shim apex will be validated on every boot. No need to do it here.
+      continue;
+    }
+    Result<void> result = VerifyPackageBoot(apex_file);
+    if (!result.ok()) {
+      return result.error();
+    }
   }
 
   // Make sure that kActiveApexPackagesDataDir exists.
@@ -2039,16 +2066,12 @@ Result<void> StagePackages(const std::vector<std::string>& tmp_paths) {
   auto scope_guard = android::base::make_scope_guard(deleter);
 
   std::unordered_set<std::string> staged_packages;
-  for (const std::string& path : tmp_paths) {
-    Result<ApexFile> apex_file = ApexFile::Open(path);
-    if (!apex_file.ok()) {
-      return apex_file.error();
-    }
+  for (const ApexFile& apex_file : *apex_files) {
     // First promote new hashtree file to the one that will be used when
     // mounting apex.
-    std::string new_hashtree_file = GetHashTreeFileName(*apex_file,
+    std::string new_hashtree_file = GetHashTreeFileName(apex_file,
                                                         /* is_new = */ true);
-    std::string old_hashtree_file = GetHashTreeFileName(*apex_file,
+    std::string old_hashtree_file = GetHashTreeFileName(apex_file,
                                                         /* is_new = */ false);
     if (access(new_hashtree_file.c_str(), F_OK) == 0) {
       if (TEMP_FAILURE_RETRY(rename(new_hashtree_file.c_str(),
@@ -2059,7 +2082,7 @@ Result<void> StagePackages(const std::vector<std::string>& tmp_paths) {
       changed_hashtree_files.emplace_back(std::move(old_hashtree_file));
     }
     // And only then move apex to /data/apex/active.
-    std::string dest_path = StageDestPath(*apex_file);
+    std::string dest_path = StageDestPath(apex_file);
     if (access(dest_path.c_str(), F_OK) == 0) {
       LOG(DEBUG) << dest_path << " already exists. Deleting";
       if (TEMP_FAILURE_RETRY(unlink(dest_path.c_str())) != 0) {
@@ -2067,14 +2090,14 @@ Result<void> StagePackages(const std::vector<std::string>& tmp_paths) {
       }
     }
 
-    if (link(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
-      return ErrnoError() << "Unable to link " << apex_file->GetPath() << " to "
+    if (link(apex_file.GetPath().c_str(), dest_path.c_str()) != 0) {
+      return ErrnoError() << "Unable to link " << apex_file.GetPath() << " to "
                           << dest_path;
     }
     staged_files.insert(dest_path);
-    staged_packages.insert(apex_file->GetManifest().name());
+    staged_packages.insert(apex_file.GetManifest().name());
 
-    LOG(DEBUG) << "Success linking " << apex_file->GetPath() << " to "
+    LOG(DEBUG) << "Success linking " << apex_file.GetPath() << " to "
                << dest_path;
   }
 
@@ -2416,12 +2439,11 @@ std::vector<ApexFileRef> SelectApexForActivation(
  * link it to kActiveApexPackagesDataDir. Returns list of decompressed APEX.
  */
 std::vector<ApexFile> ProcessCompressedApex(
-    const std::vector<ApexFileRef>& compressed_apex,
-    const std::string& decompression_dir, const std::string& active_apex_dir) {
+    const std::vector<ApexFileRef>& compressed_apex) {
   LOG(INFO) << "Processing compressed APEX";
 
   // Clean up reserved space before decompressing capex
-  if (auto ret = DeleteDirContent(kOtaReservedDir); !ret.ok()) {
+  if (auto ret = DeleteDirContent(gConfig->ota_reserved_dir); !ret.ok()) {
     LOG(ERROR) << "Failed to clean up reserved space: " << ret.error();
   }
 
@@ -2440,33 +2462,51 @@ std::vector<ApexFile> ProcessCompressedApex(
     });
 
     // Decompress them to kApexDecompressedDir
-    std::string dest_path_decompressed = StringPrintf(
-        "%s/%s%s", decompression_dir.c_str(),
-        GetPackageId(apex_file.GetManifest()).c_str(), kApexPackageSuffix);
+    const auto dest_path_decompressed =
+        StringPrintf("%s/%s%s", gConfig->decompression_dir,
+                     GetPackageId(apex_file.GetManifest()).c_str(),
+                     kDecompressedApexPackageSuffix);
+    const auto& dest_path_active =
+        StringPrintf("%s/%s%s", gConfig->active_apex_data_dir,
+                     GetPackageId(apex_file.GetManifest()).c_str(),
+                     kDecompressedApexPackageSuffix);
     cleanup.push_back(dest_path_decompressed);
-    auto result = apex_file.Decompress(dest_path_decompressed);
-    if (!result.ok()) {
-      LOG(ERROR) << "Failed to decompress : " << apex_file.GetPath().c_str()
-                 << " " << result.error();
-      continue;
-    }
-
-    // Fix label of decompressed file
-    auto restore = RestoreconPath(dest_path_decompressed);
-    if (!restore.ok()) {
-      LOG(ERROR) << restore.error();
-      continue;
-    }
-
-    // Hardlink to kActiveApexPackagesDataDir so that they get activated on
-    // reboot
-    const auto& dest_path_active = StringPrintf(
-        "%s/%s%s", active_apex_dir.c_str(),
-        GetPackageId(apex_file.GetManifest()).c_str(), kApexPackageSuffix);
     cleanup.push_back(dest_path_active);
-    if (link(dest_path_decompressed.c_str(), dest_path_active.c_str()) != 0) {
-      LOG(ERROR) << "Failed to link decompressed APEX " << apex_file.GetPath();
-      continue;
+
+    // Decompress only if path doesn't exist. Otherwise reuse existing
+    // decompressed APEX
+    auto decompressed_path_exists = PathExists(dest_path_decompressed);
+    // TODO(b/185886528): Stop hardlinking to /data/apex/active
+    auto hardlink_path_exists = PathExists(dest_path_active);
+    if (!decompressed_path_exists.ok() || !*decompressed_path_exists ||
+        !hardlink_path_exists.ok() || !*hardlink_path_exists) {
+      // Clean up before attempting to decompress
+      RemoveFileIfExists(dest_path_decompressed);
+      RemoveFileIfExists(dest_path_active);
+
+      auto result = apex_file.Decompress(dest_path_decompressed);
+      if (!result.ok()) {
+        LOG(ERROR) << "Failed to decompress : " << apex_file.GetPath().c_str()
+                   << " " << result.error();
+        continue;
+      }
+
+      // Fix label of decompressed file
+      auto restore = RestoreconPath(dest_path_decompressed);
+      if (!restore.ok()) {
+        LOG(ERROR) << restore.error();
+        continue;
+      }
+
+      // Hardlink to kActiveApexPackagesDataDir so that they get activated on
+      // reboot
+      if (link(dest_path_decompressed.c_str(), dest_path_active.c_str()) != 0) {
+        LOG(ERROR) << "Failed to link decompressed APEX "
+                   << apex_file.GetPath();
+        continue;
+      }
+    } else {
+      LOG(INFO) << "Skipping decompression for " << apex_file.GetPath();
     }
 
     // Post decompression verification
@@ -2973,16 +3013,18 @@ Result<void> ReserveSpaceForCompressedApex(int64_t size,
   return {};
 }
 
-int OnOtaChrootBootstrap(const std::vector<std::string>& built_in_dirs,
-                         const std::string& apex_data_dir) {
+int OnOtaChrootBootstrap() {
   auto& instance = ApexFileRepository::GetInstance();
-  if (auto status = instance.AddPreInstalledApex(built_in_dirs); !status.ok()) {
+  if (auto status = instance.AddPreInstalledApex(gConfig->apex_built_in_dirs);
+      !status.ok()) {
     LOG(ERROR) << "Failed to scan pre-installed apexes from "
-               << Join(built_in_dirs, ',');
+               << Join(gConfig->apex_built_in_dirs, ',');
     return 1;
   }
-  if (auto status = instance.AddDataApex(apex_data_dir); !status.ok()) {
-    LOG(ERROR) << "Failed to scan upgraded apexes from " << apex_data_dir;
+  if (auto status = instance.AddDataApex(gConfig->active_apex_data_dir);
+      !status.ok()) {
+    LOG(ERROR) << "Failed to scan upgraded apexes from "
+               << gConfig->active_apex_data_dir;
     // Failing to scan upgraded apexes is not fatal, since we can still try to
     // run otapreopt using only pre-installed apexes. Worst case, apps will be
     // re-optimized on next boot.
