@@ -58,7 +58,6 @@ void SetConfig(const ApexdConfig& config);
 
 android::base::Result<void> ResumeRevertIfNeeded();
 
-void ScanStagedSessionsDirAndStage();
 android::base::Result<void> PreinstallPackages(
     const std::vector<std::string>& paths) WARN_UNUSED;
 android::base::Result<void> PostinstallPackages(
@@ -94,7 +93,6 @@ android::base::Result<ApexFile> GetActivePackage(
 std::vector<ApexFile> GetFactoryPackages();
 
 android::base::Result<void> AbortStagedSession(const int session_id);
-android::base::Result<void> AbortActiveSession();
 
 android::base::Result<void> SnapshotCeData(const int user_id,
                                            const int rollback_id,
@@ -133,7 +131,7 @@ std::vector<ApexFileRef> SelectApexForActivation(
     const std::unordered_map<std::string, std::vector<ApexFileRef>>& all_apex,
     const ApexFileRepository& instance);
 std::vector<ApexFile> ProcessCompressedApex(
-    const std::vector<ApexFileRef>& compressed_apex);
+    const std::vector<ApexFileRef>& compressed_apex, bool is_ota_chroot);
 // Notifies system that apexes are activated by setting apexd.status property to
 // "activated".
 // Must only be called during boot (i.e. apexd.status is not "ready" or
