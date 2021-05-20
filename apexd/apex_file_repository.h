@@ -17,6 +17,7 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -59,6 +60,22 @@ class ApexFileRepository final {
   // finished, all queries to the instance are thread safe.
   android::base::Result<void> AddPreInstalledApex(
       const std::vector<std::string>& prebuilt_dirs);
+
+  // Populate instance by collecting host-provided apex files via
+  // |signature_partition|. Host can provide its apexes to a VM instance via the
+  // virtual disk image which has partitions: (see
+  // /packages/modules/Virtualization/microdroid for the details)
+  //  - signature partition(/dev/block/vd*1) should be accessed via
+  //  /dev/block/by-name/signature.
+  //  - each subsequence partition(/dev/block/vd*{2,3,..}) represents an APEX
+  //  archive.
+  // It will fail if there is more than one apex with the same name in
+  // pre-installed and block apexes. Note: this call is **not thread safe** and
+  // is expected to be performed in a single thread during initialization of
+  // apexd. After initialization is finished, all queries to the instance are
+  // thread safe.
+  android::base::Result<void> AddBlockApex(
+      const std::string& signature_partition);
 
   // Populate instance by collecting data apex files from the given |data_dir|.
   // Note: this call is **not thread safe** and is expected to be performed in a
@@ -105,6 +122,13 @@ class ApexFileRepository final {
   // expected to check if there is a pre-installed apex with the given name
   // using |HasPreinstalledVersion| function.
   ApexFileRef GetPreInstalledApex(const std::string& name) const;
+  // Returns a data version of apex with the given name. Caller is
+  // expected to check if there is a data apex with the given name
+  // using |HasDataVersion| function.
+  ApexFileRef GetDataApex(const std::string& name) const;
+
+  // Returns an instance matching with |full_path|
+  std::optional<ApexFileRef> GetApexFile(const std::string& full_path) const;
 
   // Clears ApexFileRepostiry.
   // Only use in tests.

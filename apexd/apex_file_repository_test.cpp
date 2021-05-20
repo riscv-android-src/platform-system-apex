@@ -25,6 +25,7 @@
 #include <android-base/stringprintf.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <microdroid/signature.h>
 
 #include "apex_file.h"
 #include "apex_file_repository.h"
@@ -41,9 +42,10 @@ namespace fs = std::filesystem;
 using android::apex::testing::ApexFileEq;
 using android::apex::testing::IsOk;
 using android::base::GetExecutableDirectory;
-using android::base::RemoveFileIfExists;
 using android::base::StringPrintf;
 using ::testing::ByRef;
+using ::testing::Eq;
+using ::testing::Optional;
 using ::testing::UnorderedElementsAre;
 
 static std::string GetTestDataDir() { return GetExecutableDirectory(); }
@@ -51,9 +53,29 @@ static std::string GetTestFile(const std::string& name) {
   return GetTestDataDir() + "/" + name;
 }
 
+namespace {
+// Copies the compressed apex to |built_in_dir| and decompresses it to
+// |decompression_dir
+void PrepareCompressedApex(const std::string& name,
+                           const std::string& built_in_dir,
+                           const std::string& decompression_dir) {
+  fs::copy(GetTestFile(name), built_in_dir);
+  auto compressed_apex =
+      ApexFile::Open(StringPrintf("%s/%s", built_in_dir.c_str(), name.c_str()));
+
+  const auto& pkg_name = compressed_apex->GetManifest().name();
+  const int version = compressed_apex->GetManifest().version();
+
+  auto decompression_path =
+      StringPrintf("%s/%s@%d%s", decompression_dir.c_str(), pkg_name.c_str(),
+                   version, kDecompressedApexPackageSuffix);
+  compressed_apex->Decompress(decompression_path);
+}
+}  // namespace
+
 TEST(ApexFileRepositoryTest, InitializeSuccess) {
   // Prepare test data.
-  TemporaryDir built_in_dir, data_dir;
+  TemporaryDir built_in_dir, data_dir, decompression_dir;
   fs::copy(GetTestFile("apex.apexd_test.apex"), built_in_dir.path);
   fs::copy(GetTestFile("apex.apexd_test_different_app.apex"),
            built_in_dir.path);
@@ -271,40 +293,34 @@ TEST(ApexFileRepositoryTest, IsDecompressedApex) {
   // considered decompressed
   ASSERT_TRUE(instance.IsDecompressedApex(*decompressed_apex));
 
-  // Hard links with same file name is considered decompressed
+  // Hard links with same file name is not considered decompressed
   TemporaryDir active_dir;
   auto active_path = StringPrintf("%s/%s", active_dir.path, filename.c_str());
   std::error_code ec;
   fs::create_hard_link(decompressed_path, active_path, ec);
   ASSERT_FALSE(ec) << "Failed to create hardlink";
   auto active_apex = ApexFile::Open(active_path);
-  ASSERT_TRUE(instance.IsDecompressedApex(*active_apex));
-
-  // Hard links with different filename is not considered decompressed
-  auto different_name_path =
-      StringPrintf("%s/different.name.apex", active_dir.path);
-  fs::create_hard_link(decompressed_path, different_name_path, ec);
-  ASSERT_FALSE(ec) << "Failed to create hardlink";
-  auto different_name_apex = ApexFile::Open(different_name_path);
-  ASSERT_FALSE(instance.IsDecompressedApex(*different_name_apex));
-
-  // Same file name but not hard link -> not considered decompressed
-  RemoveFileIfExists(active_path);
-  fs::copy(GetTestFile(filename), active_dir.path);
-  active_apex = ApexFile::Open(active_path);
   ASSERT_FALSE(instance.IsDecompressedApex(*active_apex));
 }
 
 TEST(ApexFileRepositoryTest, AddAndGetDataApex) {
   // Prepare test data.
-  TemporaryDir built_in_dir, data_dir;
+  TemporaryDir built_in_dir, data_dir, decompression_dir;
   fs::copy(GetTestFile("apex.apexd_test.apex"), built_in_dir.path);
   fs::copy(GetTestFile("apex.apexd_test_v2.apex"), data_dir.path);
+  PrepareCompressedApex("com.android.apex.compressed.v1.capex",
+                        built_in_dir.path, decompression_dir.path);
+  // Add a data apex that has kDecompressedApexPackageSuffix
+  fs::copy(GetTestFile("com.android.apex.compressed.v1_original.apex"),
+           StringPrintf("%s/com.android.apex.compressed@1%s", data_dir.path,
+                        kDecompressedApexPackageSuffix));
 
-  ApexFileRepository instance;
+  ApexFileRepository instance(decompression_dir.path);
   ASSERT_TRUE(IsOk(instance.AddPreInstalledApex({built_in_dir.path})));
   ASSERT_TRUE(IsOk(instance.AddDataApex(data_dir.path)));
 
+  // ApexFileRepository should only deal with APEX in /data/apex/active.
+  // Decompressed APEX should not be included
   auto data_apexs = instance.GetDataApexFiles();
   auto normal_apex =
       ApexFile::Open(StringPrintf("%s/apex.apexd_test_v2.apex", data_dir.path));
@@ -314,7 +330,7 @@ TEST(ApexFileRepositoryTest, AddAndGetDataApex) {
 
 TEST(ApexFileRepositoryTest, AddDataApexIgnoreCompressedApex) {
   // Prepare test data.
-  TemporaryDir data_dir;
+  TemporaryDir data_dir, decompression_dir;
   fs::copy(GetTestFile("com.android.apex.compressed.v1.capex"), data_dir.path);
 
   ApexFileRepository instance;
@@ -326,7 +342,7 @@ TEST(ApexFileRepositoryTest, AddDataApexIgnoreCompressedApex) {
 
 TEST(ApexFileRepositoryTest, AddDataApexIgnoreIfNotPreInstalled) {
   // Prepare test data.
-  TemporaryDir data_dir;
+  TemporaryDir data_dir, decompression_dir;
   fs::copy(GetTestFile("apex.apexd_test.apex"), data_dir.path);
 
   ApexFileRepository instance;
@@ -338,7 +354,7 @@ TEST(ApexFileRepositoryTest, AddDataApexIgnoreIfNotPreInstalled) {
 
 TEST(ApexFileRepositoryTest, AddDataApexPrioritizeHigherVersionApex) {
   // Prepare test data.
-  TemporaryDir built_in_dir, data_dir;
+  TemporaryDir built_in_dir, data_dir, decompression_dir;
   fs::copy(GetTestFile("apex.apexd_test.apex"), built_in_dir.path);
   fs::copy(GetTestFile("apex.apexd_test.apex"), data_dir.path);
   fs::copy(GetTestFile("apex.apexd_test_v2.apex"), data_dir.path);
@@ -354,54 +370,23 @@ TEST(ApexFileRepositoryTest, AddDataApexPrioritizeHigherVersionApex) {
               UnorderedElementsAre(ApexFileEq(ByRef(*normal_apex))));
 }
 
-namespace {
-// Copies the compressed apex to |built_in_dir| and decompresses it to
-// |decompressed_dir| and then hard links to |data_dir|
-void PrepareCompressedApex(const std::string& name,
-                           const std::string& built_in_dir,
-                           const std::string& data_dir,
-                           const std::string& decompressed_dir) {
-  fs::copy(GetTestFile(name), built_in_dir);
-  auto compressed_apex =
-      ApexFile::Open(StringPrintf("%s/%s", built_in_dir.c_str(), name.c_str()));
-
-  const auto& pkg_name = compressed_apex->GetManifest().name();
-  const int version = compressed_apex->GetManifest().version();
-
-  auto decompression_path = StringPrintf(
-      "%s/%s@%d.apex", decompressed_dir.c_str(), pkg_name.c_str(), version);
-  auto active_path = StringPrintf("%s/%s@%d.apex", data_dir.c_str(),
-                                  pkg_name.c_str(), version);
-  compressed_apex->Decompress(decompression_path);
-  std::error_code ec;
-  fs::create_hard_link(decompression_path, active_path, ec);
-  ASSERT_FALSE(ec) << "Failed to create hardlink";
-}
-}  // namespace
-
-TEST(ApexFileRepositoryTest, AddDataApexPrioritizeNonDecompressedApex) {
+TEST(ApexFileRepositoryTest, AddDataApexDoesNotScanDecompressedApex) {
   // Prepare test data.
-  TemporaryDir built_in_dir, data_dir, decompressed_dir;
+  TemporaryDir built_in_dir, data_dir, decompression_dir;
   PrepareCompressedApex("com.android.apex.compressed.v1.capex",
-                        built_in_dir.path, data_dir.path,
-                        decompressed_dir.path);
-  fs::copy(GetTestFile("com.android.apex.compressed.v1_original.apex"),
-           data_dir.path);
+                        built_in_dir.path, decompression_dir.path);
 
-  ApexFileRepository instance;
+  ApexFileRepository instance(decompression_dir.path);
   ASSERT_TRUE(IsOk(instance.AddPreInstalledApex({built_in_dir.path})));
   ASSERT_TRUE(IsOk(instance.AddDataApex(data_dir.path)));
 
   auto data_apexs = instance.GetDataApexFiles();
-  auto normal_apex = ApexFile::Open(StringPrintf(
-      "%s/com.android.apex.compressed.v1_original.apex", data_dir.path));
-  ASSERT_THAT(data_apexs,
-              UnorderedElementsAre(ApexFileEq(ByRef(*normal_apex))));
+  ASSERT_EQ(data_apexs.size(), 0u);
 }
 
 TEST(ApexFileRepositoryTest, AddDataApexIgnoreWrongPublicKey) {
   // Prepare test data.
-  TemporaryDir built_in_dir, data_dir;
+  TemporaryDir built_in_dir, data_dir, decompression_dir;
   fs::copy(GetTestFile("apex.apexd_test.apex"), built_in_dir.path);
   fs::copy(GetTestFile("apex.apexd_test_different_key.apex"), data_dir.path);
 
@@ -434,7 +419,7 @@ TEST(ApexFileRepositoryTest, GetPreInstalledApexFiles) {
 }
 
 TEST(ApexFileRepositoryTest, AllApexFilesByName) {
-  TemporaryDir built_in_dir;
+  TemporaryDir built_in_dir, decompression_dir;
   fs::copy(GetTestFile("apex.apexd_test.apex"), built_in_dir.path);
   fs::copy(GetTestFile("com.android.apex.cts.shim.apex"), built_in_dir.path);
   fs::copy(GetTestFile("com.android.apex.compressed.v1.capex"),
@@ -468,6 +453,33 @@ TEST(ApexFileRepositoryTest, AllApexFilesByName) {
               UnorderedElementsAre(ApexFileEq(ByRef(*compressed_apex))));
 }
 
+TEST(ApexFileRepositoryTest, GetDataApex) {
+  // Prepare test data.
+  TemporaryDir built_in_dir, data_dir;
+  fs::copy(GetTestFile("apex.apexd_test.apex"), built_in_dir.path);
+  fs::copy(GetTestFile("apex.apexd_test_v2.apex"), data_dir.path);
+
+  ApexFileRepository instance;
+  ASSERT_TRUE(IsOk(instance.AddPreInstalledApex({built_in_dir.path})));
+  ASSERT_TRUE(IsOk(instance.AddDataApex(data_dir.path)));
+
+  auto apex =
+      ApexFile::Open(StringPrintf("%s/apex.apexd_test_v2.apex", data_dir.path));
+  ASSERT_RESULT_OK(apex);
+
+  auto ret = instance.GetDataApex("com.android.apex.test_package");
+  ASSERT_THAT(ret, ApexFileEq(ByRef(*apex)));
+}
+
+TEST(ApexFileRepositoryTest, GetDataApexNoSuchApexAborts) {
+  ASSERT_DEATH(
+      {
+        ApexFileRepository instance;
+        instance.GetDataApex("whatever");
+      },
+      "");
+}
+
 TEST(ApexFileRepositoryTest, GetPreInstalledApex) {
   // Prepare test data.
   TemporaryDir built_in_dir;
@@ -484,6 +496,38 @@ TEST(ApexFileRepositoryTest, GetPreInstalledApex) {
   ASSERT_THAT(ret, ApexFileEq(ByRef(*apex)));
 }
 
+TEST(ApexFileRepositoryTest, GetApexFileWithPath) {
+  // Prepare test data.
+  TemporaryDir built_in_dir;
+  fs::copy(GetTestFile("apex.apexd_test.apex"), built_in_dir.path);
+
+  ApexFileRepository instance;
+  ASSERT_TRUE(IsOk(instance.AddPreInstalledApex({built_in_dir.path})));
+
+  auto apex_path = StringPrintf("%s/apex.apexd_test.apex", built_in_dir.path);
+  auto apex = ApexFile::Open(apex_path);
+  ASSERT_RESULT_OK(apex);
+
+  auto ret = instance.GetApexFile(apex_path);
+  ASSERT_THAT(ret, Optional(ApexFileEq(ByRef(*apex))));
+}
+
+TEST(ApexFileRepositoryTest, GetApexFileReturnsNulloptWithUnknownPath) {
+  // Prepare test data.
+  TemporaryDir built_in_dir;
+  fs::copy(GetTestFile("apex.apexd_test.apex"), built_in_dir.path);
+
+  ApexFileRepository instance;
+  ASSERT_TRUE(IsOk(instance.AddPreInstalledApex({built_in_dir.path})));
+
+  auto apex_path = StringPrintf("%s/apex.apexd_test.apex", built_in_dir.path);
+  auto apex = ApexFile::Open(apex_path);
+  ASSERT_RESULT_OK(apex);
+
+  auto ret = instance.GetApexFile(apex_path + ".wrong");
+  ASSERT_THAT(ret, Eq(std::nullopt));
+}
+
 TEST(ApexFileRepositoryTest, GetPreInstalledApexNoSuchApexAborts) {
   ASSERT_DEATH(
       {
@@ -491,6 +535,123 @@ TEST(ApexFileRepositoryTest, GetPreInstalledApexNoSuchApexAborts) {
         instance.GetPreInstalledApex("whatever");
       },
       "");
+}
+
+struct ApexFileRepositoryTestAddBlockApex : public ::testing::Test {
+  TemporaryDir test_dir;
+
+  void WriteMicrodroidSignature(const std::string& signature_path,
+                                const std::vector<std::string>& apex_paths) {
+    android::microdroid::MicrodroidSignature signature;
+    signature.set_version(1);
+    for (const auto& apex_path : apex_paths) {
+      auto apex = signature.add_apexes();
+      apex->set_name(apex_path);  // no strict rule for now; use the file_name
+      apex->set_size(GetFileSize(apex_path));
+    }
+    std::ofstream out(signature_path);
+    android::microdroid::WriteMicrodroidSignature(signature, out);
+  }
+  size_t GetFileSize(const std::string& file_name) {
+    struct stat st;
+    CHECK(stat(file_name.c_str(), &st) == 0);
+    return st.st_size;
+  }
+};
+
+TEST_F(ApexFileRepositoryTestAddBlockApex,
+       ScansPayloadDisksAndAddApexFilesToPreInstalled) {
+  // prepare payload disk
+  //  <test-dir>/vdc1 : signature
+  //            /vdc2 : apex.apexd_test.apex
+  //            /vdc3 : apex.apexd_test_different_app.apex
+
+  const auto& test_apex_foo = GetTestFile("apex.apexd_test.apex");
+  const auto& test_apex_bar = GetTestFile("apex.apexd_test_different_app.apex");
+
+  const std::string signature_partition_path = test_dir.path + "/vdc1"s;
+  const std::string apex_foo_path = test_dir.path + "/vdc2"s;
+  const std::string apex_bar_path = test_dir.path + "/vdc3"s;
+
+  WriteMicrodroidSignature(signature_partition_path,
+                           {test_apex_foo, test_apex_bar});
+  fs::copy(test_apex_foo, apex_foo_path);
+  fs::copy(test_apex_bar, apex_bar_path);
+
+  // call ApexFileRepository::AddBlockApex()
+  ApexFileRepository instance;
+  auto status = instance.AddBlockApex(signature_partition_path);
+  ASSERT_RESULT_OK(status);
+
+  // "block" apexes are treated as "pre-installed"
+  auto apex_foo = ApexFile::Open(apex_foo_path);
+  ASSERT_RESULT_OK(apex_foo);
+  auto ret_foo = instance.GetPreInstalledApex("com.android.apex.test_package");
+  ASSERT_THAT(ret_foo, ApexFileEq(ByRef(*apex_foo)));
+
+  auto apex_bar = ApexFile::Open(apex_bar_path);
+  ASSERT_RESULT_OK(apex_bar);
+  auto ret_bar =
+      instance.GetPreInstalledApex("com.android.apex.test_package_2");
+  ASSERT_THAT(ret_bar, ApexFileEq(ByRef(*apex_bar)));
+}
+
+TEST_F(ApexFileRepositoryTestAddBlockApex,
+       ScansOnlySpecifiedInSignaturePartition) {
+  // prepare payload disk
+  //  <test-dir>/vdc1 : signature with apex.apexd_test.apex only
+  //            /vdc2 : apex.apexd_test.apex
+  //            /vdc3 : apex.apexd_test_different_app.apex
+
+  const auto& test_apex_foo = GetTestFile("apex.apexd_test.apex");
+  const auto& test_apex_bar = GetTestFile("apex.apexd_test_different_app.apex");
+
+  const std::string signature_partition_path = test_dir.path + "/vdc1"s;
+  const std::string apex_foo_path = test_dir.path + "/vdc2"s;
+  const std::string apex_bar_path = test_dir.path + "/vdc3"s;
+
+  // signature lists only "foo"
+  WriteMicrodroidSignature(signature_partition_path, {test_apex_foo});
+  fs::copy(test_apex_foo, apex_foo_path);
+  fs::copy(test_apex_bar, apex_bar_path);
+
+  // call ApexFileRepository::AddBlockApex()
+  ApexFileRepository instance;
+  auto status = instance.AddBlockApex(signature_partition_path);
+  ASSERT_RESULT_OK(status);
+
+  // foo is added, but bar is not
+  auto ret_foo = instance.GetPreinstalledPath("com.android.apex.test_package");
+  ASSERT_TRUE(IsOk(ret_foo));
+  ASSERT_EQ(apex_foo_path, *ret_foo);
+  auto ret_bar =
+      instance.GetPreinstalledPath("com.android.apex.test_package_2");
+  ASSERT_FALSE(IsOk(ret_bar));
+}
+
+TEST_F(ApexFileRepositoryTestAddBlockApex, FailsWhenTheresDuplicateNames) {
+  // prepare payload disk
+  //  <test-dir>/vdc1 : signature with apex.apexd_test.apex only
+  //            /vdc2 : apex.apexd_test.apex
+  //            /vdc3 : apex.apexd_test_v2.apex
+
+  const auto& test_apex_foo = GetTestFile("apex.apexd_test.apex");
+  const auto& test_apex_bar = GetTestFile("apex.apexd_test_v2.apex");
+
+  const std::string signature_partition_path = test_dir.path + "/vdc1"s;
+  const std::string apex_foo_path = test_dir.path + "/vdc2"s;
+  const std::string apex_bar_path = test_dir.path + "/vdc3"s;
+
+  // signature lists only "foo"
+  WriteMicrodroidSignature(signature_partition_path,
+                           {test_apex_foo, test_apex_bar});
+  fs::copy(test_apex_foo, apex_foo_path);
+  fs::copy(test_apex_bar, apex_bar_path);
+
+  // call ApexFileRepository::AddBlockApex()
+  ApexFileRepository instance;
+  auto status = instance.AddBlockApex(signature_partition_path);
+  ASSERT_FALSE(IsOk(status));
 }
 
 }  // namespace apex

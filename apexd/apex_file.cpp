@@ -178,7 +178,7 @@ Result<ApexFile> ApexFile::Open(const std::string& path,
   }
 
   return ApexFile(realpath, image_offset, image_size, std::move(*manifest),
-                  pubkey, fs_type, is_compressed);
+                  pubkey, fs_type, is_compressed, size);
 }
 
 // AVB-related code.
@@ -409,6 +409,8 @@ Result<ApexVerityData> ApexFile::VerifyApexVerity(
 
 Result<void> ApexFile::Decompress(const std::string& dest_path) const {
   const std::string& src_path = GetPath();
+
+  LOG(INFO) << "Decompressing" << src_path << " to " << dest_path;
 
   // We should decompress compressed APEX files only
   if (!IsCompressed()) {
