@@ -576,6 +576,8 @@ Result<MountedApexData> VerifyAndTempMountPackage(
   return ret;
 }
 
+}  // namespace
+
 Result<void> Unmount(const MountedApexData& data) {
   LOG(DEBUG) << "Unmounting " << data.full_path << " from mount point "
              << data.mount_point;
@@ -611,6 +613,8 @@ Result<void> Unmount(const MountedApexData& data) {
 
   return {};
 }
+
+namespace {
 
 template <typename VerifyFn>
 Result<void> RunVerifyFnInsideTempMount(const ApexFile& apex,
@@ -3036,19 +3040,33 @@ void CollectApexInfoList(std::ostream& os,
 }
 
 // Reserve |size| bytes in |dest_dir| by creating a zero-filled file
+// If |size| passed is 0, then we cleanup reserved space and any
+// ota_apex that has been processed as part of pre-reboot decompression.
 Result<void> ReserveSpaceForCompressedApex(int64_t size,
                                            const std::string& dest_dir) {
-  LOG(INFO) << "Reserving " << size << " bytes for compressed APEX";
-
   if (size < 0) {
     return Error() << "Cannot reserve negative byte of space";
   }
   auto file_path = StringPrintf("%s/full.tmp", dest_dir.c_str());
   if (size == 0) {
+    LOG(INFO) << "Cleaning up reserved space for compressed APEX";
+    // Ota is being cancelled. Clean up reserved space
     RemoveFileIfExists(file_path);
+
+    // Clean up any processed ota_apex
+    auto ota_apex_files =
+        FindFilesBySuffix(gConfig->decompression_dir, {kOtaApexPackageSuffix});
+    if (!ota_apex_files.ok()) {
+      return Error() << "Failed to clean up ota_apex: "
+                     << ota_apex_files.error();
+    }
+    for (const std::string& ota_apex : *ota_apex_files) {
+      RemoveFileIfExists(ota_apex);
+    }
     return {};
   }
 
+  LOG(INFO) << "Reserving " << size << " bytes for compressed APEX";
   unique_fd dest_fd(
       open(file_path.c_str(), O_WRONLY | O_CLOEXEC | O_CREAT, 0644));
   if (dest_fd.get() == -1) {
@@ -3257,6 +3275,18 @@ int OnOtaChrootBootstrapFlattenedApex() {
 
 android::apex::MountedApexDatabase& GetApexDatabaseForTesting() {
   return gMountedApexes;
+}
+
+Result<ApexFile> InstallPackage(const std::string& package_path) {
+  LOG(INFO) << "Installing " << package_path;
+  auto apex = ApexFile::Open(package_path);
+  if (!apex.ok()) {
+    return apex;
+  }
+  if (!apex->GetManifest().supportsrebootlessupdate()) {
+    return Error() << package_path << " does not support non-staged update";
+  }
+  return Error() << "TODO(b/187864524): implement";
 }
 
 }  // namespace apex
