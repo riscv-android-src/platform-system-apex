@@ -714,6 +714,256 @@ class ApexdMountTest : public ApexdUnitTest {
   std::vector<std::string> to_unmount_;
 };
 
+// TODO(b/187864524): cover other negative scenarios.
+TEST_F(ApexdMountTest, InstallPackageRejectsApexWithoutRebootlessSupport) {
+  auto ret = InstallPackage(GetTestFile("apex.apexd_test.apex"));
+  ASSERT_FALSE(IsOk(ret));
+  ASSERT_THAT(ret.error().message(),
+              HasSubstr("does not support non-staged update"));
+}
+
+TEST_F(ApexdMountTest, InstallPackageRejectsNoPreInstalledApex) {
+  auto ret = InstallPackage(GetTestFile("test.rebootless_apex_v1.apex"));
+  ASSERT_FALSE(IsOk(ret));
+  ASSERT_THAT(
+      ret.error().message(),
+      HasSubstr("No preinstalled apex found for package test.apex.rebootless"));
+}
+
+TEST_F(ApexdMountTest, InstallPackageRejectsNoHashtree) {
+  std::string file_path = AddPreInstalledApex("test.rebootless_apex_v1.apex");
+  ApexFileRepository::GetInstance().AddPreInstalledApex({GetBuiltInDir()});
+
+  auto ret =
+      InstallPackage(GetTestFile("test.rebootless_apex_v2_no_hashtree.apex"));
+  ASSERT_FALSE(IsOk(ret));
+  ASSERT_THAT(ret.error().message(),
+              HasSubstr(" does not have an embedded hash tree"));
+}
+
+TEST_F(ApexdMountTest, InstallPackageRejectsNoActiveApex) {
+  std::string file_path = AddPreInstalledApex("test.rebootless_apex_v1.apex");
+  ApexFileRepository::GetInstance().AddPreInstalledApex({GetBuiltInDir()});
+
+  auto ret = InstallPackage(GetTestFile("test.rebootless_apex_v2.apex"));
+  ASSERT_FALSE(IsOk(ret));
+  ASSERT_THAT(
+      ret.error().message(),
+      HasSubstr("No active version found for package test.apex.rebootless"));
+}
+
+TEST_F(ApexdMountTest, InstallPackageRejectsManifestMismatch) {
+  std::string file_path = AddPreInstalledApex("test.rebootless_apex_v1.apex");
+  ApexFileRepository::GetInstance().AddPreInstalledApex({GetBuiltInDir()});
+
+  ASSERT_TRUE(IsOk(ActivatePackage(file_path)));
+  UnmountOnTearDown(file_path);
+
+  auto ret = InstallPackage(
+      GetTestFile("test.rebootless_apex_manifest_mismatch.apex"));
+  ASSERT_FALSE(IsOk(ret));
+  ASSERT_THAT(
+      ret.error().message(),
+      HasSubstr(
+          "Manifest inside filesystem does not match manifest outside it"));
+}
+
+TEST_F(ApexdMountTest, InstallPackageRejectsCorrupted) {
+  std::string file_path = AddPreInstalledApex("test.rebootless_apex_v1.apex");
+  ApexFileRepository::GetInstance().AddPreInstalledApex({GetBuiltInDir()});
+
+  ASSERT_TRUE(IsOk(ActivatePackage(file_path)));
+  UnmountOnTearDown(file_path);
+
+  auto ret = InstallPackage(GetTestFile("test.rebootless_apex_corrupted.apex"));
+  ASSERT_FALSE(IsOk(ret));
+  ASSERT_THAT(ret.error().message(), HasSubstr("Can't verify /dev/block/dm-"));
+}
+
+TEST_F(ApexdMountTest, InstallPackagePreInstallVersionActive) {
+  std::string file_path = AddPreInstalledApex("test.rebootless_apex_v1.apex");
+  ApexFileRepository::GetInstance().AddPreInstalledApex({GetBuiltInDir()});
+
+  ASSERT_TRUE(IsOk(ActivatePackage(file_path)));
+  UnmountOnTearDown(file_path);
+
+  {
+    auto active_apex = GetActivePackage("test.apex.rebootless");
+    ASSERT_TRUE(IsOk(active_apex));
+    ASSERT_EQ(active_apex->GetPath(), file_path);
+  }
+
+  auto ret = InstallPackage(GetTestFile("test.rebootless_apex_v2.apex"));
+  ASSERT_TRUE(IsOk(ret));
+  UnmountOnTearDown(ret->GetPath());
+
+  auto apex_mounts = GetApexMounts();
+  ASSERT_THAT(apex_mounts,
+              UnorderedElementsAre("/apex/test.apex.rebootless",
+                                   "/apex/test.apex.rebootless@2"));
+
+  // Check that /apex/test.apex.rebootless is a bind mount of
+  // /apex/test.apex.rebootless@2.
+  auto manifest = ReadManifest("/apex/test.apex.rebootless/apex_manifest.pb");
+  ASSERT_TRUE(IsOk(manifest));
+  ASSERT_EQ(2u, manifest->version());
+
+  // Check that GetActivePackage correctly reports upgraded version.
+  auto active_apex = GetActivePackage("test.apex.rebootless");
+  ASSERT_TRUE(IsOk(active_apex));
+  ASSERT_EQ(active_apex->GetPath(), ret->GetPath());
+
+  // Check that pre-installed APEX is still around
+  ASSERT_EQ(0, access(file_path.c_str(), F_OK))
+      << "Can't access " << file_path << " : " << strerror(errno);
+
+  auto& db = GetApexDatabaseForTesting();
+  // Check that upgraded APEX is mounted on top of dm-verity device.
+  db.ForallMountedApexes(
+      "test.apex.rebootless", [&](const MountedApexData& data, bool latest) {
+        ASSERT_TRUE(latest);
+        ASSERT_EQ(data.full_path, ret->GetPath());
+        ASSERT_EQ(data.device_name, "test.apex.rebootless@2_1");
+      });
+}
+
+TEST_F(ApexdMountTest, InstallPackagePreInstallVersionActiveSamegrade) {
+  std::string file_path = AddPreInstalledApex("test.rebootless_apex_v1.apex");
+  ApexFileRepository::GetInstance().AddPreInstalledApex({GetBuiltInDir()});
+
+  ASSERT_TRUE(IsOk(ActivatePackage(file_path)));
+  UnmountOnTearDown(file_path);
+
+  {
+    auto active_apex = GetActivePackage("test.apex.rebootless");
+    ASSERT_TRUE(IsOk(active_apex));
+    ASSERT_EQ(active_apex->GetPath(), file_path);
+  }
+
+  auto ret = InstallPackage(GetTestFile("test.rebootless_apex_v1.apex"));
+  ASSERT_TRUE(IsOk(ret));
+  UnmountOnTearDown(ret->GetPath());
+
+  auto apex_mounts = GetApexMounts();
+  ASSERT_THAT(apex_mounts,
+              UnorderedElementsAre("/apex/test.apex.rebootless",
+                                   "/apex/test.apex.rebootless@1"));
+
+  // Check that GetActivePackage correctly reports upgraded version.
+  auto active_apex = GetActivePackage("test.apex.rebootless");
+  ASSERT_TRUE(IsOk(active_apex));
+  ASSERT_EQ(active_apex->GetPath(), ret->GetPath());
+
+  // Check that pre-installed APEX is still around
+  ASSERT_EQ(0, access(file_path.c_str(), F_OK))
+      << "Can't access " << file_path << " : " << strerror(errno);
+
+  auto& db = GetApexDatabaseForTesting();
+  // Check that upgraded APEX is mounted on top of dm-verity device.
+  db.ForallMountedApexes(
+      "test.apex.rebootless", [&](const MountedApexData& data, bool latest) {
+        ASSERT_TRUE(latest);
+        ASSERT_EQ(data.full_path, ret->GetPath());
+        ASSERT_EQ(data.device_name, "test.apex.rebootless@1_1");
+      });
+}
+
+TEST_F(ApexdMountTest, InstallPackageDataVersionActive) {
+  AddPreInstalledApex("test.rebootless_apex_v1.apex");
+  ApexFileRepository::GetInstance().AddPreInstalledApex({GetBuiltInDir()});
+
+  std::string file_path = AddDataApex("test.rebootless_apex_v1.apex");
+  ASSERT_TRUE(IsOk(ActivatePackage(file_path)));
+  UnmountOnTearDown(file_path);
+
+  {
+    auto active_apex = GetActivePackage("test.apex.rebootless");
+    ASSERT_TRUE(IsOk(active_apex));
+    ASSERT_EQ(active_apex->GetPath(), file_path);
+  }
+
+  auto ret = InstallPackage(GetTestFile("test.rebootless_apex_v2.apex"));
+  ASSERT_TRUE(IsOk(ret));
+  UnmountOnTearDown(ret->GetPath());
+
+  auto apex_mounts = GetApexMounts();
+  ASSERT_THAT(apex_mounts,
+              UnorderedElementsAre("/apex/test.apex.rebootless",
+                                   "/apex/test.apex.rebootless@2"));
+
+  // Check that /apex/test.apex.rebootless is a bind mount of
+  // /apex/test.apex.rebootless@2.
+  auto manifest = ReadManifest("/apex/test.apex.rebootless/apex_manifest.pb");
+  ASSERT_TRUE(IsOk(manifest));
+  ASSERT_EQ(2u, manifest->version());
+
+  // Check that GetActivePackage correctly reports upgraded version.
+  auto active_apex = GetActivePackage("test.apex.rebootless");
+  ASSERT_TRUE(IsOk(active_apex));
+  ASSERT_EQ(active_apex->GetPath(), ret->GetPath());
+
+  // Check that previously active APEX was deleted.
+  ASSERT_EQ(-1, access(file_path.c_str(), F_OK));
+  ASSERT_EQ(ENOENT, errno);
+
+  auto& db = GetApexDatabaseForTesting();
+  // Check that upgraded APEX is mounted on top of dm-verity device.
+  db.ForallMountedApexes(
+      "test.apex.rebootless", [&](const MountedApexData& data, bool latest) {
+        ASSERT_TRUE(latest);
+        ASSERT_EQ(data.full_path, ret->GetPath());
+        ASSERT_EQ(data.device_name, "test.apex.rebootless@2_1");
+      });
+}
+
+TEST_F(ApexdMountTest, InstallPackageDataVersionActiveSamegrade) {
+  AddPreInstalledApex("test.rebootless_apex_v1.apex");
+  ApexFileRepository::GetInstance().AddPreInstalledApex({GetBuiltInDir()});
+
+  std::string file_path = AddDataApex("test.rebootless_apex_v2.apex");
+  ASSERT_TRUE(IsOk(ActivatePackage(file_path)));
+  UnmountOnTearDown(file_path);
+
+  {
+    auto active_apex = GetActivePackage("test.apex.rebootless");
+    ASSERT_TRUE(IsOk(active_apex));
+    ASSERT_EQ(active_apex->GetPath(), file_path);
+  }
+
+  auto ret = InstallPackage(GetTestFile("test.rebootless_apex_v2.apex"));
+  ASSERT_TRUE(IsOk(ret));
+  UnmountOnTearDown(ret->GetPath());
+
+  auto apex_mounts = GetApexMounts();
+  ASSERT_THAT(apex_mounts,
+              UnorderedElementsAre("/apex/test.apex.rebootless",
+                                   "/apex/test.apex.rebootless@2"));
+
+  // Check that /apex/test.apex.rebootless is a bind mount of
+  // /apex/test.apex.rebootless@2.
+  auto manifest = ReadManifest("/apex/test.apex.rebootless/apex_manifest.pb");
+  ASSERT_TRUE(IsOk(manifest));
+  ASSERT_EQ(2u, manifest->version());
+
+  // Check that GetActivePackage correctly reports upgraded version.
+  auto active_apex = GetActivePackage("test.apex.rebootless");
+  ASSERT_TRUE(IsOk(active_apex));
+  ASSERT_EQ(active_apex->GetPath(), ret->GetPath());
+
+  // Check that previously active APEX was deleted.
+  ASSERT_EQ(-1, access(file_path.c_str(), F_OK));
+  ASSERT_EQ(ENOENT, errno);
+
+  auto& db = GetApexDatabaseForTesting();
+  // Check that upgraded APEX is mounted on top of dm-verity device.
+  db.ForallMountedApexes(
+      "test.apex.rebootless", [&](const MountedApexData& data, bool latest) {
+        ASSERT_TRUE(latest);
+        ASSERT_EQ(data.full_path, ret->GetPath());
+        ASSERT_EQ(data.device_name, "test.apex.rebootless@2_1");
+      });
+}
+
 TEST_F(ApexdMountTest, ActivatePackage) {
   std::string file_path = AddPreInstalledApex("apex.apexd_test.apex");
   ApexFileRepository::GetInstance().AddPreInstalledApex({GetBuiltInDir()});
@@ -753,6 +1003,7 @@ TEST_F(ApexdMountTest, ActivateDeactivateSharedLibsApex) {
       "com.android.apex.test.sharedlibs_generated.v1.libvX.apex");
   ApexFileRepository::GetInstance().AddPreInstalledApex({GetBuiltInDir()});
 
+  UnmountOnTearDown(file_path);
   ASSERT_TRUE(IsOk(ActivatePackage(file_path)));
 
   auto active_apex = GetActivePackage("com.android.apex.test.sharedlibs");
@@ -1818,6 +2069,8 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapSelinuxLabelsAreCorrect) {
       "com.android.apex.test.sharedlibs_generated.v1.libvX.apex");
   std::string apex_path_3 = AddDataApex("apex.apexd_test_v2.apex");
 
+  UnmountOnTearDown(apex_path_2);
+  UnmountOnTearDown(apex_path_3);
   ASSERT_EQ(OnOtaChrootBootstrap(), 0);
 
   EXPECT_EQ(GetSelinuxContext("/apex/apex-info-list.xml"),
@@ -2051,12 +2304,13 @@ TEST_F(ApexdMountTest, OnStartDataHasWrongSHA) {
   // Need to call InitializeVold before calling OnStart
   InitializeVold(&checkpoint_interface);
 
-  AddPreInstalledApex("com.android.apex.cts.shim.apex");
+  std::string apex_path = AddPreInstalledApex("com.android.apex.cts.shim.apex");
   AddDataApex("com.android.apex.cts.shim.v2_wrong_sha.apex");
 
   ASSERT_RESULT_OK(
       ApexFileRepository::GetInstance().AddPreInstalledApex({GetBuiltInDir()}));
 
+  UnmountOnTearDown(apex_path);
   OnStart();
 
   // Check system shim apex is activated instead of the data one.
@@ -2589,6 +2843,19 @@ TEST_F(ApexdMountTest, OnStartOtaApexKeptUntilSlotSwitch) {
   ASSERT_RESULT_OK(
       ApexFileRepository::GetInstance().AddPreInstalledApex({GetBuiltInDir()}));
 
+  // When we call OnStart for the first time, it will decompress v1 capex and
+  // activate it, while after second call it will decompress v2 capex and
+  // activate it. We need to make sure that activated APEXes are cleaned up
+  // after test finishes.
+  auto old_decompressed_apex = StringPrintf(
+      "%s/com.android.apex.compressed@1%s", GetDecompressionDir().c_str(),
+      kDecompressedApexPackageSuffix);
+  auto new_decompressed_apex = StringPrintf(
+      "%s/com.android.apex.compressed@2%s", GetDecompressionDir().c_str(),
+      kDecompressedApexPackageSuffix);
+  UnmountOnTearDown(old_decompressed_apex);
+  UnmountOnTearDown(new_decompressed_apex);
+
   // First try starting without slot switch. Since we are booting with
   // old pre-installed capex, ota_apex should not be deleted
   OnStart();
@@ -2708,9 +2975,33 @@ TEST_F(ApexdMountTest, PopulateFromMountsChecksPathPrefix) {
   ASSERT_TRUE(IsOk(ActivatePackage(apex_path)));
   ASSERT_TRUE(IsOk(ActivatePackage(decompressed_apex)));
   ASSERT_TRUE(IsOk(ActivatePackage(other_apex)));
+
+  auto& db = GetApexDatabaseForTesting();
+  // Remember mount information for |other_apex|, since it won't be available in
+  // the database. We will need to tear it down manually.
+  std::optional<MountedApexData> other_apex_mount_data;
+  db.ForallMountedApexes(
+      "com.android.apex.test_package_2",
+      [&other_apex_mount_data](const MountedApexData& data, bool latest) {
+        if (latest) {
+          other_apex_mount_data.emplace(data);
+        }
+      });
   UnmountOnTearDown(apex_path);
   UnmountOnTearDown(decompressed_apex);
-  UnmountOnTearDown(other_apex);
+  ASSERT_TRUE(other_apex_mount_data.has_value());
+  auto deleter = make_scope_guard([&other_apex_mount_data]() {
+    if (!other_apex_mount_data.has_value()) {
+      return;
+    }
+    if (umount2("/apex/com.android.apex.test_package_2", 0) != 0) {
+      PLOG(ERROR) << "Failed to unmount /apex/com.android.apex.test_package_2";
+    }
+    auto res = Unmount(*other_apex_mount_data, /* deferred= */ false);
+    if (!res.ok()) {
+      LOG(ERROR) << res.error();
+    }
+  });
 
   auto apex_mounts = GetApexMounts();
   ASSERT_THAT(apex_mounts,
@@ -2721,7 +3012,6 @@ TEST_F(ApexdMountTest, PopulateFromMountsChecksPathPrefix) {
                                    "/apex/com.android.apex.test_package_2",
                                    "/apex/com.android.apex.test_package_2@1"));
 
-  auto& db = GetApexDatabaseForTesting();
   // Clear the database before calling PopulateFromMounts
   db.Reset();
 
