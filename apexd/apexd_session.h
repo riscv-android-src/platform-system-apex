@@ -28,10 +28,18 @@
 namespace android {
 namespace apex {
 
-static const std::string kApexSessionsDir = "/metadata/apex/sessions";
-
 class ApexSession {
  public:
+  // Returns top-level directory to store sessions metadata in.
+  // If device has /metadata partition, this will return
+  // /metadata/apex/sessions, on all other devices it will return
+  // /data/apex/sessions.
+  static std::string GetSessionsDir();
+  // Migrates content of /data/apex/sessions to /metadata/apex/sessions.
+  // If device doesn't have /metadata partition this call will be a no-op.
+  // If /data/apex/sessions this call will also be a no-op.
+  static android::base::Result<void> MigrateToMetadataSessionsDir();
+
   static android::base::Result<ApexSession> CreateSession(int session_id);
   static android::base::Result<ApexSession> GetSession(int session_id);
   static std::vector<ApexSession> GetSessions();
@@ -64,9 +72,10 @@ class ApexSession {
       const ::apex::proto::SessionState::State& state);
 
   android::base::Result<void> DeleteSession() const;
+  static void DeleteFinalizedSessions();
 
  private:
-  ApexSession(::apex::proto::SessionState state);
+  explicit ApexSession(::apex::proto::SessionState state);
   ::apex::proto::SessionState state_;
 
   static android::base::Result<ApexSession> GetSessionFromFile(
