@@ -34,6 +34,7 @@
 #include "com_android_apex.h"
 
 #include <ApexProperties.sysprop.h>
+#include <android-base/chrono_utils.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/macros.h>
@@ -52,6 +53,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/f2fs.h>
 #include <linux/loop.h>
 #include <stdlib.h>
 #include <sys/inotify.h>
@@ -83,6 +85,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+using android::base::boot_clock;
 using android::base::ConsumePrefix;
 using android::base::ErrnoError;
 using android::base::Error;
@@ -153,6 +156,31 @@ bool IsBootstrapApex(const ApexFile& apex) {
                    apex.GetManifest().name()) != kBootstrapApexes.end();
 }
 
+void ReleaseF2fsCompressedBlocks(const std::string& file_path) {
+  unique_fd fd(
+      TEMP_FAILURE_RETRY(open(file_path.c_str(), O_RDONLY | O_CLOEXEC, 0)));
+  if (fd.get() == -1) {
+    PLOG(ERROR) << "Failed to open " << file_path;
+    return;
+  }
+  unsigned int flags;
+  if (ioctl(fd, FS_IOC_GETFLAGS, &flags) == -1) {
+    PLOG(ERROR) << "Failed to call FS_IOC_GETFLAGS on " << file_path;
+    return;
+  }
+  if ((flags & FS_COMPR_FL) == 0) {
+    // Doesn't support f2fs-compression.
+    return;
+  }
+  uint64_t blk_cnt;
+  if (ioctl(fd, F2FS_IOC_RELEASE_COMPRESS_BLOCKS, &blk_cnt) == -1) {
+    PLOG(ERROR) << "Failed to call F2FS_IOC_RELEASE_COMPRESS_BLOCKS on "
+                << file_path;
+  }
+  LOG(INFO) << "Released " << blk_cnt << " compressed blocks from "
+            << file_path;
+}
+
 // Pre-allocate loop devices so that we don't have to wait for them
 // later when actually activating APEXes.
 Result<void> PreAllocateLoopDevices() {
@@ -163,13 +191,13 @@ Result<void> PreAllocateLoopDevices() {
 
   auto size = 0;
   for (const auto& path : *scan) {
-    auto apexFile = ApexFile::Open(path);
-    if (!apexFile.ok()) {
+    auto apex_file = ApexFile::Open(path);
+    if (!apex_file.ok()) {
       continue;
     }
     size++;
     // bootstrap Apexes may be activated on separate namespaces.
-    if (IsBootstrapApex(*apexFile)) {
+    if (IsBootstrapApex(*apex_file)) {
       size++;
     }
   }
@@ -405,6 +433,7 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   }
 
   LOG(VERBOSE) << "Creating mount point: " << mount_point;
+  auto time_started = boot_clock::now();
   // Note: the mount point could exist in case when the APEX was activated
   // during the bootstrap phase (e.g., the runtime or tzdata APEX).
   // Although we have separate mount namespaces to separate the early activated
@@ -530,8 +559,10 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   }
   if (mount(block_device.c_str(), mount_point.c_str(),
             apex.GetFsType().value().c_str(), mount_flags, nullptr) == 0) {
+    auto time_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        boot_clock::now() - time_started).count();
     LOG(INFO) << "Successfully mounted package " << full_path << " on "
-              << mount_point;
+              << mount_point << " duration=" << time_elapsed;
     auto status = VerifyMountedImage(apex, mount_point);
     if (!status.ok()) {
       if (umount2(mount_point.c_str(), UMOUNT_NOFOLLOW) != 0) {
@@ -2586,6 +2617,10 @@ Result<ApexFile> ProcessCompressedApex(const ApexFile& capex,
     return Error() << "Failed to decompress CAPEX: " << return_apex.error();
   }
 
+  /// Release compressed blocks in case decompression_dest is on f2fs-compressed
+  // filesystem.
+  ReleaseF2fsCompressedBlocks(decompression_dest);
+
   scope_guard.Disable();
   return return_apex;
 }
@@ -2839,6 +2874,11 @@ Result<std::vector<ApexFile>> SubmitStagedSession(
       (*session).UpdateStateAndCommit(SessionState::VERIFIED);
   if (!commit_status.ok()) {
     return commit_status.error();
+  }
+
+  for (const auto& apex : ret) {
+    // Release compressed blocks in case /data is f2fs-compressed filesystem.
+    ReleaseF2fsCompressedBlocks(apex.GetPath());
   }
 
   return ret;
@@ -3554,6 +3594,10 @@ Result<ApexFile> InstallPackage(const std::string& package_path) {
   if (auto res = UpdateApexInfoList(); !res.ok()) {
     LOG(ERROR) << res.error();
   }
+
+  // Release compressed blocks in case target_file is on f2fs-compressed
+  // filesystem.
+  ReleaseF2fsCompressedBlocks(target_file);
 
   return new_apex;
 }
