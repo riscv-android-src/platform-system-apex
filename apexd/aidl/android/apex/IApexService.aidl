@@ -134,7 +134,7 @@ interface IApexService {
     * Not meant for use outside of testing. This call will not be functional
     * on user builds. Only root is allowed to call this method.
     */
-   void recollectDataApex(in @utf8InCpp String path);
+   void recollectDataApex(in @utf8InCpp String path, in@utf8InCpp String decompression_dir);
 
    /**
     * Informs apexd that the boot has completed.
@@ -152,4 +152,11 @@ interface IApexService {
    * reservation fails. If empty list is passed, then reserved space is deallocated.
    */
    void reserveSpaceForCompressedApex(in CompressedApexInfoList compressed_apex_info_list);
+
+   /**
+    * Performs a non-staged install of the given APEX.
+    * Note: don't confuse this to preInstall and postInstall binder calls which are only used to
+    * test corresponding features of APEX packages.
+    */
+   ApexInfo installAndActivatePackage(in @utf8InCpp String packagePath);
 }

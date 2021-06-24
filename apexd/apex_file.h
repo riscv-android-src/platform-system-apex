@@ -42,6 +42,7 @@ struct ApexVerityData {
 class ApexFile {
  public:
   static android::base::Result<ApexFile> Open(const std::string& path);
+
   ApexFile() = delete;
   ApexFile(ApexFile&&) = default;
   ApexFile& operator=(ApexFile&&) = default;

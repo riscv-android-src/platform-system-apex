@@ -103,13 +103,16 @@ class ApexService : public BnApexService {
   BinderStatus remountPackages() override;
   BinderStatus recollectPreinstalledData(
       const std::vector<std::string>& paths) override;
-  BinderStatus recollectDataApex(const std::string& path) override;
+  BinderStatus recollectDataApex(const std::string& path,
+                                 const std::string& decompression_dir) override;
   BinderStatus markBootCompleted() override;
   BinderStatus calculateSizeForCompressedApex(
       const CompressedApexInfoList& compressed_apex_info_list,
       int64_t* required_size) override;
   BinderStatus reserveSpaceForCompressedApex(
       const CompressedApexInfoList& compressed_apex_info_list) override;
+  BinderStatus installAndActivatePackage(const std::string& package_path,
+                                         ApexInfo* aidl_return) override;
 
   status_t dump(int fd, const Vector<String16>& args) override;
 
@@ -277,6 +280,7 @@ void ConvertToApexSessionInfo(const ApexSession& session,
   ClearSessionInfo(session_info);
   session_info->sessionId = session.GetId();
   session_info->crashingNativeProcess = session.GetCrashingNativeProcess();
+  session_info->errorMessage = session.GetErrorMessage();
 
   switch (session.GetState()) {
     case SessionState::VERIFIED:
@@ -451,6 +455,23 @@ BinderStatus ApexService::getAllPackages(std::vector<ApexInfo>* aidl_return) {
   return BinderStatus::ok();
 }
 
+BinderStatus ApexService::installAndActivatePackage(
+    const std::string& package_path, ApexInfo* aidl_return) {
+  LOG(DEBUG) << "installAndActivatePackage() received by ApexService, path: "
+             << package_path;
+  auto res = InstallPackage(package_path);
+  if (!res.ok()) {
+    LOG(ERROR) << "Failed to install package " << package_path << " : "
+               << res.error();
+    return BinderStatus::fromExceptionCode(
+        BinderStatus::EX_SERVICE_SPECIFIC,
+        String8(res.error().message().c_str()));
+  }
+  *aidl_return = GetApexInfo(*res);
+  aidl_return->isActive = true;
+  return BinderStatus::ok();
+}
+
 BinderStatus ApexService::preinstallPackages(
     const std::vector<std::string>& paths) {
   BinderStatus debug_check = CheckDebuggable("preinstallPackages");
@@ -502,7 +523,7 @@ BinderStatus ApexService::abortStagedSession(int session_id) {
 
 BinderStatus ApexService::revertActiveSessions() {
   LOG(DEBUG) << "revertActiveSessions() received by ApexService.";
-  Result<void> res = ::android::apex::RevertActiveSessions("");
+  Result<void> res = ::android::apex::RevertActiveSessions("", "");
   if (!res.ok()) {
     return BinderStatus::fromExceptionCode(
         BinderStatus::EX_ILLEGAL_ARGUMENT,
@@ -625,8 +646,10 @@ BinderStatus ApexService::recollectPreinstalledData(
   return BinderStatus::ok();
 }
 
-BinderStatus ApexService::recollectDataApex(const std::string& path) {
-  LOG(DEBUG) << "recollectDataApex() received by ApexService, paths " << path;
+BinderStatus ApexService::recollectDataApex(
+    const std::string& path, const std::string& decompression_dir) {
+  LOG(DEBUG) << "recollectDataApex() received by ApexService, paths " << path
+             << " and " << decompression_dir;
   if (auto debug = CheckDebuggable("recollectDataApex"); !debug.isOk()) {
     return debug;
   }
@@ -702,14 +725,19 @@ status_t ApexService::dump(int fd, const Vector<String16>& /*args*/) {
       }
     }
     std::string revert_reason = "";
-    std::string crashing_native_process = session.GetCrashingNativeProcess();
+    const auto& crashing_native_process = session.GetCrashingNativeProcess();
     if (!crashing_native_process.empty()) {
       revert_reason = " Revert Reason: " + crashing_native_process;
+    }
+    std::string error_message_dump = "";
+    const auto& error_message = session.GetErrorMessage();
+    if (!error_message.empty()) {
+      error_message_dump = " Error Message: " + error_message;
     }
     std::string msg =
         StringLog() << "Session ID: " << session.GetId() << child_ids_str
                     << " State: " << SessionState_State_Name(session.GetState())
-                    << revert_reason << std::endl;
+                    << revert_reason << error_message_dump << std::endl;
     dprintf(fd, "%s", msg.c_str());
   }
 
@@ -1020,7 +1048,7 @@ void CreateAndRegisterService() {
   sp<ProcessState> ps(ProcessState::self());
 
   // Create binder service and register with LazyServiceRegistrar
-  sp<ApexService> apex_service = new ApexService();
+  sp<ApexService> apex_service = sp<ApexService>::make();
   auto lazy_registrar = LazyServiceRegistrar::getInstance();
   lazy_registrar.forcePersist(true);
   lazy_registrar.registerService(apex_service, kApexServiceName);

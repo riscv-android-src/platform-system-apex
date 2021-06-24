@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <limits>
 #include <string>
 
 #include <android-base/file.h>
@@ -76,6 +77,21 @@ TEST_P(ApexFileTest, GetOffsetOfSimplePackage) {
 
   EXPECT_EQ(zip_image_offset, apex_file->GetImageOffset().value());
   EXPECT_EQ(zip_image_size, apex_file->GetImageSize().value());
+}
+
+TEST_P(ApexFileTest, OpenBlockApex) {
+  const std::string file_path = kTestDataDir + GetParam().prefix + ".apex";
+  Result<ApexFile> apex_file = ApexFile::Open(file_path);
+  ASSERT_RESULT_OK(apex_file);
+
+  TemporaryFile temp_file;
+  auto loop_device = WriteBlockApex(file_path, temp_file.path);
+
+  Result<ApexFile> apex_file_sized = ApexFile::Open(temp_file.path);
+  ASSERT_RESULT_OK(apex_file_sized);
+
+  EXPECT_EQ(apex_file->GetImageOffset(), apex_file_sized->GetImageOffset());
+  EXPECT_EQ(apex_file->GetImageSize(), apex_file_sized->GetImageSize());
 }
 
 TEST(ApexFileTest, GetOffsetMissingFile) {
@@ -314,6 +330,23 @@ TEST(ApexFileTest, CompressedSharedLibsApexIsRejected) {
                                    "be compressed"));
 }
 
+// Check if CAPEX contains originalApexDigest in its manifest
+TEST(ApexFileTest, OriginalApexDigest) {
+  const std::string capex_path =
+      kTestDataDir + "com.android.apex.compressed.v1.capex";
+  auto capex = ApexFile::Open(capex_path);
+  ASSERT_TRUE(capex.ok());
+  const std::string decompressed_apex_path =
+      kTestDataDir + "com.android.apex.compressed.v1_original.apex";
+  auto decompressed_apex = ApexFile::Open(decompressed_apex_path);
+  ASSERT_TRUE(decompressed_apex.ok());
+  // Validate root digest
+  auto digest = decompressed_apex->VerifyApexVerity(
+      decompressed_apex->GetBundledPublicKey());
+  ASSERT_TRUE(digest.ok());
+  ASSERT_EQ(digest->root_digest,
+            capex->GetManifest().capexmetadata().originalapexdigest());
+}
 }  // namespace
 }  // namespace apex
 }  // namespace android

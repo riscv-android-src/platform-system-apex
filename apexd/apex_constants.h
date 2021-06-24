@@ -52,6 +52,9 @@ static constexpr const char* kCeDataDir = "/data/misc_ce";
 
 static constexpr const char* kApexPackageSuffix = ".apex";
 static constexpr const char* kCompressedApexPackageSuffix = ".capex";
+static constexpr const char* kDecompressedApexPackageSuffix =
+    ".decompressed.apex";
+static constexpr const char* kOtaApexPackageSuffix = ".ota.apex";
 
 static constexpr const char* kManifestFilenameJson = "apex_manifest.json";
 static constexpr const char* kManifestFilenamePb = "apex_manifest.pb";
@@ -63,6 +66,9 @@ static constexpr const char* kApexStatusSysprop = "apexd.status";
 static constexpr const char* kApexStatusStarting = "starting";
 static constexpr const char* kApexStatusActivated = "activated";
 static constexpr const char* kApexStatusReady = "ready";
+
+static constexpr const char* kVmPayloadMetadataPartition =
+    "/dev/block/by-name/metadata";
 
 // Banned APEX names
 static const std::unordered_set<std::string> kBannedApexName = {

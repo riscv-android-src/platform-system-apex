@@ -25,6 +25,7 @@
 #include <fstream>
 #include <span>
 
+#include <android-base/endian.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/scopeguard.h>
@@ -75,6 +76,28 @@ Result<std::string> RetrieveFsType(borrowed_fd fd, int32_t image_offset) {
   return Error() << "Couldn't find filesystem magic";
 }
 
+Result<uint32_t> GetApexFileSize(borrowed_fd fd) {
+  struct stat st;
+  if (fstat(fd.get(), &st) != 0) {
+    return ErrnoError() << "fstat() failed.";
+  }
+  if (S_ISREG(st.st_mode)) {
+    return static_cast<uint32_t>(st.st_size);
+  }
+  // The size of a "block" apex is at the end of it.
+  if (S_ISBLK(st.st_mode)) {
+    uint32_t file_size = 0;
+    if (lseek(fd.get(), -sizeof(file_size), SEEK_END) == -1) {
+      return ErrnoError() << "lseek() failed.";
+    }
+    if (read(fd.get(), &file_size, sizeof(file_size)) == -1) {
+      return ErrnoError() << "read() failed";
+    }
+    return betoh32(file_size);
+  }
+  return Error() << "Unknown file type: " << st.st_mode;
+}
+
 }  // namespace
 
 Result<ApexFile> ApexFile::Open(const std::string& path) {
@@ -87,14 +110,20 @@ Result<ApexFile> ApexFile::Open(const std::string& path) {
 
   unique_fd fd(open(path.c_str(), O_RDONLY | O_BINARY | O_CLOEXEC));
   if (fd < 0) {
-    return Error() << "Failed to open package " << path << ": "
-                   << "I/O error";
+    return ErrnoError() << "Failed to open package " << path << ": "
+                        << "I/O error";
+  }
+
+  auto size = GetApexFileSize(fd);
+  if (!size.ok()) {
+    return size.error();
   }
 
   ZipArchiveHandle handle;
   auto handle_guard =
       android::base::make_scope_guard([&handle] { CloseArchive(handle); });
-  int ret = OpenArchiveFd(fd.get(), path.c_str(), &handle, false);
+  int ret = OpenArchiveFdRange(fd.get(), path.c_str(), &handle, *size,
+                               /*offset=*/0, /*assume_ownership=*/false);
   if (ret < 0) {
     return Error() << "Failed to open package " << path << ": "
                    << ErrorCodeString(ret);
@@ -403,6 +432,8 @@ Result<ApexVerityData> ApexFile::VerifyApexVerity(
 
 Result<void> ApexFile::Decompress(const std::string& dest_path) const {
   const std::string& src_path = GetPath();
+
+  LOG(INFO) << "Decompressing" << src_path << " to " << dest_path;
 
   // We should decompress compressed APEX files only
   if (!IsCompressed()) {

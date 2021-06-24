@@ -96,26 +96,6 @@ using MountedApexData = MountedApexDatabase::MountedApexData;
 
 namespace fs = std::filesystem;
 
-static void CleanDir(const std::string& dir) {
-  if (access(dir.c_str(), F_OK) != 0 && errno == ENOENT) {
-    LOG(WARNING) << dir << " does not exist";
-    return;
-  }
-  auto status = WalkDir(dir, [](const fs::directory_entry& p) {
-    std::error_code ec;
-    fs::file_status status = p.status(ec);
-    ASSERT_FALSE(ec) << "Failed to stat " << p.path() << " : " << ec.message();
-    if (fs::is_directory(status)) {
-      fs::remove_all(p.path(), ec);
-    } else {
-      fs::remove(p.path(), ec);
-    }
-    ASSERT_FALSE(ec) << "Failed to delete " << p.path() << " : "
-                     << ec.message();
-  });
-  ASSERT_TRUE(IsOk(status));
-}
-
 class ApexServiceTest : public ::testing::Test {
  public:
   ApexServiceTest() {
@@ -469,10 +449,10 @@ class ApexServiceTest : public ::testing::Test {
 
  private:
   void CleanUp() {
-    CleanDir(kActiveApexPackagesDataDir);
-    CleanDir(kApexBackupDir);
-    CleanDir(kApexHashTreeDir);
-    CleanDir(ApexSession::GetSessionsDir());
+    DeleteDirContent(kActiveApexPackagesDataDir);
+    DeleteDirContent(kApexBackupDir);
+    DeleteDirContent(kApexHashTreeDir);
+    DeleteDirContent(ApexSession::GetSessionsDir());
 
     DeleteIfExists("/data/misc_ce/0/apexdata/apex.apexd_test");
     DeleteIfExists("/data/misc_ce/0/apexrollback/123456");
@@ -1159,7 +1139,8 @@ TEST_F(ApexServiceActivationSuccessTest, ShowsUpInMountedApexDatabase) {
       << GetDebugStr(installer_.get());
 
   MountedApexDatabase db;
-  db.PopulateFromMounts();
+  db.PopulateFromMounts(kActiveApexPackagesDataDir, kApexDecompressedDir,
+                        kApexHashTreeDir);
 
   std::optional<MountedApexData> mounted_apex;
   db.ForallMountedApexes(installer_->package,
@@ -1285,7 +1266,8 @@ TEST_F(ApexServiceNoHashtreeApexActivationTest, ShowsUpInMountedApexDatabase) {
       << GetDebugStr(installer_.get());
 
   MountedApexDatabase db;
-  db.PopulateFromMounts();
+  db.PopulateFromMounts(kActiveApexPackagesDataDir, kApexDecompressedDir,
+                        kApexHashTreeDir);
 
   std::optional<MountedApexData> mounted_apex;
   db.ForallMountedApexes(installer_->package,
@@ -1411,19 +1393,22 @@ TEST_F(ApexServiceTest, GetFactoryPackages) {
   ASSERT_TRUE(IsOk(factory_packages));
   ASSERT_TRUE(factory_packages->size() > 0);
 
-  std::vector<std::string> builtinDirs;
+  std::vector<std::string> builtin_dirs;
   for (const auto& d : kApexPackageBuiltinDirs) {
     std::string realpath;
     if (android::base::Realpath(d, &realpath)) {
-      builtinDirs.push_back(realpath);
+      builtin_dirs.push_back(realpath);
     }
     // realpath might fail in case when dir is a non-existing path. We can
     // ignore non-existing paths.
   }
 
+  // Decompressed APEX is also considred factory package
+  builtin_dirs.push_back(kApexDecompressedDir);
+
   for (const ApexInfo& package : *factory_packages) {
     bool is_builtin = false;
-    for (const auto& dir : builtinDirs) {
+    for (const auto& dir : builtin_dirs) {
       if (StartsWith(package.modulePath, dir)) {
         is_builtin = true;
       }
@@ -2194,7 +2179,7 @@ TEST_F(ApexServiceTest, ActivePackagesDirEmpty) {
   }
 
   // Make sure that /data/apex/active is empty
-  CleanDir(kActiveApexPackagesDataDir);
+  DeleteDirContent(kActiveApexPackagesDataDir);
 
   ApexInfoList list;
   ApexSessionParams params;
@@ -2482,7 +2467,7 @@ TEST_F(ApexServiceRevertTest, RevertStoresCrashingNativeProcess) {
   // TODO(ioffe): this is calling into internals of apexd which makes test quite
   //  britle. With some refactoring we should be able to call binder api, or
   //  make this a unit test of apexd.cpp.
-  Result<void> res = ::android::apex::RevertActiveSessions(native_process);
+  Result<void> res = ::android::apex::RevertActiveSessions(native_process, "");
   session = ApexSession::GetSession(1543);
   ASSERT_EQ(session->GetCrashingNativeProcess(), native_process);
 }
@@ -2668,21 +2653,6 @@ TEST_F(ApexShimUpdateTest, UpdateToV2Success) {
   }
 
   ASSERT_TRUE(IsOk(service_->stagePackages({installer.test_file})));
-}
-
-TEST_F(ApexShimUpdateTest, UpdateToV2FailureWrongSHA512) {
-  PrepareTestApexForInstall installer(
-      GetTestFile("com.android.apex.cts.shim.v2_wrong_sha.apex"));
-
-  if (!installer.Prepare()) {
-    FAIL() << GetDebugStr(&installer);
-  }
-
-  const auto& status = service_->stagePackages({installer.test_file});
-  ASSERT_FALSE(IsOk(status));
-  const std::string& error_message =
-      std::string(status.exceptionMessage().c_str());
-  ASSERT_THAT(error_message, HasSubstr("has unexpected SHA512 hash"));
 }
 
 TEST_F(ApexShimUpdateTest, SubmitStagedSessionFailureHasPreInstallHook) {
@@ -3030,15 +3000,16 @@ class ApexServiceTestForCompressedApex : public ApexServiceTest {
         GetTestFile("com.android.apex.compressed.v1.capex"), kTempPrebuiltDir,
         kApexDecompressedDir, kActiveApexPackagesDataDir);
     service_->recollectPreinstalledData({kTempPrebuiltDir});
-    service_->recollectDataApex(kActiveApexPackagesDataDir);
+    service_->recollectDataApex(kActiveApexPackagesDataDir,
+                                kApexDecompressedDir);
   }
 
   void TearDown() override {
     ApexServiceTest::TearDown();
-    CleanDir(kTempPrebuiltDir);
+    DeleteDirContent(kTempPrebuiltDir);
     rmdir(kTempPrebuiltDir);
-    CleanDir(kApexDecompressedDir);
-    CleanDir(kActiveApexPackagesDataDir);
+    DeleteDirContent(kApexDecompressedDir);
+    DeleteDirContent(kActiveApexPackagesDataDir);
   }
 };
 
@@ -3114,6 +3085,7 @@ TEST_F(ApexServiceTestForCompressedApex, ReserveSpaceForCompressedApex) {
 
 int main(int argc, char** argv) {
   android::base::InitLogging(argv, &android::base::StderrLogger);
+  android::base::SetMinimumLogSeverity(android::base::VERBOSE);
   ::testing::InitGoogleTest(&argc, argv);
   ::testing::UnitTest::GetInstance()->listeners().Append(
       new android::apex::LogTestToLogcat());

@@ -19,6 +19,7 @@
 
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_set>
 
@@ -197,7 +198,21 @@ class MountedApexDatabase {
     }
   }
 
-  void PopulateFromMounts();
+  inline std::optional<MountedApexData> GetLatestMountedApex(
+      const std::string& package) REQUIRES(!mounted_apexes_mutex_) {
+    std::optional<MountedApexData> ret;
+    ForallMountedApexes(package,
+                        [&ret](const MountedApexData& data, bool latest) {
+                          if (latest) {
+                            ret.emplace(data);
+                          }
+                        });
+    return ret;
+  }
+
+  void PopulateFromMounts(const std::string& active_apex_dir,
+                          const std::string& decompression_dir,
+                          const std::string& apex_hash_tree_dir);
 
   // Resets state of the database. Should only be used in testing.
   inline void Reset() REQUIRES(!mounted_apexes_mutex_) {

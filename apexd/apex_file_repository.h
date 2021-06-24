@@ -60,6 +60,22 @@ class ApexFileRepository final {
   android::base::Result<void> AddPreInstalledApex(
       const std::vector<std::string>& prebuilt_dirs);
 
+  // Populate instance by collecting host-provided apex files via
+  // |metadata_partition|. Host can provide its apexes to a VM instance via the
+  // virtual disk image which has partitions: (see
+  // /packages/modules/Virtualization/microdroid for the details)
+  //  - metadata partition(/dev/block/vd*1) should be accessed via
+  //  /dev/block/by-name/metadata.
+  //  - each subsequence partition(/dev/block/vd*{2,3,..}) represents an APEX
+  //  archive.
+  // It will fail if there is more than one apex with the same name in
+  // pre-installed and block apexes. Note: this call is **not thread safe** and
+  // is expected to be performed in a single thread during initialization of
+  // apexd. After initialization is finished, all queries to the instance are
+  // thread safe.
+  android::base::Result<void> AddBlockApex(
+      const std::string& metadata_partition);
+
   // Populate instance by collecting data apex files from the given |data_dir|.
   // Note: this call is **not thread safe** and is expected to be performed in a
   // single thread during initialization of apexd. After initialization is
@@ -105,12 +121,17 @@ class ApexFileRepository final {
   // expected to check if there is a pre-installed apex with the given name
   // using |HasPreinstalledVersion| function.
   ApexFileRef GetPreInstalledApex(const std::string& name) const;
+  // Returns a data version of apex with the given name. Caller is
+  // expected to check if there is a data apex with the given name
+  // using |HasDataVersion| function.
+  ApexFileRef GetDataApex(const std::string& name) const;
 
   // Clears ApexFileRepostiry.
   // Only use in tests.
-  void Reset() {
+  void Reset(const std::string& decompression_dir = kApexDecompressedDir) {
     pre_installed_store_.clear();
     data_store_.clear();
+    decompression_dir_ = decompression_dir;
   }
 
  private:
@@ -127,7 +148,7 @@ class ApexFileRepository final {
   std::unordered_map<std::string, ApexFile> pre_installed_store_, data_store_;
   // Decompression directory which will be used to determine if apex is
   // decompressed or not
-  const std::string decompression_dir_;
+  std::string decompression_dir_;
 };
 
 }  // namespace apex

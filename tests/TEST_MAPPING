@@ -4,9 +4,6 @@
       "name": "apex_targetprep_tests"
     },
     {
-      "name": "sdkextensions_e2e_tests"
-    },
-    {
       "name": "timezone_data_e2e_tests"
     },
     {
@@ -14,8 +11,12 @@
     }
   ],
   "presubmit-large": [
+    // TODO(b/190710217): uncomment this.
+    //{
+    //  "name": "apex_rollback_tests"
+    //},
     {
-      "name": "apex_rollback_tests"
+      "name": "sdkextensions_e2e_tests"
     },
     {
       "name": "sharedlibs_host_tests"

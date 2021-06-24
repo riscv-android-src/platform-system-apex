@@ -28,6 +28,7 @@
 #include "apex_database.h"
 #include "apex_file.h"
 #include "apex_file_repository.h"
+#include "apexd_session.h"
 
 namespace android {
 namespace apex {
@@ -40,25 +41,41 @@ namespace apex {
 // this config should do the trick.
 struct ApexdConfig {
   const char* apex_status_sysprop;
+  std::vector<std::string> apex_built_in_dirs;
   const char* active_apex_data_dir;
+  const char* decompression_dir;
+  const char* ota_reserved_dir;
+  const char* apex_hash_tree_dir;
+  const char* staged_session_dir;
+  // Overrides the path to the "metadata" partition which is by default
+  // /dev/block/by-name/metadata It should be a path pointing the first
+  // partition of the VM payload disk. So, realpath() of this path is checked if
+  // it has the suffix "1". For example, /test-dir/test-metadata-1 can be valid
+  // and the subsequent numbers should point APEX files.
+  const char* vm_payload_metadata_partition;
 };
 
-static constexpr const ApexdConfig kDefaultConfig = {
+static const ApexdConfig kDefaultConfig = {
     kApexStatusSysprop,
+    kApexPackageBuiltinDirs,
     kActiveApexPackagesDataDir,
+    kApexDecompressedDir,
+    kOtaReservedDir,
+    kApexHashTreeDir,
+    kStagedSessionsDir,
+    kVmPayloadMetadataPartition,
 };
 
 class CheckpointInterface;
 
 void SetConfig(const ApexdConfig& config);
 
+// Exposed only for testing.
+android::base::Result<void> Unmount(
+    const MountedApexDatabase::MountedApexData& data, bool deferred);
+
 android::base::Result<void> ResumeRevertIfNeeded();
 
-// Keep it for now to make otapreopt_chroot keep happy.
-// TODO(b/137086602): remove this function.
-android::base::Result<void> ScanPackagesDirAndActivate(
-    const char* apex_package_dir);
-void ScanStagedSessionsDirAndStage();
 android::base::Result<void> PreinstallPackages(
     const std::vector<std::string>& paths) WARN_UNUSED;
 android::base::Result<void> PostinstallPackages(
@@ -77,10 +94,14 @@ android::base::Result<void> MarkStagedSessionReady(const int session_id)
     WARN_UNUSED;
 android::base::Result<void> MarkStagedSessionSuccessful(const int session_id)
     WARN_UNUSED;
+// Only only of the parameters should be passed during revert
 android::base::Result<void> RevertActiveSessions(
-    const std::string& crashing_native_process);
+    const std::string& crashing_native_process,
+    const std::string& error_message);
+// Only only of the parameters should be passed during revert
 android::base::Result<void> RevertActiveSessionsAndReboot(
-    const std::string& crashing_native_process);
+    const std::string& crashing_native_process,
+    const std::string& error_message);
 
 android::base::Result<void> ActivatePackage(const std::string& full_path)
     WARN_UNUSED;
@@ -94,7 +115,6 @@ android::base::Result<ApexFile> GetActivePackage(
 std::vector<ApexFile> GetFactoryPackages();
 
 android::base::Result<void> AbortStagedSession(const int session_id);
-android::base::Result<void> AbortActiveSession();
 
 android::base::Result<void> SnapshotCeData(const int user_id,
                                            const int rollback_id,
@@ -133,9 +153,10 @@ std::vector<ApexFileRef> SelectApexForActivation(
     const std::unordered_map<std::string, std::vector<ApexFileRef>>& all_apex,
     const ApexFileRepository& instance);
 std::vector<ApexFile> ProcessCompressedApex(
-    const std::vector<ApexFileRef>& compressed_apex,
-    const std::string& decompression_dir = kApexDecompressedDir,
-    const std::string& active_apex_dir = kActiveApexPackagesDataDir);
+    const std::vector<ApexFileRef>& compressed_apex, bool is_ota_chroot);
+// Validate |apex| is same as |capex|
+android::base::Result<void> ValidateDecompressedApex(const ApexFile& capex,
+                                                     const ApexFile& apex);
 // Notifies system that apexes are activated by setting apexd.status property to
 // "activated".
 // Must only be called during boot (i.e. apexd.status is not "ready" or
@@ -146,9 +167,9 @@ void OnAllPackagesActivated(bool is_bootstrap);
 // Must only be called during boot (i.e. apexd.status is not "ready" or
 // "activated").
 void OnAllPackagesReady();
-void RemoveUnlinkedDecompressedApex(const std::string& decompression_dir,
-                                    const std::string& apex_active_dir);
 void OnBootCompleted();
+// Exposed for testing
+void RemoveInactiveDataApex();
 void BootCompletedCleanup();
 int SnapshotOrRestoreDeUserData();
 
@@ -174,14 +195,21 @@ void CollectApexInfoList(std::ostream& os,
 android::base::Result<void> ReserveSpaceForCompressedApex(
     int64_t size, const std::string& dest_dir);
 
+// Entry point when running in the VM mode (with --vm arg)
+int OnStartInVmMode();
+
 // Activates apexes in otapreot_chroot environment.
 // TODO(b/172911822): support compressed apexes.
-// TODO(b/181182967): probably also need to support flattened apexes.
-int OnOtaChrootBootstrap(
-    const std::vector<std::string>& built_in_dirs = kApexPackageBuiltinDirs,
-    const std::string& apex_data_dir = kActiveApexPackagesDataDir);
+int OnOtaChrootBootstrap();
+
+// Activates flattened apexes in otapreopt_chroot environment.
+int OnOtaChrootBootstrapFlattenedApex();
 
 android::apex::MountedApexDatabase& GetApexDatabaseForTesting();
+
+// Performs a non-staged install of an APEX specified by |package_path|.
+// TODO(ioffe): add more documentation.
+android::base::Result<ApexFile> InstallPackage(const std::string& package_path);
 
 }  // namespace apex
 }  // namespace android

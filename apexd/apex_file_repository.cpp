@@ -25,15 +25,16 @@
 #include <android-base/result.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <microdroid/metadata.h>
 
 #include "apex_constants.h"
 #include "apex_file.h"
 #include "apexd_utils.h"
 
+using android::base::EndsWith;
 using android::base::Error;
 using android::base::GetProperty;
 using android::base::Result;
-using android::base::StringPrintf;
 
 namespace android {
 namespace apex {
@@ -53,6 +54,7 @@ Result<void> ApexFileRepository::ScanBuiltInDir(const std::string& dir) {
 
   // TODO(b/179248390): scan parallelly if possible
   for (const auto& file : *all_apex_files) {
+    LOG(INFO) << "Found pre-installed APEX " << file;
     Result<ApexFile> apex_file = ApexFile::Open(file);
     if (!apex_file.ok()) {
       return Error() << "Failed to open " << file << " : " << apex_file.error();
@@ -63,15 +65,7 @@ Result<void> ApexFileRepository::ScanBuiltInDir(const std::string& dir) {
     if (it == pre_installed_store_.end()) {
       pre_installed_store_.emplace(name, std::move(*apex_file));
     } else if (it->second.GetPath() != apex_file->GetPath()) {
-      // Currently, on some -eng builds there are two art apexes on /system
-      // partition. While this issue is not fixed, exempt art apex from the
-      // duplicate check on -eng builds.
-      // TODO(b/176497601): remove this exemption once issue with duplicate art
-      // apex is resolved.
-      std::string build_type = GetProperty("ro.build.type", "");
-      auto level = build_type == "eng" && name == "com.android.art"
-                       ? base::ERROR
-                       : base::FATAL;
+      auto level = base::FATAL;
       // On some development (non-REL) builds the VNDK apex could be in /vendor.
       // When testing CTS-on-GSI on these builds, there would be two VNDK apexes
       // in the system, one in /system and one in /vendor.
@@ -109,6 +103,74 @@ android::base::Result<void> ApexFileRepository::AddPreInstalledApex(
   return {};
 }
 
+Result<void> ApexFileRepository::AddBlockApex(
+    const std::string& metadata_partition) {
+  // TODO(b/185069443) consider moving the logic to find disk_path from
+  // metadata_partition to its own library
+  LOG(INFO) << "Scanning " << metadata_partition << " for host apexes";
+  if (access(metadata_partition.c_str(), F_OK) != 0 && errno == ENOENT) {
+    LOG(WARNING) << metadata_partition << " does not exist. Skipping";
+    return {};
+  }
+
+  std::string metadata_realpath;
+  if (!android::base::Realpath(metadata_partition, &metadata_realpath)) {
+    LOG(WARNING) << "Can't get realpath of " << metadata_partition
+                 << ". Skipping";
+    return {};
+  }
+
+  std::string_view metadata_path_view(metadata_realpath);
+  if (!android::base::ConsumeSuffix(&metadata_path_view, "1")) {
+    LOG(WARNING) << metadata_realpath << " is not a first partition. Skipping";
+    return {};
+  }
+
+  const std::string disk_path(metadata_path_view);
+
+  // The first partition is "metadata".
+  auto metadata = android::microdroid::ReadMetadata(metadata_realpath);
+  if (!metadata.ok()) {
+    LOG(WARNING) << "Failed to load metadata from " << metadata_realpath
+                 << ". Skipping: " << metadata.error();
+    return {};
+  }
+
+  // subsequent partitions are APEX archives.
+  static constexpr const int kFirstApexPartition = 2;
+  for (int i = 0; i < metadata->apexes_size(); i++) {
+    const auto& apex_config = metadata->apexes(i);
+
+    const std::string apex_path =
+        disk_path + std::to_string(i + kFirstApexPartition);
+    auto apex_file = ApexFile::Open(apex_path);
+    if (!apex_file.ok()) {
+      return Error() << "Failed to open " << apex_path << " : "
+                     << apex_file.error();
+    }
+
+    // When metadata specifies the public key of the apex, it should match the
+    // bundled key. Otherwise we accept it.
+    if (apex_config.publickey() != "" &&
+        apex_config.publickey() != apex_file->GetBundledPublicKey()) {
+      return Error() << "public key doesn't match: " << apex_path;
+    }
+
+    // TODO(b/185873258): metadata in repository to verify apexes with
+    // root_digest when given.
+
+    // APEX should be unique.
+    const std::string& name = apex_file->GetManifest().name();
+    auto it = pre_installed_store_.find(name);
+    if (it != pre_installed_store_.end()) {
+      return Error() << "duplicate found in " << it->second.GetPath();
+    }
+
+    pre_installed_store_.emplace(name, std::move(*apex_file));
+  }
+  return {};
+}
+
 // TODO(b/179497746): AddDataApex should not concern with filtering out invalid
 //   apex.
 Result<void> ApexFileRepository::AddDataApex(const std::string& data_dir) {
@@ -118,14 +180,15 @@ Result<void> ApexFileRepository::AddDataApex(const std::string& data_dir) {
     return {};
   }
 
-  Result<std::vector<std::string>> all_apex_files =
+  Result<std::vector<std::string>> active_apex =
       FindFilesBySuffix(data_dir, {kApexPackageSuffix});
-  if (!all_apex_files.ok()) {
-    return all_apex_files.error();
+  if (!active_apex.ok()) {
+    return active_apex.error();
   }
 
   // TODO(b/179248390): scan parallelly if possible
-  for (const auto& file : *all_apex_files) {
+  for (const auto& file : *active_apex) {
+    LOG(INFO) << "Found updated apex " << file;
     Result<ApexFile> apex_file = ApexFile::Open(file);
     if (!apex_file.ok()) {
       LOG(ERROR) << "Failed to open " << file << " : " << apex_file.error();
@@ -147,6 +210,13 @@ Result<void> ApexFileRepository::AddDataApex(const std::string& data_dir) {
       continue;
     }
 
+    if (EndsWith(apex_file->GetPath(), kDecompressedApexPackageSuffix)) {
+      LOG(WARNING) << "Skipping " << file
+                   << " : Non-decompressed APEX should not have "
+                   << kDecompressedApexPackageSuffix << " suffix";
+      continue;
+    }
+
     auto it = data_store_.find(name);
     if (it == data_store_.end()) {
       data_store_.emplace(name, std::move(*apex_file));
@@ -158,9 +228,7 @@ Result<void> ApexFileRepository::AddDataApex(const std::string& data_dir) {
     // If multiple data apexs are preset, select the one with highest version
     bool prioritize_higher_version = new_version > existing_version;
     // For same version, non-decompressed apex gets priority
-    bool prioritize_non_decompressed =
-        (new_version == existing_version) && !IsDecompressedApex(*apex_file);
-    if (prioritize_higher_version || prioritize_non_decompressed) {
+    if (prioritize_higher_version) {
       it->second = std::move(*apex_file);
     }
   }
@@ -208,17 +276,10 @@ bool ApexFileRepository::HasDataVersion(const std::string& name) const {
   return data_store_.find(name) != data_store_.end();
 }
 
-// ApexFile is considered a decompressed APEX if it is a hard link of file in
-// |decompression_dir_| with same filename
+// ApexFile is considered a decompressed APEX if it is located in decompression
+// dir
 bool ApexFileRepository::IsDecompressedApex(const ApexFile& apex) const {
-  namespace fs = std::filesystem;
-  const std::string filename = fs::path(apex.GetPath()).filename();
-  const std::string decompressed_path =
-      StringPrintf("%s/%s", decompression_dir_.c_str(), filename.c_str());
-
-  std::error_code ec;
-  bool hard_link_exists = fs::equivalent(decompressed_path, apex.GetPath(), ec);
-  return !ec && hard_link_exists;
+  return apex.GetPath().starts_with(decompression_dir_);
 }
 
 bool ApexFileRepository::IsPreInstalledApex(const ApexFile& apex) const {
@@ -269,6 +330,12 @@ ApexFileRepository::AllApexFilesByName() const {
   }
 
   return std::move(result);
+}
+
+ApexFileRef ApexFileRepository::GetDataApex(const std::string& name) const {
+  auto it = data_store_.find(name);
+  CHECK(it != data_store_.end());
+  return std::cref(it->second);
 }
 
 ApexFileRef ApexFileRepository::GetPreInstalledApex(
