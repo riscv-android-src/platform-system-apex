@@ -28,6 +28,7 @@
 #include "apex_database.h"
 #include "apex_file.h"
 #include "apex_file_repository.h"
+#include "apexd_session.h"
 
 namespace android {
 namespace apex {
@@ -45,12 +46,13 @@ struct ApexdConfig {
   const char* decompression_dir;
   const char* ota_reserved_dir;
   const char* apex_hash_tree_dir;
-  // Overrides the path to the "signature" partition which is by default
-  // /dev/block/by-name/signature It should be a path pointing the first
+  const char* staged_session_dir;
+  // Overrides the path to the "metadata" partition which is by default
+  // /dev/block/by-name/metadata It should be a path pointing the first
   // partition of the VM payload disk. So, realpath() of this path is checked if
-  // it has the suffix "1". For example, /test-dir/test-signature-1 can be valid
+  // it has the suffix "1". For example, /test-dir/test-metadata-1 can be valid
   // and the subsequent numbers should point APEX files.
-  const char* vm_payload_signature_partition;
+  const char* vm_payload_metadata_partition;
 };
 
 static const ApexdConfig kDefaultConfig = {
@@ -60,7 +62,8 @@ static const ApexdConfig kDefaultConfig = {
     kApexDecompressedDir,
     kOtaReservedDir,
     kApexHashTreeDir,
-    kVmPayloadSignaturePartition,
+    kStagedSessionsDir,
+    kVmPayloadMetadataPartition,
 };
 
 class CheckpointInterface;
@@ -91,10 +94,14 @@ android::base::Result<void> MarkStagedSessionReady(const int session_id)
     WARN_UNUSED;
 android::base::Result<void> MarkStagedSessionSuccessful(const int session_id)
     WARN_UNUSED;
+// Only only of the parameters should be passed during revert
 android::base::Result<void> RevertActiveSessions(
-    const std::string& crashing_native_process);
+    const std::string& crashing_native_process,
+    const std::string& error_message);
+// Only only of the parameters should be passed during revert
 android::base::Result<void> RevertActiveSessionsAndReboot(
-    const std::string& crashing_native_process);
+    const std::string& crashing_native_process,
+    const std::string& error_message);
 
 android::base::Result<void> ActivatePackage(const std::string& full_path)
     WARN_UNUSED;

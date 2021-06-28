@@ -25,7 +25,7 @@
 #include <android-base/stringprintf.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include <microdroid/signature.h>
+#include <microdroid/metadata.h>
 
 #include "apex_file.h"
 #include "apex_file_repository.h"
@@ -44,8 +44,6 @@ using android::apex::testing::IsOk;
 using android::base::GetExecutableDirectory;
 using android::base::StringPrintf;
 using ::testing::ByRef;
-using ::testing::Eq;
-using ::testing::Optional;
 using ::testing::UnorderedElementsAre;
 
 static std::string GetTestDataDir() { return GetExecutableDirectory(); }
@@ -496,38 +494,6 @@ TEST(ApexFileRepositoryTest, GetPreInstalledApex) {
   ASSERT_THAT(ret, ApexFileEq(ByRef(*apex)));
 }
 
-TEST(ApexFileRepositoryTest, GetApexFileWithPath) {
-  // Prepare test data.
-  TemporaryDir built_in_dir;
-  fs::copy(GetTestFile("apex.apexd_test.apex"), built_in_dir.path);
-
-  ApexFileRepository instance;
-  ASSERT_TRUE(IsOk(instance.AddPreInstalledApex({built_in_dir.path})));
-
-  auto apex_path = StringPrintf("%s/apex.apexd_test.apex", built_in_dir.path);
-  auto apex = ApexFile::Open(apex_path);
-  ASSERT_RESULT_OK(apex);
-
-  auto ret = instance.GetApexFile(apex_path);
-  ASSERT_THAT(ret, Optional(ApexFileEq(ByRef(*apex))));
-}
-
-TEST(ApexFileRepositoryTest, GetApexFileReturnsNulloptWithUnknownPath) {
-  // Prepare test data.
-  TemporaryDir built_in_dir;
-  fs::copy(GetTestFile("apex.apexd_test.apex"), built_in_dir.path);
-
-  ApexFileRepository instance;
-  ASSERT_TRUE(IsOk(instance.AddPreInstalledApex({built_in_dir.path})));
-
-  auto apex_path = StringPrintf("%s/apex.apexd_test.apex", built_in_dir.path);
-  auto apex = ApexFile::Open(apex_path);
-  ASSERT_RESULT_OK(apex);
-
-  auto ret = instance.GetApexFile(apex_path + ".wrong");
-  ASSERT_THAT(ret, Eq(std::nullopt));
-}
-
 TEST(ApexFileRepositoryTest, GetPreInstalledApexNoSuchApexAborts) {
   ASSERT_DEATH(
       {
@@ -540,47 +506,40 @@ TEST(ApexFileRepositoryTest, GetPreInstalledApexNoSuchApexAborts) {
 struct ApexFileRepositoryTestAddBlockApex : public ::testing::Test {
   TemporaryDir test_dir;
 
-  void WriteMicrodroidSignature(const std::string& signature_path,
-                                const std::vector<std::string>& apex_paths) {
-    android::microdroid::MicrodroidSignature signature;
-    signature.set_version(1);
+  void WriteMetadata(const std::string& metadata_path,
+                     const std::vector<std::string>& apex_paths) {
+    android::microdroid::Metadata metadata;
+    metadata.set_version(1);
     for (const auto& apex_path : apex_paths) {
-      auto apex = signature.add_apexes();
+      auto apex = metadata.add_apexes();
       apex->set_name(apex_path);  // no strict rule for now; use the file_name
-      apex->set_size(GetFileSize(apex_path));
     }
-    std::ofstream out(signature_path);
-    android::microdroid::WriteMicrodroidSignature(signature, out);
-  }
-  size_t GetFileSize(const std::string& file_name) {
-    struct stat st;
-    CHECK(stat(file_name.c_str(), &st) == 0);
-    return st.st_size;
+    std::ofstream out(metadata_path);
+    android::microdroid::WriteMetadata(metadata, out);
   }
 };
 
 TEST_F(ApexFileRepositoryTestAddBlockApex,
        ScansPayloadDisksAndAddApexFilesToPreInstalled) {
   // prepare payload disk
-  //  <test-dir>/vdc1 : signature
+  //  <test-dir>/vdc1 : metadata
   //            /vdc2 : apex.apexd_test.apex
   //            /vdc3 : apex.apexd_test_different_app.apex
 
   const auto& test_apex_foo = GetTestFile("apex.apexd_test.apex");
   const auto& test_apex_bar = GetTestFile("apex.apexd_test_different_app.apex");
 
-  const std::string signature_partition_path = test_dir.path + "/vdc1"s;
+  const std::string metadata_partition_path = test_dir.path + "/vdc1"s;
   const std::string apex_foo_path = test_dir.path + "/vdc2"s;
   const std::string apex_bar_path = test_dir.path + "/vdc3"s;
 
-  WriteMicrodroidSignature(signature_partition_path,
-                           {test_apex_foo, test_apex_bar});
-  fs::copy(test_apex_foo, apex_foo_path);
-  fs::copy(test_apex_bar, apex_bar_path);
+  WriteMetadata(metadata_partition_path, {test_apex_foo, test_apex_bar});
+  auto loop_device1 = WriteBlockApex(test_apex_foo, apex_foo_path);
+  auto loop_device2 = WriteBlockApex(test_apex_bar, apex_bar_path);
 
   // call ApexFileRepository::AddBlockApex()
   ApexFileRepository instance;
-  auto status = instance.AddBlockApex(signature_partition_path);
+  auto status = instance.AddBlockApex(metadata_partition_path);
   ASSERT_RESULT_OK(status);
 
   // "block" apexes are treated as "pre-installed"
@@ -597,27 +556,27 @@ TEST_F(ApexFileRepositoryTestAddBlockApex,
 }
 
 TEST_F(ApexFileRepositoryTestAddBlockApex,
-       ScansOnlySpecifiedInSignaturePartition) {
+       ScansOnlySpecifiedInMetadataPartition) {
   // prepare payload disk
-  //  <test-dir>/vdc1 : signature with apex.apexd_test.apex only
+  //  <test-dir>/vdc1 : metadata with apex.apexd_test.apex only
   //            /vdc2 : apex.apexd_test.apex
   //            /vdc3 : apex.apexd_test_different_app.apex
 
   const auto& test_apex_foo = GetTestFile("apex.apexd_test.apex");
   const auto& test_apex_bar = GetTestFile("apex.apexd_test_different_app.apex");
 
-  const std::string signature_partition_path = test_dir.path + "/vdc1"s;
+  const std::string metadata_partition_path = test_dir.path + "/vdc1"s;
   const std::string apex_foo_path = test_dir.path + "/vdc2"s;
   const std::string apex_bar_path = test_dir.path + "/vdc3"s;
 
-  // signature lists only "foo"
-  WriteMicrodroidSignature(signature_partition_path, {test_apex_foo});
-  fs::copy(test_apex_foo, apex_foo_path);
-  fs::copy(test_apex_bar, apex_bar_path);
+  // metadata lists only "foo"
+  WriteMetadata(metadata_partition_path, {test_apex_foo});
+  auto loop_device1 = WriteBlockApex(test_apex_foo, apex_foo_path);
+  auto loop_device2 = WriteBlockApex(test_apex_bar, apex_bar_path);
 
   // call ApexFileRepository::AddBlockApex()
   ApexFileRepository instance;
-  auto status = instance.AddBlockApex(signature_partition_path);
+  auto status = instance.AddBlockApex(metadata_partition_path);
   ASSERT_RESULT_OK(status);
 
   // foo is added, but bar is not
@@ -631,26 +590,25 @@ TEST_F(ApexFileRepositoryTestAddBlockApex,
 
 TEST_F(ApexFileRepositoryTestAddBlockApex, FailsWhenTheresDuplicateNames) {
   // prepare payload disk
-  //  <test-dir>/vdc1 : signature with apex.apexd_test.apex only
+  //  <test-dir>/vdc1 : metadata with apex.apexd_test.apex only
   //            /vdc2 : apex.apexd_test.apex
   //            /vdc3 : apex.apexd_test_v2.apex
 
   const auto& test_apex_foo = GetTestFile("apex.apexd_test.apex");
   const auto& test_apex_bar = GetTestFile("apex.apexd_test_v2.apex");
 
-  const std::string signature_partition_path = test_dir.path + "/vdc1"s;
+  const std::string metadata_partition_path = test_dir.path + "/vdc1"s;
   const std::string apex_foo_path = test_dir.path + "/vdc2"s;
   const std::string apex_bar_path = test_dir.path + "/vdc3"s;
 
-  // signature lists only "foo"
-  WriteMicrodroidSignature(signature_partition_path,
-                           {test_apex_foo, test_apex_bar});
-  fs::copy(test_apex_foo, apex_foo_path);
-  fs::copy(test_apex_bar, apex_bar_path);
+  // metadata lists only "foo"
+  WriteMetadata(metadata_partition_path, {test_apex_foo, test_apex_bar});
+  auto loop_device1 = WriteBlockApex(test_apex_foo, apex_foo_path);
+  auto loop_device2 = WriteBlockApex(test_apex_bar, apex_bar_path);
 
   // call ApexFileRepository::AddBlockApex()
   ApexFileRepository instance;
-  auto status = instance.AddBlockApex(signature_partition_path);
+  auto status = instance.AddBlockApex(metadata_partition_path);
   ASSERT_FALSE(IsOk(status));
 }
 
