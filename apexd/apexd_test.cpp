@@ -24,6 +24,7 @@
 #include <android-base/stringprintf.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <libdm/dm.h>
 #include <microdroid/metadata.h>
 
 #include "apex_database.h"
@@ -55,6 +56,7 @@ using android::base::Result;
 using android::base::StringPrintf;
 using android::base::unique_fd;
 using android::base::WriteStringToFile;
+using android::dm::DeviceMapper;
 using com::android::apex::testing::ApexInfoXmlEq;
 using ::testing::ByRef;
 using ::testing::HasSubstr;
@@ -96,8 +98,10 @@ class ApexdUnitTest : public ::testing::Test {
     ota_reserved_dir_ = StringPrintf("%s/ota-reserved", td_.path);
     hash_tree_dir_ = StringPrintf("%s/apex-hash-tree", td_.path);
     staged_session_dir_ = StringPrintf("%s/staged-session-dir", td_.path);
-    vm_payload_metadata_path_ =
-        StringPrintf("%s/vm-payload-1", td_.path);  // should end with 1
+
+    vm_payload_disk_ = StringPrintf("%s/vm-payload", td_.path);
+    vm_payload_metadata_path_ = vm_payload_disk_ + "1";
+
     config_ = {kTestApexdStatusSysprop,     {built_in_dir_},
                data_dir_.c_str(),           decompression_dir_.c_str(),
                ota_reserved_dir_.c_str(),   hash_tree_dir_.c_str(),
@@ -143,7 +147,7 @@ class ApexdUnitTest : public ::testing::Test {
 
   std::string AddBlockApex(const std::string& apex_name,
                            std::optional<std::string> pubkey = std::nullopt) {
-    auto apex_path = StringPrintf("%s/vm-payload-2", td_.path);
+    auto apex_path = vm_payload_disk_ + "2";  // second partition
     auto apex_file = GetTestFile(apex_name);
     WriteMetadata(apex_file, std::move(pubkey));
     // loop_devices_ will be disposed after each test
@@ -214,6 +218,7 @@ class ApexdUnitTest : public ::testing::Test {
   std::string decompression_dir_;
   std::string ota_reserved_dir_;
   std::string hash_tree_dir_;
+  std::string vm_payload_disk_;
   std::string vm_payload_metadata_path_;
   std::string staged_session_dir_;
   ApexdConfig config_;
@@ -680,19 +685,33 @@ TEST_F(ApexdUnitTest, ReserveSpaceForCompressedApexDeallocateIfPassedZero) {
   ASSERT_EQ(files->size(), 0u);
 }
 
-TEST_F(ApexdUnitTest, ReserveSpaceForCapexCleansOtaApexIfPassedZero) {
+TEST_F(ApexdUnitTest, ReserveSpaceForCapexCleansOtaApex) {
   TemporaryDir dest_dir;
 
-  // Create an ota_apex first
   auto ota_apex_path = StringPrintf(
       "%s/ota_apex%s", GetDecompressionDir().c_str(), kOtaApexPackageSuffix);
-  fs::copy(GetTestFile("com.android.apex.compressed.v1_original.apex"),
-           ota_apex_path);
+  auto create_ota_apex = [&]() {
+    // Create an ota_apex first
+    fs::copy(GetTestFile("com.android.apex.compressed.v1_original.apex"),
+             ota_apex_path);
+    auto path_exists = PathExists(ota_apex_path);
+    ASSERT_TRUE(*path_exists);
+  };
+  create_ota_apex();
+
+  // Should not delete the reserved file if size passed is negative
+  ASSERT_FALSE(IsOk(ReserveSpaceForCompressedApex(-1, dest_dir.path)));
   auto path_exists = PathExists(ota_apex_path);
   ASSERT_TRUE(*path_exists);
 
   // Should delete the reserved file if size passed is 0
   ASSERT_TRUE(IsOk(ReserveSpaceForCompressedApex(0, dest_dir.path)));
+  path_exists = PathExists(ota_apex_path);
+  ASSERT_FALSE(*path_exists);
+
+  create_ota_apex();
+  // Should delete the reserved file if size passed is positive
+  ASSERT_TRUE(IsOk(ReserveSpaceForCompressedApex(10, dest_dir.path)));
   path_exists = PathExists(ota_apex_path);
   ASSERT_FALSE(*path_exists);
 }
@@ -2822,7 +2841,7 @@ TEST_F(ApexdMountTest, OnStartOnlyPreInstalledCapexes) {
                            ASSERT_TRUE(latest);
                            ASSERT_EQ(data.full_path, decompressed_active_apex);
                            ASSERT_EQ(data.device_name,
-                                     "com.android.apex.compressed@1");
+                                     "com.android.apex.compressed");
                          });
 }
 
@@ -2854,7 +2873,7 @@ TEST_F(ApexdMountTest, OnStartDataHasHigherVersionThanCapex) {
                            ASSERT_TRUE(latest);
                            ASSERT_EQ(data.full_path, apex_path_2);
                            ASSERT_EQ(data.device_name,
-                                     "com.android.apex.compressed@2");
+                                     "com.android.apex.compressed");
                          });
 }
 
@@ -2888,7 +2907,7 @@ TEST_F(ApexdMountTest, OnStartDataHasSameVersionAsCapex) {
                            ASSERT_TRUE(latest);
                            ASSERT_EQ(data.full_path, apex_path_2);
                            ASSERT_EQ(data.device_name,
-                                     "com.android.apex.compressed@1");
+                                     "com.android.apex.compressed");
                          });
 }
 
@@ -2925,7 +2944,7 @@ TEST_F(ApexdMountTest, OnStartSystemHasHigherVersionCapexThanData) {
                            ASSERT_TRUE(latest);
                            ASSERT_EQ(data.full_path, decompressed_active_apex);
                            ASSERT_EQ(data.device_name,
-                                     "com.android.apex.compressed@2");
+                                     "com.android.apex.compressed");
                          });
 }
 
@@ -2961,7 +2980,7 @@ TEST_F(ApexdMountTest, OnStartFailsToActivateApexOnDataFallsBackToCapex) {
                            ASSERT_TRUE(latest);
                            ASSERT_EQ(data.full_path, decompressed_active_apex);
                            ASSERT_EQ(data.device_name,
-                                     "com.android.apex.compressed@1");
+                                     "com.android.apex.compressed");
                          });
 }
 
@@ -2998,7 +3017,7 @@ TEST_F(ApexdMountTest, OnStartFallbackToAlreadyDecompressedCapex) {
                            ASSERT_TRUE(latest);
                            ASSERT_EQ(data.full_path, decompressed_active_apex);
                            ASSERT_EQ(data.device_name,
-                                     "com.android.apex.compressed@1");
+                                     "com.android.apex.compressed");
                          });
 }
 
@@ -3038,7 +3057,7 @@ TEST_F(ApexdMountTest, OnStartFallbackToCapexSameVersion) {
                            ASSERT_TRUE(latest);
                            ASSERT_EQ(data.full_path, decompressed_active_apex);
                            ASSERT_EQ(data.device_name,
-                                     "com.android.apex.compressed@2");
+                                     "com.android.apex.compressed");
                          });
 }
 
@@ -3146,7 +3165,7 @@ TEST_F(ApexdMountTest, OnStartDecompressedApexVersionDifferentThanCapex) {
                            ASSERT_TRUE(latest);
                            ASSERT_EQ(data.full_path, decompressed_active_apex);
                            ASSERT_EQ(data.device_name,
-                                     "com.android.apex.compressed@1");
+                                     "com.android.apex.compressed");
                          });
 }
 
@@ -3618,6 +3637,24 @@ TEST_F(ApexActivationFailureTests, ActivatePackageImplFails) {
               HasSubstr("Failed to activate packages"));
   ASSERT_THAT(apex_session->GetErrorMessage(),
               HasSubstr("has unexpected SHA512 hash"));
+}
+
+TEST_F(ApexdMountTest, OnBootstrapCreatesEmptyDmDevices) {
+  AddPreInstalledApex("apex.apexd_test.apex");
+  AddPreInstalledApex("com.android.apex.compressed.v1.capex");
+
+  DeviceMapper& dm = DeviceMapper::Instance();
+
+  auto cleaner = make_scope_guard([&]() {
+    dm.DeleteDevice("com.android.apex.test_package", 1s);
+    dm.DeleteDevice("com.android.apex.compressed", 1s);
+  });
+
+  ASSERT_EQ(0, OnBootstrap());
+
+  std::string ignored;
+  ASSERT_TRUE(dm.WaitForDevice("com.android.apex.test_package", 1s, &ignored));
+  ASSERT_TRUE(dm.WaitForDevice("com.android.apex.compressed", 1s, &ignored));
 }
 
 }  // namespace apex
