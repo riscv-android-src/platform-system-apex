@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#define ATRACE_TAG ATRACE_TAG_PACKAGE_MANAGER
+
 #include "apexd.h"
 #include "apex_file_repository.h"
 #include "apexd_private.h"
@@ -50,6 +52,7 @@
 #include <libdm/dm_table.h>
 #include <libdm/dm_target.h>
 #include <selinux/android.h>
+#include <utils/Trace.h>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -319,6 +322,7 @@ Result<DmVerityDevice> CreateVerityDevice(
 Result<DmVerityDevice> CreateVerityDevice(const std::string& name,
                                           const DmTable& table,
                                           bool reuse_device) {
+  ATRACE_NAME("CreateVerityDevice");
   LOG(VERBOSE) << "Creating verity device " << name;
   auto timeout = std::chrono::milliseconds(
       android::sysprop::ApexProperties::dm_create_timeout().value_or(1000));
@@ -460,6 +464,8 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
                                          const std::string& hashtree_file,
                                          bool verify_image, bool reuse_device,
                                          bool temp_mount = false) {
+  auto tag = "MountPackageImpl: " + apex.GetManifest().name();
+  ATRACE_NAME(tag.c_str());
   if (apex.IsCompressed()) {
     return Error() << "Cannot directly mount compressed APEX "
                    << apex.GetPath();
@@ -1266,6 +1272,7 @@ bool IsValidPackageName(const std::string& package_name) {
 Result<void> ActivatePackageImpl(const ApexFile& apex_file,
                                  const std::string& device_name,
                                  bool reuse_device) {
+  ATRACE_NAME("ActivatePackageImpl");
   const ApexManifest& manifest = apex_file.GetManifest();
 
   if (!IsValidPackageName(manifest.name())) {
@@ -1571,6 +1578,7 @@ enum ActivationMode { kBootstrapMode = 0, kBootMode, kOtaChrootMode, kVmMode };
 std::vector<Result<void>> ActivateApexWorker(
     ActivationMode mode, std::queue<const ApexFile*>& apex_queue,
     std::mutex& mutex) {
+  ATRACE_NAME("ActivateApexWorker");
   std::vector<Result<void>> ret;
 
   while (true) {
@@ -1606,6 +1614,7 @@ std::vector<Result<void>> ActivateApexWorker(
 
 Result<void> ActivateApexPackages(const std::vector<ApexFileRef>& apexes,
                                   ActivationMode mode) {
+  ATRACE_NAME("ActivateApexPackages");
   std::queue<const ApexFile*> apex_queue;
   std::mutex apex_queue_mutex;
 
@@ -2354,6 +2363,7 @@ Result<void> CreateSharedLibsApexDir() {
 }
 
 int OnBootstrap() {
+  ATRACE_NAME("OnBootstrap");
   auto time_started = boot_clock::now();
   Result<void> pre_allocate = PreAllocateLoopDevices();
   if (!pre_allocate.ok()) {
@@ -2735,6 +2745,7 @@ Result<void> ValidateDecompressedApex(const ApexFile& capex,
 }
 
 void OnStart() {
+  ATRACE_NAME("OnStart");
   LOG(INFO) << "Marking APEXd as starting";
   auto time_started = boot_clock::now();
   if (!SetProperty(gConfig->apex_status_sysprop, kApexStatusStarting)) {
@@ -3184,10 +3195,18 @@ void CollectApexInfoList(std::ostream& os,
     if (preinstalled_path.ok()) {
       preinstalled_module_path = *preinstalled_path;
     }
+
+    std::optional<int64_t> mtime;
+    struct stat stat_buf;
+    if (stat(apex.GetPath().c_str(), &stat_buf) == 0) {
+      mtime.emplace(stat_buf.st_mtime);
+    } else {
+      PLOG(WARNING) << "Failed to stat " << apex.GetPath();
+    }
     com::android::apex::ApexInfo apex_info(
         apex.GetManifest().name(), apex.GetPath(), preinstalled_module_path,
         apex.GetManifest().version(), apex.GetManifest().versionname(),
-        instance.IsPreInstalledApex(apex), is_active);
+        instance.IsPreInstalledApex(apex), is_active, mtime);
     apex_infos.emplace_back(apex_info);
   };
   for (const auto& apex : active_apexs) {
@@ -3451,7 +3470,8 @@ int OnOtaChrootBootstrapFlattenedApex() {
                               /* preinstalledModulePath= */ apex_dir,
                               /* versionCode= */ manifest->version(),
                               /* versionName= */ manifest->versionname(),
-                              /* isFactory= */ true, /* isActive= */ true);
+                              /* isFactory= */ true, /* isActive= */ true,
+                              /* lastUpdateMillis= */ 0);
     }
   }
 
