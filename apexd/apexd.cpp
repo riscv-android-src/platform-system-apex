@@ -1785,7 +1785,7 @@ void SnapshotOrRestoreDeIfNeeded(const std::string& base_dir,
     }
   } else if (session.IsRollback()) {
     for (const auto& apex_name : session.GetApexNames()) {
-      if (!gInFsCheckpointMode) {
+      if (!gSupportsFsCheckpoints) {
         // Snapshot before restore so this rollback can be reverted.
         SnapshotDataDirectory(base_dir, session.GetRollbackId(), apex_name,
                               true /* pre_restore */);
@@ -2004,6 +2004,17 @@ void ScanStagedSessionsDirAndStage() {
     std::string build_fingerprint = GetProperty(kBuildFingerprintSysprop, "");
     if (session.GetBuildFingerprint().compare(build_fingerprint) != 0) {
       auto error_message = "APEX build fingerprint has changed";
+      LOG(ERROR) << error_message;
+      session.SetErrorMessage(error_message);
+      continue;
+    }
+
+    // If device supports fs-checkpoint, then apex session should only be
+    // installed when in checkpoint-mode. Otherwise, we will not be able to
+    // revert /data on error.
+    if (gSupportsFsCheckpoints && !gInFsCheckpointMode) {
+      auto error_message =
+          "Cannot install apex session if not in fs-checkpoint mode";
       LOG(ERROR) << error_message;
       session.SetErrorMessage(error_message);
       continue;
@@ -2279,7 +2290,7 @@ Result<void> RevertActiveSessions(const std::string& crashing_native_process,
     }
   }
 
-  if (!gInFsCheckpointMode) {
+  if (!gSupportsFsCheckpoints) {
     auto restore_status = RestoreActivePackages();
     if (!restore_status.ok()) {
       for (auto& session : active_sessions) {
@@ -2297,7 +2308,7 @@ Result<void> RevertActiveSessions(const std::string& crashing_native_process,
   }
 
   for (auto& session : active_sessions) {
-    if (!gInFsCheckpointMode && session.IsRollback()) {
+    if (!gSupportsFsCheckpoints && session.IsRollback()) {
       // If snapshots have already been restored, undo that by restoring the
       // pre-restore snapshot.
       RestoreDePreRestoreSnapshotsIfPresent(session);
@@ -2993,7 +3004,7 @@ Result<void> MarkStagedSessionSuccessful(const int session_id) {
       return Error() << "Failed to mark session " << *session
                      << " as successful : " << cleanup_status.error();
     }
-    if (session->IsRollback() && !gInFsCheckpointMode) {
+    if (session->IsRollback() && !gSupportsFsCheckpoints) {
       DeleteDePreRestoreSnapshots(*session);
     }
     return session->UpdateStateAndCommit(SessionState::SUCCESS);
