@@ -505,8 +505,10 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   }
   loop::LoopbackDeviceUniqueFd loopback_device;
   for (size_t attempts = 1;; ++attempts) {
-    Result<loop::LoopbackDeviceUniqueFd> ret = loop::CreateLoopDevice(
-        full_path, apex.GetImageOffset().value(), apex.GetImageSize().value());
+    Result<loop::LoopbackDeviceUniqueFd> ret =
+        loop::CreateAndConfigureLoopDevice(full_path,
+                                           apex.GetImageOffset().value(),
+                                           apex.GetImageSize().value());
     if (ret.ok()) {
       loopback_device = std::move(*ret);
       break;
@@ -552,7 +554,10 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
           !st.ok()) {
         return st.error();
       }
-      auto create_loop_status = loop::CreateLoopDevice(hashtree_file, 0, 0);
+      auto create_loop_status =
+          loop::CreateAndConfigureLoopDevice(hashtree_file,
+                                             /* image_offset= */ 0,
+                                             /* image_size= */ 0);
       if (!create_loop_status.ok()) {
         return create_loop_status.error();
       }
@@ -1405,6 +1410,46 @@ Result<void> DeactivatePackage(const std::string& full_path) {
 
   return UnmountPackage(*apex_file, /* allow_latest= */ true,
                         /* deferred= */ false);
+}
+
+Result<std::vector<ApexFile>> GetStagedApexFiles(
+    int session_id, const std::vector<int>& child_session_ids) {
+  auto session = ApexSession::GetSession(session_id);
+  if (!session.ok()) {
+    return session.error();
+  }
+  // We should only accept sessions in SessionState::STAGED state
+  auto session_state = (*session).GetState();
+  if (session_state != SessionState::STAGED) {
+    return Error() << "Session " << session_id << " is not in state STAGED";
+  }
+
+  std::vector<int> ids_to_scan;
+  if (!child_session_ids.empty()) {
+    ids_to_scan = child_session_ids;
+  } else {
+    ids_to_scan = {session_id};
+  }
+
+  // Find apex files in the staging directory
+  std::vector<std::string> apex_file_paths;
+  for (int id_to_scan : ids_to_scan) {
+    std::string session_dir_path = std::string(gConfig->staged_session_dir) +
+                                   "/session_" + std::to_string(id_to_scan);
+    Result<std::vector<std::string>> scan =
+        FindFilesBySuffix(session_dir_path, {kApexPackageSuffix});
+    if (!scan.ok()) {
+      return scan.error();
+    }
+    if (scan->size() != 1) {
+      return Error() << "Expected exactly one APEX file in directory "
+                     << session_dir_path << ". Found: " << scan->size();
+    }
+    std::string& apex_file_path = (*scan)[0];
+    apex_file_paths.push_back(std::move(apex_file_path));
+  }
+
+  return OpenApexFiles(apex_file_paths);
 }
 
 std::vector<ApexFile> GetActivePackages() {
@@ -3187,9 +3232,9 @@ Result<void> RemountPackages() {
 }
 
 // Given a single new APEX incoming via OTA, should we allocate space for it?
-Result<bool> ShouldAllocateSpaceForDecompression(
-    const std::string& new_apex_name, const int64_t new_apex_version,
-    const ApexFileRepository& instance) {
+bool ShouldAllocateSpaceForDecompression(const std::string& new_apex_name,
+                                         const int64_t new_apex_version,
+                                         const ApexFileRepository& instance) {
   // An apex at most will have two versions on device: pre-installed and data.
 
   // Check if there is a pre-installed version for the new apex.
@@ -3226,6 +3271,24 @@ Result<bool> ShouldAllocateSpaceForDecompression(
   const int64_t data_version = data_apex.get().GetManifest().version();
   // We only decompress the new_apex if it has higher version than data apex.
   return new_apex_version > data_version;
+}
+
+int64_t CalculateSizeForCompressedApex(
+    const std::vector<std::tuple<std::string, int64_t, int64_t>>&
+        compressed_apexes,
+    const ApexFileRepository& instance) {
+  int64_t result = 0;
+  for (const auto& compressed_apex : compressed_apexes) {
+    std::string module_name;
+    int64_t version_code;
+    int64_t decompressed_size;
+    std::tie(module_name, version_code, decompressed_size) = compressed_apex;
+    if (ShouldAllocateSpaceForDecompression(module_name, version_code,
+                                            instance)) {
+      result += decompressed_size;
+    }
+  }
+  return result;
 }
 
 void CollectApexInfoList(std::ostream& os,
