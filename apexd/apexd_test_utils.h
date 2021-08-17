@@ -17,7 +17,6 @@
 #include <filesystem>
 #include <fstream>
 
-#include <asm-generic/errno-base.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <linux/loop.h>
@@ -34,6 +33,8 @@
 #include <android/apex/ApexInfo.h>
 #include <android/apex/ApexSessionInfo.h>
 #include <binder/IServiceManager.h>
+#include <fstab/fstab.h>
+#include <libdm/dm.h>
 #include <selinux/android.h>
 
 #include "apex_file.h"
@@ -43,19 +44,9 @@
 
 #include "com_android_apex.h"
 
-using android::base::Error;
-using android::base::Result;
-using apex::proto::SessionState;
-
 namespace android {
 namespace apex {
 namespace testing {
-
-using ::testing::AllOf;
-using ::testing::Eq;
-using ::testing::ExplainMatchResult;
-using ::testing::Field;
-using ::testing::Property;
 
 template <typename T>
 inline ::testing::AssertionResult IsOk(const android::base::Result<T>& result) {
@@ -76,6 +67,10 @@ inline ::testing::AssertionResult IsOk(const android::binder::Status& status) {
 }
 
 MATCHER_P(SessionInfoEq, other, "") {
+  using ::testing::AllOf;
+  using ::testing::Eq;
+  using ::testing::Field;
+
   return ExplainMatchResult(
       AllOf(
           Field("sessionId", &ApexSessionInfo::sessionId, Eq(other.sessionId)),
@@ -98,6 +93,10 @@ MATCHER_P(SessionInfoEq, other, "") {
 }
 
 MATCHER_P(ApexInfoEq, other, "") {
+  using ::testing::AllOf;
+  using ::testing::Eq;
+  using ::testing::Field;
+
   return ExplainMatchResult(
       AllOf(Field("moduleName", &ApexInfo::moduleName, Eq(other.moduleName)),
             Field("modulePath", &ApexInfo::modulePath, Eq(other.modulePath)),
@@ -110,6 +109,10 @@ MATCHER_P(ApexInfoEq, other, "") {
 }
 
 MATCHER_P(ApexFileEq, other, "") {
+  using ::testing::AllOf;
+  using ::testing::Eq;
+  using ::testing::Property;
+
   return ExplainMatchResult(
       AllOf(Property("path", &ApexFile::GetPath, Eq(other.get().GetPath())),
             Property("image_offset", &ApexFile::GetImageOffset,
@@ -168,13 +171,13 @@ inline void PrintTo(const ApexInfo& apex, std::ostream* os) {
   *os << "}";
 }
 
-inline Result<bool> CompareFiles(const std::string& filename1,
-                                 const std::string& filename2) {
+inline android::base::Result<bool> CompareFiles(const std::string& filename1,
+                                                const std::string& filename2) {
   std::ifstream file1(filename1, std::ios::binary);
   std::ifstream file2(filename2, std::ios::binary);
 
   if (file1.bad() || file2.bad()) {
-    return Error() << "Could not open one of the file";
+    return android::base::Error() << "Could not open one of the file";
   }
 
   std::istreambuf_iterator<char> begin1(file1);
@@ -301,7 +304,7 @@ inline android::base::Result<void> SetUpApexTestEnvironment() {
   // Just in case, run restorecon -R on /apex.
   if (selinux_android_restorecon("/apex", SELINUX_ANDROID_RESTORECON_RECURSE) <
       0) {
-    return android::base::ErrnoError() << "Failed to restorecon /apex";
+    return ErrnoError() << "Failed to restorecon /apex";
   }
 
   return {};
@@ -354,32 +357,83 @@ inline base::Result<loop::LoopbackDeviceUniqueFd> MountViaLoopDevice(
   return loop_device;
 }
 
-inline size_t AlignSizeToBlock(size_t size) {
-  static constexpr int kBlockSize = 4096;
-  return (size + kBlockSize - 1) / kBlockSize * kBlockSize;
-}
-
 inline base::Result<loop::LoopbackDeviceUniqueFd> WriteBlockApex(
     const std::string& apex_file, const std::string& apex_path) {
   std::string intermediate_path = apex_path + ".intermediate";
-  std::ofstream out(intermediate_path);
-
-  // copy
-  std::ifstream in(apex_file, std::ios::binary);
-  out << in.rdbuf();
-  in.close();
-
-  // padding
-  size_t size = out.tellp();
-  size_t total_size = AlignSizeToBlock(size + 4);  // 4 for size suffix
-  out << std::string(total_size - size - 4, '\0');
-
-  // size at the end
-  uint32_t be_size = htobe32(static_cast<uint32_t>(size));
-  out.write(reinterpret_cast<const char*>(&be_size), sizeof(be_size));
-  out.close();
-
+  std::filesystem::copy(apex_file, intermediate_path);
   return MountViaLoopDevice(intermediate_path, apex_path);
+}
+
+inline android::base::Result<std::string> GetBlockDeviceForApex(
+    const std::string& package_id) {
+  using android::fs_mgr::Fstab;
+  using android::fs_mgr::GetEntryForMountPoint;
+  using android::fs_mgr::ReadFstabFromFile;
+
+  std::string mount_point = std::string(kApexRoot) + "/" + package_id;
+  Fstab fstab;
+  if (!ReadFstabFromFile("/proc/mounts", &fstab)) {
+    return android::base::Error() << "Failed to read /proc/mounts";
+  }
+  auto entry = GetEntryForMountPoint(&fstab, mount_point);
+  if (entry == nullptr) {
+    return android::base::Error()
+           << "Can't find " << mount_point << " in /proc/mounts";
+  }
+  return entry->blk_device;
+}
+
+inline android::base::Result<void> ReadDevice(const std::string& block_device) {
+  static constexpr int kBlockSize = 4096;
+  static constexpr size_t kBufSize = 1024 * kBlockSize;
+  std::vector<uint8_t> buffer(kBufSize);
+
+  android::base::unique_fd fd(
+      TEMP_FAILURE_RETRY(open(block_device.c_str(), O_RDONLY | O_CLOEXEC)));
+  if (fd.get() == -1) {
+    return android::base::ErrnoError() << "Can't open " << block_device;
+  }
+
+  while (true) {
+    int n = read(fd.get(), buffer.data(), kBufSize);
+    if (n < 0) {
+      return android::base::ErrnoError() << "Failed to read " << block_device;
+    }
+    if (n == 0) {
+      break;
+    }
+  }
+  return {};
+}
+
+inline android::base::Result<std::vector<std::string>> ListChildLoopDevices(
+    const std::string& name) {
+  using android::base::Error;
+  using android::dm::DeviceMapper;
+
+  DeviceMapper& dm = DeviceMapper::Instance();
+  std::string dm_path;
+  if (!dm.GetDmDevicePathByName(name, &dm_path)) {
+    return Error() << "Failed to get path of dm device " << name;
+  }
+  // It's a little bit sad we can't use ConsumePrefix here :(
+  constexpr std::string_view kDevPrefix = "/dev/";
+  if (!android::base::StartsWith(dm_path, kDevPrefix)) {
+    return Error() << "Illegal path " << dm_path;
+  }
+  dm_path = dm_path.substr(kDevPrefix.length());
+  std::vector<std::string> children;
+  std::string dir = "/sys/" + dm_path + "/slaves";
+  auto status = WalkDir(dir, [&](const auto& entry) {
+    std::error_code ec;
+    if (entry.is_symlink(ec)) {
+      children.push_back("/dev/block/" + entry.path().filename().string());
+    }
+  });
+  if (!status.ok()) {
+    return status.error();
+  }
+  return children;
 }
 
 }  // namespace apex

@@ -25,7 +25,6 @@
 #include <fstream>
 #include <span>
 
-#include <android-base/endian.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/scopeguard.h>
@@ -63,7 +62,7 @@ struct FsMagic {
 constexpr const FsMagic kFsType[] = {{"f2fs", 1024, 4, "\x10\x20\xf5\xf2"},
                                      {"ext4", 1024 + 0x38, 2, "\123\357"}};
 
-Result<std::string> RetrieveFsType(borrowed_fd fd, int32_t image_offset) {
+Result<std::string> RetrieveFsType(borrowed_fd fd, uint32_t image_offset) {
   for (const auto& fs : kFsType) {
     char buf[fs.len];
     if (!ReadFullyAtOffset(fd, buf, fs.len, image_offset + fs.offset)) {
@@ -76,32 +75,10 @@ Result<std::string> RetrieveFsType(borrowed_fd fd, int32_t image_offset) {
   return Error() << "Couldn't find filesystem magic";
 }
 
-Result<uint32_t> GetApexFileSize(borrowed_fd fd) {
-  struct stat st;
-  if (fstat(fd.get(), &st) != 0) {
-    return ErrnoError() << "fstat() failed.";
-  }
-  if (S_ISREG(st.st_mode)) {
-    return static_cast<uint32_t>(st.st_size);
-  }
-  // The size of a "block" apex is at the end of it.
-  if (S_ISBLK(st.st_mode)) {
-    uint32_t file_size = 0;
-    if (lseek(fd.get(), -sizeof(file_size), SEEK_END) == -1) {
-      return ErrnoError() << "lseek() failed.";
-    }
-    if (read(fd.get(), &file_size, sizeof(file_size)) == -1) {
-      return ErrnoError() << "read() failed";
-    }
-    return betoh32(file_size);
-  }
-  return Error() << "Unknown file type: " << st.st_mode;
-}
-
 }  // namespace
 
 Result<ApexFile> ApexFile::Open(const std::string& path) {
-  std::optional<int32_t> image_offset;
+  std::optional<uint32_t> image_offset;
   std::optional<size_t> image_size;
   std::string manifest_content;
   std::string pubkey;
@@ -114,16 +91,11 @@ Result<ApexFile> ApexFile::Open(const std::string& path) {
                         << "I/O error";
   }
 
-  auto size = GetApexFileSize(fd);
-  if (!size.ok()) {
-    return size.error();
-  }
-
   ZipArchiveHandle handle;
   auto handle_guard =
       android::base::make_scope_guard([&handle] { CloseArchive(handle); });
-  int ret = OpenArchiveFdRange(fd.get(), path.c_str(), &handle, *size,
-                               /*offset=*/0, /*assume_ownership=*/false);
+  int ret = OpenArchiveFd(fd.get(), path.c_str(), &handle,
+                          /*assume_ownership=*/false);
   if (ret < 0) {
     return Error() << "Failed to open package " << path << ": "
                    << ErrorCodeString(ret);

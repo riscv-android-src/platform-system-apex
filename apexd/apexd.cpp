@@ -505,8 +505,10 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   }
   loop::LoopbackDeviceUniqueFd loopback_device;
   for (size_t attempts = 1;; ++attempts) {
-    Result<loop::LoopbackDeviceUniqueFd> ret = loop::CreateLoopDevice(
-        full_path, apex.GetImageOffset().value(), apex.GetImageSize().value());
+    Result<loop::LoopbackDeviceUniqueFd> ret =
+        loop::CreateAndConfigureLoopDevice(full_path,
+                                           apex.GetImageOffset().value(),
+                                           apex.GetImageSize().value());
     if (ret.ok()) {
       loopback_device = std::move(*ret);
       break;
@@ -552,7 +554,10 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
           !st.ok()) {
         return st.error();
       }
-      auto create_loop_status = loop::CreateLoopDevice(hashtree_file, 0, 0);
+      auto create_loop_status =
+          loop::CreateAndConfigureLoopDevice(hashtree_file,
+                                             /* image_offset= */ 0,
+                                             /* image_size= */ 0);
       if (!create_loop_status.ok()) {
         return create_loop_status.error();
       }
@@ -721,19 +726,24 @@ Result<void> RunVerifyFnInsideTempMount(const ApexFile& apex,
     return mount_status.error();
   }
   auto cleaner = [&]() {
-    if (unmount_during_cleanup) {
-      LOG(DEBUG) << "Unmounting " << temp_mount_point;
-      Result<void> result = Unmount(*mount_status, /* deferred= */ false);
-      if (!result.ok()) {
-        LOG(WARNING) << "Failed to unmount " << temp_mount_point << " : "
-                     << result.error();
-      }
-      gMountedApexes.RemoveMountedApex(apex.GetManifest().name(),
-                                       apex.GetPath(), true);
+    LOG(DEBUG) << "Unmounting " << temp_mount_point;
+    Result<void> result = Unmount(*mount_status, /* deferred= */ false);
+    if (!result.ok()) {
+      LOG(WARNING) << "Failed to unmount " << temp_mount_point << " : "
+                   << result.error();
     }
+    gMountedApexes.RemoveMountedApex(apex.GetManifest().name(), apex.GetPath(),
+                                     true);
   };
   auto scope_guard = android::base::make_scope_guard(cleaner);
-  return verify_fn(temp_mount_point);
+  auto result = verify_fn(temp_mount_point);
+  if (!result.ok()) {
+    return result.error();
+  }
+  if (!unmount_during_cleanup) {
+    scope_guard.Disable();
+  }
+  return {};
 }
 
 template <typename HookFn, typename HookCall>
@@ -788,11 +798,6 @@ Result<void> PrePostinstallPackages(const std::vector<ApexFile>& apexes,
 Result<void> PreinstallPackages(const std::vector<ApexFile>& apexes) {
   return PrePostinstallPackages(apexes, &ApexManifest::preinstallhook,
                                 &StagePreInstall);
-}
-
-Result<void> PostinstallPackages(const std::vector<ApexFile>& apexes) {
-  return PrePostinstallPackages(apexes, &ApexManifest::postinstallhook,
-                                &StagePostInstall);
 }
 
 // Converts a list of apex file paths into a list of ApexFile objects
@@ -889,9 +894,9 @@ Result<std::vector<ApexFile>> VerifyPackages(
   return std::move(*apex_files);
 }
 
-Result<ApexFile> VerifySessionDir(const int session_id) {
-  std::string session_dir_path = std::string(kStagedSessionsDir) + "/session_" +
-                                 std::to_string(session_id);
+Result<ApexFile> VerifySessionDir(int session_id) {
+  std::string session_dir_path =
+      StringPrintf("%s/session_%d", gConfig->staged_session_dir, session_id);
   LOG(INFO) << "Scanning " << session_dir_path
             << " looking for packages to be validated";
   Result<std::vector<std::string>> scan =
@@ -1402,6 +1407,46 @@ Result<void> DeactivatePackage(const std::string& full_path) {
                         /* deferred= */ false);
 }
 
+Result<std::vector<ApexFile>> GetStagedApexFiles(
+    int session_id, const std::vector<int>& child_session_ids) {
+  auto session = ApexSession::GetSession(session_id);
+  if (!session.ok()) {
+    return session.error();
+  }
+  // We should only accept sessions in SessionState::STAGED state
+  auto session_state = (*session).GetState();
+  if (session_state != SessionState::STAGED) {
+    return Error() << "Session " << session_id << " is not in state STAGED";
+  }
+
+  std::vector<int> ids_to_scan;
+  if (!child_session_ids.empty()) {
+    ids_to_scan = child_session_ids;
+  } else {
+    ids_to_scan = {session_id};
+  }
+
+  // Find apex files in the staging directory
+  std::vector<std::string> apex_file_paths;
+  for (int id_to_scan : ids_to_scan) {
+    std::string session_dir_path = std::string(gConfig->staged_session_dir) +
+                                   "/session_" + std::to_string(id_to_scan);
+    Result<std::vector<std::string>> scan =
+        FindFilesBySuffix(session_dir_path, {kApexPackageSuffix});
+    if (!scan.ok()) {
+      return scan.error();
+    }
+    if (scan->size() != 1) {
+      return Error() << "Expected exactly one APEX file in directory "
+                     << session_dir_path << ". Found: " << scan->size();
+    }
+    std::string& apex_file_path = (*scan)[0];
+    apex_file_paths.push_back(std::move(apex_file_path));
+  }
+
+  return OpenApexFiles(apex_file_paths);
+}
+
 std::vector<ApexFile> GetActivePackages() {
   std::vector<ApexFile> ret;
   gMountedApexes.ForallMountedApexes(
@@ -1785,7 +1830,7 @@ void SnapshotOrRestoreDeIfNeeded(const std::string& base_dir,
     }
   } else if (session.IsRollback()) {
     for (const auto& apex_name : session.GetApexNames()) {
-      if (!gInFsCheckpointMode) {
+      if (!gSupportsFsCheckpoints) {
         // Snapshot before restore so this rollback can be reverted.
         SnapshotDataDirectory(base_dir, session.GetRollbackId(), apex_name,
                               true /* pre_restore */);
@@ -2009,6 +2054,17 @@ void ScanStagedSessionsDirAndStage() {
       continue;
     }
 
+    // If device supports fs-checkpoint, then apex session should only be
+    // installed when in checkpoint-mode. Otherwise, we will not be able to
+    // revert /data on error.
+    if (gSupportsFsCheckpoints && !gInFsCheckpointMode) {
+      auto error_message =
+          "Cannot install apex session if not in fs-checkpoint mode";
+      LOG(ERROR) << error_message;
+      session.SetErrorMessage(error_message);
+      continue;
+    }
+
     std::vector<std::string> dirs_to_scan;
     if (session.GetChildSessionIds().empty()) {
       dirs_to_scan.push_back(std::string(gConfig->staged_session_dir) +
@@ -2059,17 +2115,6 @@ void ScanStagedSessionsDirAndStage() {
       continue;
     }
 
-    // Run postinstall, if necessary.
-    Result<void> postinstall_status = PostinstallPackages(apexes);
-    if (!postinstall_status.ok()) {
-      std::string error_message =
-          StringPrintf("Postinstall failed for session %d %s", session_id,
-                       postinstall_status.error().message().c_str());
-      LOG(ERROR) << error_message;
-      session.SetErrorMessage(error_message);
-      continue;
-    }
-
     for (const auto& apex : apexes) {
       // TODO(b/158470836): Avoid opening ApexFile repeatedly.
       Result<ApexFile> apex_file = ApexFile::Open(apex);
@@ -2108,15 +2153,6 @@ Result<void> PreinstallPackages(const std::vector<std::string>& paths) {
   }
   LOG(DEBUG) << "PreinstallPackages() for " << Join(paths, ',');
   return PreinstallPackages(*apex_files);
-}
-
-Result<void> PostinstallPackages(const std::vector<std::string>& paths) {
-  Result<std::vector<ApexFile>> apex_files = OpenApexFiles(paths);
-  if (!apex_files.ok()) {
-    return apex_files.error();
-  }
-  LOG(DEBUG) << "PostinstallPackages() for " << Join(paths, ',');
-  return PostinstallPackages(*apex_files);
 }
 
 namespace {
@@ -2279,7 +2315,7 @@ Result<void> RevertActiveSessions(const std::string& crashing_native_process,
     }
   }
 
-  if (!gInFsCheckpointMode) {
+  if (!gSupportsFsCheckpoints) {
     auto restore_status = RestoreActivePackages();
     if (!restore_status.ok()) {
       for (auto& session : active_sessions) {
@@ -2297,7 +2333,7 @@ Result<void> RevertActiveSessions(const std::string& crashing_native_process,
   }
 
   for (auto& session : active_sessions) {
-    if (!gInFsCheckpointMode && session.IsRollback()) {
+    if (!gSupportsFsCheckpoints && session.IsRollback()) {
       // If snapshots have already been restored, undo that by restoring the
       // pre-restore snapshot.
       RestoreDePreRestoreSnapshotsIfPresent(session);
@@ -2536,19 +2572,46 @@ std::vector<ApexFileRef> SelectApexForActivation(
                            const ApexFileRef& a_ref,
                            const int version_b) mutable {
       const ApexFile& a = a_ref.get();
-      // APEX that provides shared library always gets activated
-      const bool provides_shared_apex_libs =
-          a.GetManifest().providesharedapexlibs();
       // If A has higher version than B, then it should be activated
       const bool higher_version = a.GetManifest().version() > version_b;
       // If A has same version as B, then data version should get activated
       const bool same_version_priority_to_data =
           a.GetManifest().version() == version_b &&
           !instance.IsPreInstalledApex(a);
-      if (provides_shared_apex_libs || higher_version ||
-          same_version_priority_to_data) {
+
+      // APEX that provides shared library are special:
+      //  - if preinstalled version is lower than data version, both versions
+      //    are activated.
+      //  - if preinstalled version is equal to data version, data version only
+      //    is activated.
+      //  - if preinstalled version is higher than data version, preinstalled
+      //    version only is activated.
+      const bool provides_shared_apex_libs =
+          a.GetManifest().providesharedapexlibs();
+      bool activate = false;
+      if (provides_shared_apex_libs) {
+        // preinstalled version gets activated in all cases except when same
+        // version as data.
+        if (instance.IsPreInstalledApex(a) &&
+            (a.GetManifest().version() != version_b)) {
+          LOG(DEBUG) << "Activating preinstalled shared libs APEX: "
+                     << a.GetManifest().name() << " " << a.GetPath();
+          activate = true;
+        }
+        // data version gets activated in all cases except when its version
+        // is lower than preinstalled version.
+        if (!instance.IsPreInstalledApex(a) &&
+            (a.GetManifest().version() >= version_b)) {
+          LOG(DEBUG) << "Activating shared libs APEX: "
+                     << a.GetManifest().name() << " " << a.GetPath();
+          activate = true;
+        }
+      } else if (higher_version || same_version_priority_to_data) {
         LOG(DEBUG) << "Selecting between two APEX: " << a.GetManifest().name()
                    << " " << a.GetPath();
+        activate = true;
+      }
+      if (activate) {
         activation_list.emplace_back(a_ref);
       }
     };
@@ -2916,6 +2979,11 @@ Result<std::vector<ApexFile>> SubmitStagedSession(
   }
 
   std::vector<ApexFile> ret;
+  auto guard = android::base::make_scope_guard([&ret]() {
+    for (const auto& apex : ret) {
+      apexd_private::UnmountTempMount(apex);
+    }
+  });
   for (int id_to_scan : ids_to_scan) {
     auto verified = VerifySessionDir(id_to_scan);
     if (!verified.ok()) {
@@ -2993,7 +3061,7 @@ Result<void> MarkStagedSessionSuccessful(const int session_id) {
       return Error() << "Failed to mark session " << *session
                      << " as successful : " << cleanup_status.error();
     }
-    if (session->IsRollback() && !gInFsCheckpointMode) {
+    if (session->IsRollback() && !gSupportsFsCheckpoints) {
       DeleteDePreRestoreSnapshots(*session);
     }
     return session->UpdateStateAndCommit(SessionState::SUCCESS);
@@ -3139,9 +3207,9 @@ Result<void> RemountPackages() {
 }
 
 // Given a single new APEX incoming via OTA, should we allocate space for it?
-Result<bool> ShouldAllocateSpaceForDecompression(
-    const std::string& new_apex_name, const int64_t new_apex_version,
-    const ApexFileRepository& instance) {
+bool ShouldAllocateSpaceForDecompression(const std::string& new_apex_name,
+                                         const int64_t new_apex_version,
+                                         const ApexFileRepository& instance) {
   // An apex at most will have two versions on device: pre-installed and data.
 
   // Check if there is a pre-installed version for the new apex.
@@ -3178,6 +3246,24 @@ Result<bool> ShouldAllocateSpaceForDecompression(
   const int64_t data_version = data_apex.get().GetManifest().version();
   // We only decompress the new_apex if it has higher version than data apex.
   return new_apex_version > data_version;
+}
+
+int64_t CalculateSizeForCompressedApex(
+    const std::vector<std::tuple<std::string, int64_t, int64_t>>&
+        compressed_apexes,
+    const ApexFileRepository& instance) {
+  int64_t result = 0;
+  for (const auto& compressed_apex : compressed_apexes) {
+    std::string module_name;
+    int64_t version_code;
+    int64_t decompressed_size;
+    std::tie(module_name, version_code, decompressed_size) = compressed_apex;
+    if (ShouldAllocateSpaceForDecompression(module_name, version_code,
+                                            instance)) {
+      result += decompressed_size;
+    }
+  }
+  return result;
 }
 
 void CollectApexInfoList(std::ostream& os,
@@ -3416,8 +3502,8 @@ int OnOtaChrootBootstrap() {
   return 0;
 }
 
-int OnOtaChrootBootstrapFlattenedApex() {
-  LOG(INFO) << "OnOtaChrootBootstrapFlattenedApex";
+int ActivateFlattenedApex() {
+  LOG(INFO) << "ActivateFlattenedApex";
 
   std::vector<com::android::apex::ApexInfo> apex_infos;
 
