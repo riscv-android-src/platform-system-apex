@@ -29,6 +29,7 @@ interface IApexService {
 
    ApexSessionInfo[] getSessions();
    ApexSessionInfo getStagedSessionInfo(int session_id);
+   ApexInfo[] getStagedApexInfos(in ApexSessionParams params);
    ApexInfo[] getActivePackages();
    ApexInfo[] getAllPackages();
 
@@ -75,22 +76,7 @@ interface IApexService {
     * Not meant for use outside of testing. The call will not be
     * functional on user builds.
     */
-   void activatePackage(in @utf8InCpp String package_path);
-   /**
-    * Not meant for use outside of testing. The call will not be
-    * functional on user builds.
-    */
-   void deactivatePackage(in @utf8InCpp String package_path);
-   /**
-    * Not meant for use outside of testing. The call will not be
-    * functional on user builds.
-    */
    void preinstallPackages(in @utf8InCpp List<String> package_tmp_paths);
-   /**
-    * Not meant for use outside of testing. The call will not be
-    * functional on user builds.
-    */
-   void postinstallPackages(in @utf8InCpp List<String> package_tmp_paths);
    /**
     * Not meant for use outside of testing. The call will not be
     * functional on user builds.
@@ -152,4 +138,11 @@ interface IApexService {
    * reservation fails. If empty list is passed, then reserved space is deallocated.
    */
    void reserveSpaceForCompressedApex(in CompressedApexInfoList compressed_apex_info_list);
+
+   /**
+    * Performs a non-staged install of the given APEX.
+    * Note: don't confuse this to preInstall and postInstall binder calls which are only used to
+    * test corresponding features of APEX packages.
+    */
+   ApexInfo installAndActivatePackage(in @utf8InCpp String packagePath);
 }

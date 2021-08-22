@@ -62,7 +62,7 @@ struct FsMagic {
 constexpr const FsMagic kFsType[] = {{"f2fs", 1024, 4, "\x10\x20\xf5\xf2"},
                                      {"ext4", 1024 + 0x38, 2, "\123\357"}};
 
-Result<std::string> RetrieveFsType(borrowed_fd fd, int32_t image_offset) {
+Result<std::string> RetrieveFsType(borrowed_fd fd, uint32_t image_offset) {
   for (const auto& fs : kFsType) {
     char buf[fs.len];
     if (!ReadFullyAtOffset(fd, buf, fs.len, image_offset + fs.offset)) {
@@ -77,9 +77,8 @@ Result<std::string> RetrieveFsType(borrowed_fd fd, int32_t image_offset) {
 
 }  // namespace
 
-Result<ApexFile> ApexFile::Open(const std::string& path,
-                                std::optional<uint32_t> size) {
-  std::optional<int32_t> image_offset;
+Result<ApexFile> ApexFile::Open(const std::string& path) {
+  std::optional<uint32_t> image_offset;
   std::optional<size_t> image_size;
   std::string manifest_content;
   std::string pubkey;
@@ -95,11 +94,7 @@ Result<ApexFile> ApexFile::Open(const std::string& path,
   ZipArchiveHandle handle;
   auto handle_guard =
       android::base::make_scope_guard([&handle] { CloseArchive(handle); });
-  int ret =
-      size.has_value()
-          ? OpenArchiveFdRange(fd.get(), path.c_str(), &handle, size.value(),
-                               /*offset=*/0, /*assume_ownership=*/false)
-          : OpenArchiveFd(fd.get(), path.c_str(), &handle,
+  int ret = OpenArchiveFd(fd.get(), path.c_str(), &handle,
                           /*assume_ownership=*/false);
   if (ret < 0) {
     return Error() << "Failed to open package " << path << ": "
@@ -178,7 +173,7 @@ Result<ApexFile> ApexFile::Open(const std::string& path,
   }
 
   return ApexFile(realpath, image_offset, image_size, std::move(*manifest),
-                  pubkey, fs_type, is_compressed, size);
+                  pubkey, fs_type, is_compressed);
 }
 
 // AVB-related code.

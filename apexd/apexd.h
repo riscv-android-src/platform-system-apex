@@ -28,6 +28,7 @@
 #include "apex_database.h"
 #include "apex_file.h"
 #include "apex_file_repository.h"
+#include "apexd_session.h"
 
 namespace android {
 namespace apex {
@@ -45,12 +46,13 @@ struct ApexdConfig {
   const char* decompression_dir;
   const char* ota_reserved_dir;
   const char* apex_hash_tree_dir;
-  // Overrides the path to the "signature" partition which is by default
-  // /dev/block/by-name/signature It should be a path pointing the first
+  const char* staged_session_dir;
+  // Overrides the path to the "metadata" partition which is by default
+  // /dev/block/by-name/payload-metadata It should be a path pointing the first
   // partition of the VM payload disk. So, realpath() of this path is checked if
-  // it has the suffix "1". For example, /test-dir/test-signature-1 can be valid
+  // it has the suffix "1". For example, /test-dir/test-metadata-1 can be valid
   // and the subsequent numbers should point APEX files.
-  const char* vm_payload_signature_partition;
+  const char* vm_payload_metadata_partition;
 };
 
 static const ApexdConfig kDefaultConfig = {
@@ -60,18 +62,21 @@ static const ApexdConfig kDefaultConfig = {
     kApexDecompressedDir,
     kOtaReservedDir,
     kApexHashTreeDir,
-    kVmPayloadSignaturePartition,
+    kStagedSessionsDir,
+    kVmPayloadMetadataPartition,
 };
 
 class CheckpointInterface;
 
 void SetConfig(const ApexdConfig& config);
 
+// Exposed only for testing.
+android::base::Result<void> Unmount(
+    const MountedApexDatabase::MountedApexData& data, bool deferred);
+
 android::base::Result<void> ResumeRevertIfNeeded();
 
 android::base::Result<void> PreinstallPackages(
-    const std::vector<std::string>& paths) WARN_UNUSED;
-android::base::Result<void> PostinstallPackages(
     const std::vector<std::string>& paths) WARN_UNUSED;
 
 android::base::Result<void> StagePackages(
@@ -83,14 +88,21 @@ android::base::Result<std::vector<ApexFile>> SubmitStagedSession(
     const int session_id, const std::vector<int>& child_session_ids,
     const bool has_rollback_enabled, const bool is_rollback,
     const int rollback_id) WARN_UNUSED;
+android::base::Result<std::vector<ApexFile>> GetStagedApexFiles(
+    const int session_id,
+    const std::vector<int>& child_session_ids) WARN_UNUSED;
 android::base::Result<void> MarkStagedSessionReady(const int session_id)
     WARN_UNUSED;
 android::base::Result<void> MarkStagedSessionSuccessful(const int session_id)
     WARN_UNUSED;
+// Only only of the parameters should be passed during revert
 android::base::Result<void> RevertActiveSessions(
-    const std::string& crashing_native_process);
+    const std::string& crashing_native_process,
+    const std::string& error_message);
+// Only only of the parameters should be passed during revert
 android::base::Result<void> RevertActiveSessionsAndReboot(
-    const std::string& crashing_native_process);
+    const std::string& crashing_native_process,
+    const std::string& error_message);
 
 android::base::Result<void> ActivatePackage(const std::string& full_path)
     WARN_UNUSED;
@@ -172,8 +184,13 @@ GetTempMountedApexData(const std::string& package);
 android::base::Result<void> RemountPackages();
 
 // Exposed for unit tests
-android::base::Result<bool> ShouldAllocateSpaceForDecompression(
-    const std::string& new_apex_name, int64_t new_apex_version,
+bool ShouldAllocateSpaceForDecompression(const std::string& new_apex_name,
+                                         int64_t new_apex_version,
+                                         const ApexFileRepository& instance);
+
+int64_t CalculateSizeForCompressedApex(
+    const std::vector<std::tuple<std::string, int64_t, int64_t>>&
+        compressed_apexes,
     const ApexFileRepository& instance);
 
 void CollectApexInfoList(std::ostream& os,
@@ -191,10 +208,14 @@ int OnStartInVmMode();
 // TODO(b/172911822): support compressed apexes.
 int OnOtaChrootBootstrap();
 
-// Activates flattened apexes in otapreopt_chroot environment.
-int OnOtaChrootBootstrapFlattenedApex();
+// Activates flattened apexes
+int ActivateFlattenedApex();
 
 android::apex::MountedApexDatabase& GetApexDatabaseForTesting();
+
+// Performs a non-staged install of an APEX specified by |package_path|.
+// TODO(ioffe): add more documentation.
+android::base::Result<ApexFile> InstallPackage(const std::string& package_path);
 
 }  // namespace apex
 }  // namespace android

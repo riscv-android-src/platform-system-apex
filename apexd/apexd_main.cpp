@@ -142,7 +142,11 @@ int main(int /*argc*/, char** argv) {
       // mark apexd as ready
       android::apex::OnAllPackagesReady();
     } else if (strcmp("--otachroot-bootstrap", argv[1]) == 0) {
-      return android::apex::OnOtaChrootBootstrapFlattenedApex();
+      LOG(INFO) << "OTA chroot bootstrap subcommand detected";
+      return android::apex::ActivateFlattenedApex();
+    } else if (strcmp("--bootstrap", argv[1]) == 0) {
+      LOG(INFO) << "Bootstrap subcommand detected";
+      return android::apex::ActivateFlattenedApex();
     }
     return 0;
   }
@@ -190,6 +194,9 @@ int main(int /*argc*/, char** argv) {
     lifecycle.WaitForBootStatus(android::apex::RevertActiveSessionsAndReboot);
   }
 
+  // Run cleanup routine before AllowServiceShutdown(), to prevent
+  // service_manager killing apexd in the middle of the cleanup.
+  android::apex::BootCompletedCleanup();
   android::apex::binder::AllowServiceShutdown();
 
   android::apex::binder::JoinThreadPool();

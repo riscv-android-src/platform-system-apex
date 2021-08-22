@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
+#define ATRACE_TAG ATRACE_TAG_PACKAGE_MANAGER
+
 #include "apexd.h"
+#include "apex_file_repository.h"
 #include "apexd_private.h"
 
 #include "apex_constants.h"
@@ -31,9 +34,9 @@
 #include "apexd_utils.h"
 #include "apexd_verity.h"
 #include "com_android_apex.h"
-#include "string_log.h"
 
 #include <ApexProperties.sysprop.h>
+#include <android-base/chrono_utils.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/macros.h>
@@ -49,9 +52,11 @@
 #include <libdm/dm_table.h>
 #include <libdm/dm_target.h>
 #include <selinux/android.h>
+#include <utils/Trace.h>
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/f2fs.h>
 #include <linux/loop.h>
 #include <stdlib.h>
 #include <sys/inotify.h>
@@ -78,10 +83,13 @@
 #include <queue>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
+using android::base::boot_clock;
+using android::base::ConsumePrefix;
 using android::base::ErrnoError;
 using android::base::Error;
 using android::base::GetProperty;
@@ -91,6 +99,7 @@ using android::base::ReadFully;
 using android::base::RemoveFileIfExists;
 using android::base::Result;
 using android::base::SetProperty;
+using android::base::StartsWith;
 using android::base::StringPrintf;
 using android::base::unique_fd;
 using android::dm::DeviceMapper;
@@ -151,6 +160,31 @@ bool IsBootstrapApex(const ApexFile& apex) {
                    apex.GetManifest().name()) != kBootstrapApexes.end();
 }
 
+void ReleaseF2fsCompressedBlocks(const std::string& file_path) {
+  unique_fd fd(
+      TEMP_FAILURE_RETRY(open(file_path.c_str(), O_RDONLY | O_CLOEXEC, 0)));
+  if (fd.get() == -1) {
+    PLOG(ERROR) << "Failed to open " << file_path;
+    return;
+  }
+  unsigned int flags;
+  if (ioctl(fd, FS_IOC_GETFLAGS, &flags) == -1) {
+    PLOG(ERROR) << "Failed to call FS_IOC_GETFLAGS on " << file_path;
+    return;
+  }
+  if ((flags & FS_COMPR_FL) == 0) {
+    // Doesn't support f2fs-compression.
+    return;
+  }
+  uint64_t blk_cnt;
+  if (ioctl(fd, F2FS_IOC_RELEASE_COMPRESS_BLOCKS, &blk_cnt) == -1) {
+    PLOG(ERROR) << "Failed to call F2FS_IOC_RELEASE_COMPRESS_BLOCKS on "
+                << file_path;
+  }
+  LOG(INFO) << "Released " << blk_cnt << " compressed blocks from "
+            << file_path;
+}
+
 // Pre-allocate loop devices so that we don't have to wait for them
 // later when actually activating APEXes.
 Result<void> PreAllocateLoopDevices() {
@@ -161,13 +195,13 @@ Result<void> PreAllocateLoopDevices() {
 
   auto size = 0;
   for (const auto& path : *scan) {
-    auto apexFile = ApexFile::Open(path);
-    if (!apexFile.ok()) {
+    auto apex_file = ApexFile::Open(path);
+    if (!apex_file.ok()) {
       continue;
     }
     size++;
     // bootstrap Apexes may be activated on separate namespaces.
-    if (IsBootstrapApex(*apexFile)) {
+    if (IsBootstrapApex(*apex_file)) {
       size++;
     }
   }
@@ -213,8 +247,15 @@ std::unique_ptr<DmTable> CreateVerityTable(const ApexVerityData& verity_data,
 
 // Deletes a dm-verity device with a given name and path
 // Synchronizes on the device actually being deleted from userspace.
-Result<void> DeleteVerityDevice(const std::string& name) {
+Result<void> DeleteVerityDevice(const std::string& name, bool deferred) {
   DeviceMapper& dm = DeviceMapper::Instance();
+  if (deferred) {
+    if (!dm.DeleteDeviceDeferred(name)) {
+      return ErrnoError() << "Failed to issue deferred delete of verity device "
+                          << name;
+    }
+    return {};
+  }
   auto timeout = std::chrono::milliseconds(
       android::sysprop::ApexProperties::dm_delete_timeout().value_or(750));
   if (!dm.DeleteDevice(name, timeout)) {
@@ -250,7 +291,7 @@ class DmVerityDevice {
 
   ~DmVerityDevice() {
     if (!cleared_) {
-      Result<void> ret = DeleteVerityDevice(name_);
+      Result<void> ret = DeleteVerityDevice(name_, /* deferred= */ false);
       if (!ret.ok()) {
         LOG(ERROR) << ret.error();
       }
@@ -268,27 +309,60 @@ class DmVerityDevice {
   bool cleared_;
 };
 
-Result<DmVerityDevice> CreateVerityDevice(const std::string& name,
-                                          const DmTable& table) {
-  DeviceMapper& dm = DeviceMapper::Instance();
-
-  if (dm.GetState(name) != DmDeviceState::INVALID) {
-    // Delete dangling dm-device. This can happen if apexd fails to delete it
-    // while unmounting an apex.
-    LOG(WARNING) << "Deleting existing dm device " << name;
-    auto result = DeleteVerityDevice(name);
-    if (!result.ok()) {
-      return result.error();
-    }
-  }
-
-  auto timeout = std::chrono::milliseconds(
-      android::sysprop::ApexProperties::dm_create_timeout().value_or(1000));
+Result<DmVerityDevice> CreateVerityDevice(
+    DeviceMapper& dm, const std::string& name, const DmTable& table,
+    const std::chrono::milliseconds& timeout) {
   std::string dev_path;
   if (!dm.CreateDevice(name, table, &dev_path, timeout)) {
     return Errorf("Couldn't create verity device.");
   }
   return DmVerityDevice(name, dev_path);
+}
+
+Result<DmVerityDevice> CreateVerityDevice(const std::string& name,
+                                          const DmTable& table,
+                                          bool reuse_device) {
+  ATRACE_NAME("CreateVerityDevice");
+  LOG(VERBOSE) << "Creating verity device " << name;
+  auto timeout = std::chrono::milliseconds(
+      android::sysprop::ApexProperties::dm_create_timeout().value_or(1000));
+
+  DeviceMapper& dm = DeviceMapper::Instance();
+
+  auto state = dm.GetState(name);
+  if (state == DmDeviceState::INVALID) {
+    return CreateVerityDevice(dm, name, table, timeout);
+  }
+
+  if (reuse_device) {
+    if (state == DmDeviceState::ACTIVE) {
+      LOG(WARNING) << "Deleting existing active dm device " << name;
+      if (auto r = DeleteVerityDevice(name, /* deferred= */ false); !r.ok()) {
+        return r.error();
+      }
+      return CreateVerityDevice(dm, name, table, timeout);
+    }
+    if (!dm.LoadTableAndActivate(name, table)) {
+      dm.DeleteDevice(name);
+      return Error() << "Failed to activate dm device " << name;
+    }
+    std::string path;
+    if (!dm.WaitForDevice(name, timeout, &path)) {
+      dm.DeleteDevice(name);
+      return Error() << "Failed waiting for dm device " << name;
+    }
+    return DmVerityDevice(name, path);
+  } else {
+    if (state != DmDeviceState::INVALID) {
+      // Delete dangling dm-device. This can happen if apexd fails to delete it
+      // while unmounting an apex.
+      LOG(WARNING) << "Deleting existing dm device " << name;
+      if (auto r = DeleteVerityDevice(name, /* deferred= */ false); !r.ok()) {
+        return r.error();
+      }
+    }
+    return CreateVerityDevice(dm, name, table, timeout);
+  }
 }
 
 /**
@@ -307,7 +381,7 @@ Result<void> RemovePreviouslyActiveApexFiles(
     const std::unordered_set<std::string>& affected_packages,
     const std::unordered_set<std::string>& files_to_keep) {
   auto all_active_apex_files =
-      FindFilesBySuffix(kActiveApexPackagesDataDir, {kApexPackageSuffix});
+      FindFilesBySuffix(gConfig->active_apex_data_dir, {kApexPackageSuffix});
 
   if (!all_active_apex_files.ok()) {
     return all_active_apex_files.error();
@@ -388,14 +462,17 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
                                          const std::string& mount_point,
                                          const std::string& device_name,
                                          const std::string& hashtree_file,
-                                         bool verify_image,
+                                         bool verify_image, bool reuse_device,
                                          bool temp_mount = false) {
+  auto tag = "MountPackageImpl: " + apex.GetManifest().name();
+  ATRACE_NAME(tag.c_str());
   if (apex.IsCompressed()) {
     return Error() << "Cannot directly mount compressed APEX "
                    << apex.GetPath();
   }
 
   LOG(VERBOSE) << "Creating mount point: " << mount_point;
+  auto time_started = boot_clock::now();
   // Note: the mount point could exist in case when the APEX was activated
   // during the bootstrap phase (e.g., the runtime or tzdata APEX).
   // Although we have separate mount namespaces to separate the early activated
@@ -428,8 +505,10 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   }
   loop::LoopbackDeviceUniqueFd loopback_device;
   for (size_t attempts = 1;; ++attempts) {
-    Result<loop::LoopbackDeviceUniqueFd> ret = loop::CreateLoopDevice(
-        full_path, apex.GetImageOffset().value(), apex.GetImageSize().value());
+    Result<loop::LoopbackDeviceUniqueFd> ret =
+        loop::CreateAndConfigureLoopDevice(full_path,
+                                           apex.GetImageOffset().value(),
+                                           apex.GetImageSize().value());
     if (ret.ok()) {
       loopback_device = std::move(*ret);
       break;
@@ -475,7 +554,10 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
           !st.ok()) {
         return st.error();
       }
-      auto create_loop_status = loop::CreateLoopDevice(hashtree_file, 0, 0);
+      auto create_loop_status =
+          loop::CreateAndConfigureLoopDevice(hashtree_file,
+                                             /* image_offset= */ 0,
+                                             /* image_size= */ 0);
       if (!create_loop_status.ok()) {
         return create_loop_status.error();
       }
@@ -487,7 +569,7 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
         CreateVerityTable(*verity_data, loopback_device.name, hash_device,
                           /* restart_on_corruption = */ !verify_image);
     Result<DmVerityDevice> verity_dev_res =
-        CreateVerityDevice(device_name, *verity_table);
+        CreateVerityDevice(device_name, *verity_table, reuse_device);
     if (!verity_dev_res.ok()) {
       return Error() << "Failed to create Apex Verity device " << full_path
                      << ": " << verity_dev_res.error();
@@ -521,8 +603,10 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   }
   if (mount(block_device.c_str(), mount_point.c_str(),
             apex.GetFsType().value().c_str(), mount_flags, nullptr) == 0) {
+    auto time_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        boot_clock::now() - time_started).count();
     LOG(INFO) << "Successfully mounted package " << full_path << " on "
-              << mount_point;
+              << mount_point << " duration=" << time_elapsed;
     auto status = VerifyMountedImage(apex, mount_point);
     if (!status.ok()) {
       if (umount2(mount_point.c_str(), UMOUNT_NOFOLLOW) != 0) {
@@ -564,7 +648,8 @@ Result<MountedApexData> VerifyAndTempMountPackage(
   }
   auto ret =
       MountPackageImpl(apex, mount_point, temp_device_name, hashtree_file,
-                       /* verify_image = */ true, /* temp_mount = */ true);
+                       /* verify_image = */ true, /* reuse_device= */ false,
+                       /* temp_mount = */ true);
   if (!ret.ok()) {
     LOG(DEBUG) << "Cleaning up " << hashtree_file;
     if (TEMP_FAILURE_RETRY(unlink(hashtree_file.c_str())) != 0) {
@@ -576,23 +661,26 @@ Result<MountedApexData> VerifyAndTempMountPackage(
   return ret;
 }
 
-Result<void> Unmount(const MountedApexData& data) {
+}  // namespace
+
+Result<void> Unmount(const MountedApexData& data, bool deferred) {
   LOG(DEBUG) << "Unmounting " << data.full_path << " from mount point "
-             << data.mount_point;
+             << data.mount_point << " deferred = " << deferred;
   // Lazily try to umount whatever is mounted.
   if (umount2(data.mount_point.c_str(), UMOUNT_NOFOLLOW) != 0 &&
       errno != EINVAL && errno != ENOENT) {
     return ErrnoError() << "Failed to unmount directory " << data.mount_point;
   }
-  // Attempt to delete the folder. If the folder is retained, other
-  // data may be incorrect.
-  if (rmdir(data.mount_point.c_str()) != 0) {
-    PLOG(ERROR) << "Failed to rmdir directory " << data.mount_point;
+
+  if (!deferred) {
+    if (rmdir(data.mount_point.c_str()) != 0) {
+      PLOG(ERROR) << "Failed to rmdir " << data.mount_point;
+    }
   }
 
   // Try to free up the device-mapper device.
   if (!data.device_name.empty()) {
-    const auto& result = DeleteVerityDevice(data.device_name);
+    const auto& result = DeleteVerityDevice(data.device_name, deferred);
     if (!result.ok()) {
       return result;
     }
@@ -602,15 +690,23 @@ Result<void> Unmount(const MountedApexData& data) {
   auto log_fn = [](const std::string& path, const std::string& /*id*/) {
     LOG(VERBOSE) << "Freeing loop device " << path << " for unmount.";
   };
-  if (!data.loop_name.empty()) {
+
+  // Since we now use LO_FLAGS_AUTOCLEAR when configuring loop devices, in
+  // theory we don't need to manually call DestroyLoopDevice here even if
+  // |deferred| is false. However we prefer to call it to ensure the invariant
+  // of SubmitStagedSession (after it's done, loop devices created for temp
+  // mount are freed).
+  if (!data.loop_name.empty() && !deferred) {
     loop::DestroyLoopDevice(data.loop_name, log_fn);
   }
-  if (!data.hashtree_loop_name.empty()) {
+  if (!data.hashtree_loop_name.empty() && !deferred) {
     loop::DestroyLoopDevice(data.hashtree_loop_name, log_fn);
   }
 
   return {};
 }
+
+namespace {
 
 template <typename VerifyFn>
 Result<void> RunVerifyFnInsideTempMount(const ApexFile& apex,
@@ -630,19 +726,24 @@ Result<void> RunVerifyFnInsideTempMount(const ApexFile& apex,
     return mount_status.error();
   }
   auto cleaner = [&]() {
-    if (unmount_during_cleanup) {
-      LOG(DEBUG) << "Unmounting " << temp_mount_point;
-      Result<void> result = Unmount(*mount_status);
-      if (!result.ok()) {
-        LOG(WARNING) << "Failed to unmount " << temp_mount_point << " : "
-                     << result.error();
-      }
-      gMountedApexes.RemoveMountedApex(apex.GetManifest().name(),
-                                       apex.GetPath(), true);
+    LOG(DEBUG) << "Unmounting " << temp_mount_point;
+    Result<void> result = Unmount(*mount_status, /* deferred= */ false);
+    if (!result.ok()) {
+      LOG(WARNING) << "Failed to unmount " << temp_mount_point << " : "
+                   << result.error();
     }
+    gMountedApexes.RemoveMountedApex(apex.GetManifest().name(), apex.GetPath(),
+                                     true);
   };
   auto scope_guard = android::base::make_scope_guard(cleaner);
-  return verify_fn(temp_mount_point);
+  auto result = verify_fn(temp_mount_point);
+  if (!result.ok()) {
+    return result.error();
+  }
+  if (!unmount_during_cleanup) {
+    scope_guard.Disable();
+  }
+  return {};
 }
 
 template <typename HookFn, typename HookCall>
@@ -697,11 +798,6 @@ Result<void> PrePostinstallPackages(const std::vector<ApexFile>& apexes,
 Result<void> PreinstallPackages(const std::vector<ApexFile>& apexes) {
   return PrePostinstallPackages(apexes, &ApexManifest::preinstallhook,
                                 &StagePreInstall);
-}
-
-Result<void> PostinstallPackages(const std::vector<ApexFile>& apexes) {
-  return PrePostinstallPackages(apexes, &ApexManifest::postinstallhook,
-                                &StagePostInstall);
 }
 
 // Converts a list of apex file paths into a list of ApexFile objects
@@ -767,7 +863,7 @@ Result<void> VerifyPackageBoot(const ApexFile& apex_file) {
 // This function contains checks that might be expensive to perform, e.g. temp
 // mounting a package and reading entire dm-verity device, and shouldn't be run
 // during boot.
-Result<void> VerifyPackageInstall(const ApexFile& apex_file) {
+Result<void> VerifyPackageStagedInstall(const ApexFile& apex_file) {
   const auto& verify_package_boot_status = VerifyPackageBoot(apex_file);
   if (!verify_package_boot_status.ok()) {
     return verify_package_boot_status;
@@ -798,9 +894,9 @@ Result<std::vector<ApexFile>> VerifyPackages(
   return std::move(*apex_files);
 }
 
-Result<ApexFile> VerifySessionDir(const int session_id) {
-  std::string session_dir_path = std::string(kStagedSessionsDir) + "/session_" +
-                                 std::to_string(session_id);
+Result<ApexFile> VerifySessionDir(int session_id) {
+  std::string session_dir_path =
+      StringPrintf("%s/session_%d", gConfig->staged_session_dir, session_id);
   LOG(INFO) << "Scanning " << session_dir_path
             << " looking for packages to be validated";
   Result<std::vector<std::string>> scan =
@@ -815,7 +911,7 @@ Result<ApexFile> VerifySessionDir(const int session_id) {
         "More than one APEX package found in the same session directory.");
   }
 
-  auto verified = VerifyPackages(*scan, VerifyPackageInstall);
+  auto verified = VerifyPackages(*scan, VerifyPackageStagedInstall);
   if (!verified.ok()) {
     return verified.error();
   }
@@ -836,7 +932,7 @@ Result<void> DeleteBackup() {
 }
 
 Result<void> BackupActivePackages() {
-  LOG(DEBUG) << "Initializing  backup of " << kActiveApexPackagesDataDir;
+  LOG(DEBUG) << "Initializing  backup of " << gConfig->active_apex_data_dir;
 
   // Previous restore might've delete backups folder.
   auto create_status = CreateDirIfNeeded(kApexBackupDir, 0700);
@@ -844,18 +940,19 @@ Result<void> BackupActivePackages() {
     return Error() << "Backup failed : " << create_status.error();
   }
 
-  auto apex_active_exists = PathExists(std::string(kActiveApexPackagesDataDir));
+  auto apex_active_exists =
+      PathExists(std::string(gConfig->active_apex_data_dir));
   if (!apex_active_exists.ok()) {
     return Error() << "Backup failed : " << apex_active_exists.error();
   }
   if (!*apex_active_exists) {
-    LOG(DEBUG) << kActiveApexPackagesDataDir
+    LOG(DEBUG) << gConfig->active_apex_data_dir
                << " does not exist. Nothing to backup";
     return {};
   }
 
   auto active_packages =
-      FindFilesBySuffix(kActiveApexPackagesDataDir, {kApexPackageSuffix});
+      FindFilesBySuffix(gConfig->active_apex_data_dir, {kApexPackageSuffix});
   if (!active_packages.ok()) {
     return Error() << "Backup failed : " << active_packages.error();
   }
@@ -896,7 +993,7 @@ Result<void> BackupActivePackages() {
 }
 
 Result<void> RestoreActivePackages() {
-  LOG(DEBUG) << "Initializing  restore of " << kActiveApexPackagesDataDir;
+  LOG(DEBUG) << "Initializing  restore of " << gConfig->active_apex_data_dir;
 
   auto backup_exists = PathExists(std::string(kApexBackupDir));
   if (!backup_exists.ok()) {
@@ -907,35 +1004,37 @@ Result<void> RestoreActivePackages() {
   }
 
   struct stat stat_data;
-  if (stat(kActiveApexPackagesDataDir, &stat_data) != 0) {
-    return ErrnoError() << "Failed to access " << kActiveApexPackagesDataDir;
+  if (stat(gConfig->active_apex_data_dir, &stat_data) != 0) {
+    return ErrnoError() << "Failed to access " << gConfig->active_apex_data_dir;
   }
 
-  LOG(DEBUG) << "Deleting existing packages in " << kActiveApexPackagesDataDir;
+  LOG(DEBUG) << "Deleting existing packages in "
+             << gConfig->active_apex_data_dir;
   auto delete_status =
-      DeleteDirContent(std::string(kActiveApexPackagesDataDir));
+      DeleteDirContent(std::string(gConfig->active_apex_data_dir));
   if (!delete_status.ok()) {
     return delete_status;
   }
 
   LOG(DEBUG) << "Renaming " << kApexBackupDir << " to "
-             << kActiveApexPackagesDataDir;
-  if (rename(kApexBackupDir, kActiveApexPackagesDataDir) != 0) {
+             << gConfig->active_apex_data_dir;
+  if (rename(kApexBackupDir, gConfig->active_apex_data_dir) != 0) {
     return ErrnoError() << "Failed to rename " << kApexBackupDir << " to "
-                        << kActiveApexPackagesDataDir;
+                        << gConfig->active_apex_data_dir;
   }
 
   LOG(DEBUG) << "Restoring original permissions for "
-             << kActiveApexPackagesDataDir;
-  if (chmod(kActiveApexPackagesDataDir, stat_data.st_mode & ALLPERMS) != 0) {
+             << gConfig->active_apex_data_dir;
+  if (chmod(gConfig->active_apex_data_dir, stat_data.st_mode & ALLPERMS) != 0) {
     return ErrnoError() << "Failed to restore original permissions for "
-                        << kActiveApexPackagesDataDir;
+                        << gConfig->active_apex_data_dir;
   }
 
   return {};
 }
 
-Result<void> UnmountPackage(const ApexFile& apex, bool allow_latest) {
+Result<void> UnmountPackage(const ApexFile& apex, bool allow_latest,
+                            bool deferred) {
   LOG(INFO) << "Unmounting " << GetPackageId(apex.GetManifest());
 
   const ApexManifest& manifest = apex.GetManifest();
@@ -962,19 +1061,21 @@ Result<void> UnmountPackage(const ApexFile& apex, bool allow_latest) {
       return Error() << "Package " << apex.GetPath() << " is active";
     }
     std::string mount_point = apexd_private::GetActiveMountPoint(manifest);
-    LOG(INFO) << "Unmounting and deleting " << mount_point;
+    LOG(INFO) << "Unmounting " << mount_point;
     if (umount2(mount_point.c_str(), UMOUNT_NOFOLLOW) != 0) {
       return ErrnoError() << "Failed to unmount " << mount_point;
     }
-    if (rmdir(mount_point.c_str()) != 0) {
-      PLOG(ERROR) << "Could not rmdir " << mount_point;
-      // Continue here.
+
+    if (!deferred) {
+      if (rmdir(mount_point.c_str()) != 0) {
+        PLOG(ERROR) << "Failed to rmdir " << mount_point;
+      }
     }
   }
 
   // Clean up gMountedApexes now, even though we're not fully done.
   gMountedApexes.RemoveMountedApex(manifest.name(), apex.GetPath());
-  return Unmount(*data);
+  return Unmount(*data, deferred);
 }
 
 }  // namespace
@@ -982,10 +1083,10 @@ Result<void> UnmountPackage(const ApexFile& apex, bool allow_latest) {
 void SetConfig(const ApexdConfig& config) { gConfig = config; }
 
 Result<void> MountPackage(const ApexFile& apex, const std::string& mount_point,
-                          const std::string& device_name) {
+                          const std::string& device_name, bool reuse_device) {
   auto ret = MountPackageImpl(apex, mount_point, device_name,
                               GetHashTreeFileName(apex, /* is_new= */ false),
-                              /* verify_image = */ false);
+                              /* verify_image = */ false, reuse_device);
   if (!ret.ok()) {
     return ret.error();
   }
@@ -1009,7 +1110,7 @@ Result<void> UnmountTempMount(const ApexFile& apex) {
       finished_unmounting = true;
     } else {
       gMountedApexes.RemoveMountedApex(manifest.name(), data->full_path, true);
-      Unmount(*data);
+      Unmount(*data, /* deferred= */ false);
     }
   }
   return {};
@@ -1065,7 +1166,7 @@ Result<void> ResumeRevertIfNeeded() {
   if (sessions.empty()) {
     return {};
   }
-  return RevertActiveSessions("");
+  return RevertActiveSessions("", "");
 }
 
 Result<void> ActivateSharedLibsPackage(const std::string& mount_point) {
@@ -1174,7 +1275,9 @@ bool IsValidPackageName(const std::string& package_name) {
 }
 
 Result<void> ActivatePackageImpl(const ApexFile& apex_file,
-                                 const std::string& device_name) {
+                                 const std::string& device_name,
+                                 bool reuse_device) {
+  ATRACE_NAME("ActivatePackageImpl");
   const ApexManifest& manifest = apex_file.GetManifest();
 
   if (!IsValidPackageName(manifest.name())) {
@@ -1233,7 +1336,8 @@ Result<void> ActivatePackageImpl(const ApexFile& apex_file,
       apexd_private::GetPackageMountPoint(manifest);
 
   if (!version_found_mounted) {
-    auto mount_status = MountPackage(apex_file, mount_point, device_name);
+    auto mount_status =
+        MountPackage(apex_file, mount_point, device_name, reuse_device);
     if (!mount_status.ok()) {
       return mount_status;
     }
@@ -1287,8 +1391,8 @@ Result<void> ActivatePackage(const std::string& full_path) {
   if (!apex_file.ok()) {
     return apex_file.error();
   }
-  return ActivatePackageImpl(*apex_file,
-                             GetPackageId(apex_file->GetManifest()));
+  return ActivatePackageImpl(*apex_file, GetPackageId(apex_file->GetManifest()),
+                             /* reuse_device= */ false);
 }
 
 Result<void> DeactivatePackage(const std::string& full_path) {
@@ -1299,26 +1403,59 @@ Result<void> DeactivatePackage(const std::string& full_path) {
     return apex_file.error();
   }
 
-  return UnmountPackage(*apex_file, /* allow_latest= */ true);
+  return UnmountPackage(*apex_file, /* allow_latest= */ true,
+                        /* deferred= */ false);
+}
+
+Result<std::vector<ApexFile>> GetStagedApexFiles(
+    int session_id, const std::vector<int>& child_session_ids) {
+  auto session = ApexSession::GetSession(session_id);
+  if (!session.ok()) {
+    return session.error();
+  }
+  // We should only accept sessions in SessionState::STAGED state
+  auto session_state = (*session).GetState();
+  if (session_state != SessionState::STAGED) {
+    return Error() << "Session " << session_id << " is not in state STAGED";
+  }
+
+  std::vector<int> ids_to_scan;
+  if (!child_session_ids.empty()) {
+    ids_to_scan = child_session_ids;
+  } else {
+    ids_to_scan = {session_id};
+  }
+
+  // Find apex files in the staging directory
+  std::vector<std::string> apex_file_paths;
+  for (int id_to_scan : ids_to_scan) {
+    std::string session_dir_path = std::string(gConfig->staged_session_dir) +
+                                   "/session_" + std::to_string(id_to_scan);
+    Result<std::vector<std::string>> scan =
+        FindFilesBySuffix(session_dir_path, {kApexPackageSuffix});
+    if (!scan.ok()) {
+      return scan.error();
+    }
+    if (scan->size() != 1) {
+      return Error() << "Expected exactly one APEX file in directory "
+                     << session_dir_path << ". Found: " << scan->size();
+    }
+    std::string& apex_file_path = (*scan)[0];
+    apex_file_paths.push_back(std::move(apex_file_path));
+  }
+
+  return OpenApexFiles(apex_file_paths);
 }
 
 std::vector<ApexFile> GetActivePackages() {
   std::vector<ApexFile> ret;
-  const auto& instance = ApexFileRepository::GetInstance();
   gMountedApexes.ForallMountedApexes(
       [&](const std::string&, const MountedApexData& data, bool latest) {
         if (!latest) {
           return;
         }
-        // A block apex requires its size to open it.
-        // Retrieves file_size from ApexFileRepository.
-        // TODO(b/187783952): we can remove this when the block device
-        // can be open without size.
-        std::optional<uint32_t> file_size = std::nullopt;
-        if (auto apex = instance.GetApexFile(data.full_path); apex) {
-          file_size = apex->get().GetFileSize();
-        }
-        Result<ApexFile> apex_file = ApexFile::Open(data.full_path, file_size);
+
+        Result<ApexFile> apex_file = ApexFile::Open(data.full_path);
         if (!apex_file.ok()) {
           return;
         }
@@ -1326,6 +1463,20 @@ std::vector<ApexFile> GetActivePackages() {
       });
 
   return ret;
+}
+
+std::vector<ApexFile> CalculateInactivePackages(
+    const std::vector<ApexFile>& active) {
+  std::vector<ApexFile> inactive = GetFactoryPackages();
+  auto new_end = std::remove_if(
+      inactive.begin(), inactive.end(), [&active](const ApexFile& apex) {
+        return std::any_of(active.begin(), active.end(),
+                           [&apex](const ApexFile& active_apex) {
+                             return apex.GetPath() == active_apex.GetPath();
+                           });
+      });
+  inactive.erase(new_end, inactive.end());
+  return std::move(inactive);
 }
 
 Result<void> EmitApexInfoList(bool is_bootstrap) {
@@ -1354,15 +1505,7 @@ Result<void> EmitApexInfoList(bool is_bootstrap) {
   // we skip for non-activated built-in apexes in bootstrap mode
   // in order to avoid boottime increase
   if (!is_bootstrap) {
-    inactive = GetFactoryPackages();
-    auto new_end = std::remove_if(
-        inactive.begin(), inactive.end(), [&active](const ApexFile& apex) {
-          return std::any_of(active.begin(), active.end(),
-                             [&apex](const ApexFile& active_apex) {
-                               return apex.GetPath() == active_apex.GetPath();
-                             });
-        });
-    inactive.erase(new_end, inactive.end());
+    inactive = CalculateInactivePackages(active);
   }
 
   std::stringstream xml;
@@ -1475,40 +1618,12 @@ Result<void> AbortStagedSession(int session_id) {
 
 namespace {
 
-// TODO(b/179497746): Avoid scanning apex directly here
-// Only used in OnBootstrap. Should we remove this function?
-Result<std::vector<ApexFile>> ScanApexFiles(const char* apex_package_dir,
-                                            bool include_compressed = false) {
-  LOG(INFO) << "Scanning " << apex_package_dir << " looking for APEX packages.";
-  if (access(apex_package_dir, F_OK) != 0 && errno == ENOENT) {
-    LOG(INFO) << "... does not exist. Skipping";
-    return {};
-  }
-  std::vector<std::string> suffix_list = {kApexPackageSuffix};
-  if (include_compressed) {
-    suffix_list.push_back(kCompressedApexPackageSuffix);
-  }
-  Result<std::vector<std::string>> scan =
-      FindFilesBySuffix(apex_package_dir, suffix_list);
-  if (!scan.ok()) {
-    return Error() << "Failed to scan " << apex_package_dir << " : "
-                   << scan.error();
-  }
-  std::vector<ApexFile> ret;
-  for (const auto& name : *scan) {
-    Result<ApexFile> apex_file = ApexFile::Open(name);
-    if (!apex_file.ok()) {
-      LOG(ERROR) << "Failed to scan " << name << " : " << apex_file.error();
-    } else {
-      ret.emplace_back(std::move(*apex_file));
-    }
-  }
-  return ret;
-}
+enum ActivationMode { kBootstrapMode = 0, kBootMode, kOtaChrootMode, kVmMode };
 
 std::vector<Result<void>> ActivateApexWorker(
-    bool is_ota_chroot, std::queue<const ApexFile*>& apex_queue,
+    ActivationMode mode, std::queue<const ApexFile*>& apex_queue,
     std::mutex& mutex) {
+  ATRACE_NAME("ActivateApexWorker");
   std::vector<Result<void>> ret;
 
   while (true) {
@@ -1520,11 +1635,18 @@ std::vector<Result<void>> ActivateApexWorker(
       apex_queue.pop();
     }
 
-    std::string device_name = GetPackageId(apex->GetManifest());
-    if (is_ota_chroot) {
+    std::string device_name;
+    if (mode == ActivationMode::kBootMode) {
+      device_name = apex->GetManifest().name();
+    } else {
+      device_name = GetPackageId(apex->GetManifest());
+    }
+    if (mode == ActivationMode::kOtaChrootMode) {
       device_name += ".chroot";
     }
-    if (auto res = ActivatePackageImpl(*apex, device_name); !res.ok()) {
+    bool reuse_device = mode == ActivationMode::kBootMode;
+    auto res = ActivatePackageImpl(*apex, device_name, reuse_device);
+    if (!res.ok()) {
       ret.push_back(Error() << "Failed to activate " << apex->GetPath() << " : "
                             << res.error());
     } else {
@@ -1536,7 +1658,8 @@ std::vector<Result<void>> ActivateApexWorker(
 }
 
 Result<void> ActivateApexPackages(const std::vector<ApexFileRef>& apexes,
-                                  bool is_ota_chroot) {
+                                  ActivationMode mode) {
+  ATRACE_NAME("ActivateApexPackages");
   std::queue<const ApexFile*> apex_queue;
   std::mutex apex_queue_mutex;
 
@@ -1561,12 +1684,13 @@ Result<void> ActivateApexPackages(const std::vector<ApexFileRef>& apexes,
   futures.reserve(worker_num);
   for (size_t i = 0; i < worker_num; i++) {
     futures.push_back(std::async(std::launch::async, ActivateApexWorker,
-                                 std::ref(is_ota_chroot), std::ref(apex_queue),
+                                 std::ref(mode), std::ref(apex_queue),
                                  std::ref(apex_queue_mutex)));
   }
 
   size_t activated_cnt = 0;
   size_t failed_cnt = 0;
+  std::string error_message;
   for (size_t i = 0; i < futures.size(); i++) {
     for (const auto& res : futures[i].get()) {
       if (res.ok()) {
@@ -1574,12 +1698,16 @@ Result<void> ActivateApexPackages(const std::vector<ApexFileRef>& apexes,
       } else {
         ++failed_cnt;
         LOG(ERROR) << res.error();
+        if (failed_cnt == 1) {
+          error_message = res.error().message();
+        }
       }
     }
   }
 
   if (failed_cnt > 0) {
-    return Error() << "Failed to activate " << failed_cnt << " APEX packages";
+    return Error() << "Failed to activate " << failed_cnt
+                   << " APEX packages. One of the errors: " << error_message;
   }
   LOG(INFO) << "Activated " << activated_cnt << " packages.";
   return {};
@@ -1589,7 +1717,7 @@ Result<void> ActivateApexPackages(const std::vector<ApexFileRef>& apexes,
 // such apexes that were coming from /data partition we will attempt to activate
 // their corresponding pre-installed copies.
 Result<void> ActivateMissingApexes(const std::vector<ApexFileRef>& apexes,
-                                   bool is_ota_chroot) {
+                                   ActivationMode mode) {
   LOG(INFO) << "Trying to activate pre-installed versions of missing apexes";
   const auto& file_repository = ApexFileRepository::GetInstance();
   const auto& activated_apexes = GetActivePackagesMap();
@@ -1624,13 +1752,14 @@ Result<void> ActivateMissingApexes(const std::vector<ApexFileRef>& apexes,
   }
   std::vector<ApexFile> decompressed_apex;
   if (!compressed_apex.empty()) {
-    decompressed_apex =
-        ProcessCompressedApex(compressed_apex, /* is_ota_chroot= */ false);
+    decompressed_apex = ProcessCompressedApex(
+        compressed_apex,
+        /* is_ota_chroot= */ mode == ActivationMode::kOtaChrootMode);
     for (const ApexFile& apex_file : decompressed_apex) {
       fallback_apexes.emplace_back(std::cref(apex_file));
     }
   }
-  return ActivateApexPackages(fallback_apexes, is_ota_chroot);
+  return ActivateApexPackages(fallback_apexes, mode);
 }
 
 }  // namespace
@@ -1701,7 +1830,7 @@ void SnapshotOrRestoreDeIfNeeded(const std::string& base_dir,
     }
   } else if (session.IsRollback()) {
     for (const auto& apex_name : session.GetApexNames()) {
-      if (!gInFsCheckpointMode) {
+      if (!gSupportsFsCheckpoints) {
         // Snapshot before restore so this rollback can be reverted.
         SnapshotDataDirectory(base_dir, session.GetRollbackId(), apex_name,
                               true /* pre_restore */);
@@ -1883,7 +2012,6 @@ void DeleteDePreRestoreSnapshots(const ApexSession& session) {
 
 void OnBootCompleted() {
   ApexdLifecycle::GetInstance().MarkBootCompleted();
-  BootCompletedCleanup();
 }
 
 // Returns true if any session gets staged
@@ -1920,18 +2048,31 @@ void ScanStagedSessionsDirAndStage() {
 
     std::string build_fingerprint = GetProperty(kBuildFingerprintSysprop, "");
     if (session.GetBuildFingerprint().compare(build_fingerprint) != 0) {
-      LOG(ERROR) << "APEX build fingerprint has changed";
+      auto error_message = "APEX build fingerprint has changed";
+      LOG(ERROR) << error_message;
+      session.SetErrorMessage(error_message);
+      continue;
+    }
+
+    // If device supports fs-checkpoint, then apex session should only be
+    // installed when in checkpoint-mode. Otherwise, we will not be able to
+    // revert /data on error.
+    if (gSupportsFsCheckpoints && !gInFsCheckpointMode) {
+      auto error_message =
+          "Cannot install apex session if not in fs-checkpoint mode";
+      LOG(ERROR) << error_message;
+      session.SetErrorMessage(error_message);
       continue;
     }
 
     std::vector<std::string> dirs_to_scan;
     if (session.GetChildSessionIds().empty()) {
-      dirs_to_scan.push_back(std::string(kStagedSessionsDir) + "/session_" +
-                             std::to_string(session_id));
+      dirs_to_scan.push_back(std::string(gConfig->staged_session_dir) +
+                             "/session_" + std::to_string(session_id));
     } else {
       for (auto child_session_id : session.GetChildSessionIds()) {
-        dirs_to_scan.push_back(std::string(kStagedSessionsDir) + "/session_" +
-                               std::to_string(child_session_id));
+        dirs_to_scan.push_back(std::string(gConfig->staged_session_dir) +
+                               "/session_" + std::to_string(child_session_id));
       }
     }
 
@@ -1942,20 +2083,28 @@ void ScanStagedSessionsDirAndStage() {
           FindFilesBySuffix(dir_to_scan, {kApexPackageSuffix});
       if (!scan.ok()) {
         LOG(WARNING) << scan.error();
+        session.SetErrorMessage(scan.error().message());
         scan_successful = false;
         break;
       }
 
       if (scan->size() > 1) {
-        LOG(WARNING) << "More than one APEX package found in the same session "
-                     << "directory " << dir_to_scan << ", skipping activation.";
+        std::string error_message = StringPrintf(
+            "More than one APEX package found in the same session directory %s "
+            ", skipping activation",
+            dir_to_scan.c_str());
+        LOG(WARNING) << error_message;
+        session.SetErrorMessage(error_message);
         scan_successful = false;
         break;
       }
 
       if (scan->empty()) {
-        LOG(WARNING) << "No APEX packages found while scanning " << dir_to_scan
-                     << " session id: " << session_id << ".";
+        std::string error_message = StringPrintf(
+            "No APEX packages found while scanning %s session id: %d.",
+            dir_to_scan.c_str(), session_id);
+        LOG(WARNING) << error_message;
+        session.SetErrorMessage(error_message);
         scan_successful = false;
         break;
       }
@@ -1963,15 +2112,6 @@ void ScanStagedSessionsDirAndStage() {
     }
 
     if (!scan_successful) {
-      continue;
-    }
-
-    // Run postinstall, if necessary.
-    Result<void> postinstall_status = PostinstallPackages(apexes);
-    if (!postinstall_status.ok()) {
-      LOG(ERROR) << "Postinstall failed for session "
-                 << std::to_string(session_id) << ": "
-                 << postinstall_status.error();
       continue;
     }
 
@@ -1987,8 +2127,11 @@ void ScanStagedSessionsDirAndStage() {
 
     const Result<void> result = StagePackages(apexes);
     if (!result.ok()) {
-      LOG(ERROR) << "Activation failed for packages " << Join(apexes, ',')
-                 << ": " << result.error();
+      std::string error_message = StringPrintf(
+          "Activation failed for packages %s : %s", Join(apexes, ',').c_str(),
+          result.error().message().c_str());
+      LOG(ERROR) << error_message;
+      session.SetErrorMessage(error_message);
       continue;
     }
 
@@ -2012,18 +2155,9 @@ Result<void> PreinstallPackages(const std::vector<std::string>& paths) {
   return PreinstallPackages(*apex_files);
 }
 
-Result<void> PostinstallPackages(const std::vector<std::string>& paths) {
-  Result<std::vector<ApexFile>> apex_files = OpenApexFiles(paths);
-  if (!apex_files.ok()) {
-    return apex_files.error();
-  }
-  LOG(DEBUG) << "PostinstallPackages() for " << Join(paths, ',');
-  return PostinstallPackages(*apex_files);
-}
-
 namespace {
 std::string StageDestPath(const ApexFile& apex_file) {
-  return StringPrintf("%s/%s%s", kActiveApexPackagesDataDir,
+  return StringPrintf("%s/%s%s", gConfig->active_apex_data_dir,
                       GetPackageId(apex_file.GetManifest()).c_str(),
                       kApexPackageSuffix);
 }
@@ -2057,7 +2191,7 @@ Result<void> StagePackages(const std::vector<std::string>& tmp_paths) {
 
   // Make sure that kActiveApexPackagesDataDir exists.
   auto create_dir_status =
-      CreateDirIfNeeded(std::string(kActiveApexPackagesDataDir), 0755);
+      CreateDirIfNeeded(std::string(gConfig->active_apex_data_dir), 0755);
   if (!create_dir_status.ok()) {
     return create_dir_status.error();
   }
@@ -2156,7 +2290,8 @@ Result<void> UnstagePackages(const std::vector<std::string>& paths) {
  * Also, we need to put staged sessions in /data/apex/sessions in REVERTED state
  * so that they do not get activated on next reboot.
  */
-Result<void> RevertActiveSessions(const std::string& crashing_native_process) {
+Result<void> RevertActiveSessions(const std::string& crashing_native_process,
+                                  const std::string& error_message) {
   // First check whenever there is anything to revert. If there is none, then
   // fail. This prevents apexd from boot looping a device in case a native
   // process is crashing and there are no apex updates.
@@ -2169,6 +2304,9 @@ Result<void> RevertActiveSessions(const std::string& crashing_native_process) {
     if (!crashing_native_process.empty()) {
       session.SetCrashingNativeProcess(crashing_native_process);
     }
+    if (!error_message.empty()) {
+      session.SetErrorMessage(error_message);
+    }
     auto status =
         session.UpdateStateAndCommit(SessionState::REVERT_IN_PROGRESS);
     if (!status.ok()) {
@@ -2177,7 +2315,7 @@ Result<void> RevertActiveSessions(const std::string& crashing_native_process) {
     }
   }
 
-  if (!gInFsCheckpointMode) {
+  if (!gSupportsFsCheckpoints) {
     auto restore_status = RestoreActivePackages();
     if (!restore_status.ok()) {
       for (auto& session : active_sessions) {
@@ -2195,7 +2333,7 @@ Result<void> RevertActiveSessions(const std::string& crashing_native_process) {
   }
 
   for (auto& session : active_sessions) {
-    if (!gInFsCheckpointMode && session.IsRollback()) {
+    if (!gSupportsFsCheckpoints && session.IsRollback()) {
       // If snapshots have already been restored, undo that by restoring the
       // pre-restore snapshot.
       RestoreDePreRestoreSnapshotsIfPresent(session);
@@ -2212,8 +2350,9 @@ Result<void> RevertActiveSessions(const std::string& crashing_native_process) {
 }
 
 Result<void> RevertActiveSessionsAndReboot(
-    const std::string& crashing_native_process) {
-  auto status = RevertActiveSessions(crashing_native_process);
+    const std::string& crashing_native_process,
+    const std::string& error_message) {
+  auto status = RevertActiveSessions(crashing_native_process, error_message);
   if (!status.ok()) {
     return status;
   }
@@ -2260,6 +2399,8 @@ Result<void> CreateSharedLibsApexDir() {
 }
 
 int OnBootstrap() {
+  ATRACE_NAME("OnBootstrap");
+  auto time_started = boot_clock::now();
   Result<void> pre_allocate = PreAllocateLoopDevices();
   if (!pre_allocate.ok()) {
     LOG(ERROR) << "Failed to pre-allocate loop devices : "
@@ -2267,12 +2408,27 @@ int OnBootstrap() {
   }
 
   ApexFileRepository& instance = ApexFileRepository::GetInstance();
-  static const std::vector<std::string> kBootstrapApexDirs{
-      kApexPackageSystemDir, kApexPackageSystemExtDir, kApexPackageVendorDir};
-  Result<void> status = instance.AddPreInstalledApex(kBootstrapApexDirs);
+  Result<void> status =
+      instance.AddPreInstalledApex(gConfig->apex_built_in_dirs);
   if (!status.ok()) {
     LOG(ERROR) << "Failed to collect APEX keys : " << status.error();
     return 1;
+  }
+
+  DeviceMapper& dm = DeviceMapper::Instance();
+  // Create empty dm device for each found APEX.
+  // This is a boot time optimization that makes use of the fact that user space
+  // paths will be created by ueventd before apexd is started, and hence
+  // reducing the time to activate APEXEs on /data.
+  // Note: since at this point we don't know which APEXes are updated, we are
+  // optimistically creating a verity device for all of them. Once boot
+  // finishes, apexd will clean up unused devices.
+  // TODO(b/192241176): move to apexd_verity.{h,cpp}
+  for (const auto& apex : instance.GetPreInstalledApexFiles()) {
+    const std::string& name = apex.get().GetManifest().name();
+    if (!dm.CreateEmptyDevice(name)) {
+      LOG(ERROR) << "Failed to create empty device " << name;
+    }
   }
 
   // Create directories for APEX shared libraries.
@@ -2283,33 +2439,25 @@ int OnBootstrap() {
   }
 
   // Find all bootstrap apexes
-  std::vector<ApexFile> bootstrap_apexes;
-  for (const auto& dir : kBootstrapApexDirs) {
-    auto scan = ScanApexFiles(dir.c_str());
-    if (!scan.ok()) {
-      LOG(ERROR) << "Failed to scan APEX files in " << dir << " : "
-                 << scan.error();
-      return 1;
+  std::vector<ApexFileRef> bootstrap_apexes;
+  for (const auto& apex : instance.GetPreInstalledApexFiles()) {
+    if (IsBootstrapApex(apex.get())) {
+      bootstrap_apexes.push_back(apex);
     }
-    std::copy_if(std::make_move_iterator(scan->begin()),
-                 std::make_move_iterator(scan->end()),
-                 std::back_inserter(bootstrap_apexes), IsBootstrapApex);
   }
 
   // Now activate bootstrap apexes.
-  std::vector<ApexFileRef> bootstrap_apexes_ref;
-  std::transform(bootstrap_apexes.begin(), bootstrap_apexes.end(),
-                 std::back_inserter(bootstrap_apexes_ref),
-                 [](const auto& x) { return std::cref(x); });
-  auto ret = ActivateApexPackages(bootstrap_apexes_ref,
-                                  /* is_ota_chroot= */ false);
+  auto ret =
+      ActivateApexPackages(bootstrap_apexes, ActivationMode::kBootstrapMode);
   if (!ret.ok()) {
     LOG(ERROR) << "Failed to activate bootstrap apex files : " << ret.error();
     return 1;
   }
 
   OnAllPackagesActivated(/*is_bootstrap=*/true);
-  LOG(INFO) << "Bootstrapping done";
+  auto time_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+    boot_clock::now() - time_started).count();
+  LOG(INFO) << "OnBootstrap done, duration=" << time_elapsed;
   return 0;
 }
 
@@ -2362,8 +2510,7 @@ void Initialize(CheckpointInterface* checkpoint_service) {
 //  ApexFileRepository can act as cache and re-scanning is not expensive
 void InitializeDataApex() {
   ApexFileRepository& instance = ApexFileRepository::GetInstance();
-  Result<void> status =
-      instance.AddDataApex(kActiveApexPackagesDataDir, kApexDecompressedDir);
+  Result<void> status = instance.AddDataApex(kActiveApexPackagesDataDir);
   if (!status.ok()) {
     LOG(ERROR) << "Failed to collect data APEX files : " << status.error();
     return;
@@ -2425,22 +2572,46 @@ std::vector<ApexFileRef> SelectApexForActivation(
                            const ApexFileRef& a_ref,
                            const int version_b) mutable {
       const ApexFile& a = a_ref.get();
-      // APEX that provides shared library always gets activated
-      const bool provides_shared_apex_libs =
-          a.GetManifest().providesharedapexlibs();
       // If A has higher version than B, then it should be activated
       const bool higher_version = a.GetManifest().version() > version_b;
       // If A has same version as B, then data version should get activated
       const bool same_version_priority_to_data =
           a.GetManifest().version() == version_b &&
           !instance.IsPreInstalledApex(a);
-      // If A has same version as B and they are both pre-installed,
-      // then it means one of them is compressed. Choose decompressed copy.
-      const bool decompressed = instance.IsDecompressedApex(a);
-      if (provides_shared_apex_libs || higher_version ||
-          same_version_priority_to_data || decompressed) {
+
+      // APEX that provides shared library are special:
+      //  - if preinstalled version is lower than data version, both versions
+      //    are activated.
+      //  - if preinstalled version is equal to data version, data version only
+      //    is activated.
+      //  - if preinstalled version is higher than data version, preinstalled
+      //    version only is activated.
+      const bool provides_shared_apex_libs =
+          a.GetManifest().providesharedapexlibs();
+      bool activate = false;
+      if (provides_shared_apex_libs) {
+        // preinstalled version gets activated in all cases except when same
+        // version as data.
+        if (instance.IsPreInstalledApex(a) &&
+            (a.GetManifest().version() != version_b)) {
+          LOG(DEBUG) << "Activating preinstalled shared libs APEX: "
+                     << a.GetManifest().name() << " " << a.GetPath();
+          activate = true;
+        }
+        // data version gets activated in all cases except when its version
+        // is lower than preinstalled version.
+        if (!instance.IsPreInstalledApex(a) &&
+            (a.GetManifest().version() >= version_b)) {
+          LOG(DEBUG) << "Activating shared libs APEX: "
+                     << a.GetManifest().name() << " " << a.GetPath();
+          activate = true;
+        }
+      } else if (higher_version || same_version_priority_to_data) {
         LOG(DEBUG) << "Selecting between two APEX: " << a.GetManifest().name()
                    << " " << a.GetPath();
+        activate = true;
+      }
+      if (activate) {
         activation_list.emplace_back(a_ref);
       }
     };
@@ -2452,6 +2623,137 @@ std::vector<ApexFileRef> SelectApexForActivation(
   return activation_list;
 }
 
+namespace {
+
+Result<ApexFile> OpenAndValidateDecompressedApex(const ApexFile& capex,
+                                                 const std::string& apex_path) {
+  auto apex = ApexFile::Open(apex_path);
+  if (!apex.ok()) {
+    return Error() << "Failed to open decompressed APEX: " << apex.error();
+  }
+  auto result = ValidateDecompressedApex(capex, *apex);
+  if (!result.ok()) {
+    return result.error();
+  }
+  return std::move(*apex);
+}
+
+// Process a single compressed APEX. Returns the decompressed APEX if
+// successful.
+Result<ApexFile> ProcessCompressedApex(const ApexFile& capex,
+                                       bool is_ota_chroot) {
+  LOG(INFO) << "Processing compressed APEX " << capex.GetPath();
+  const auto decompressed_apex_path =
+      StringPrintf("%s/%s%s", gConfig->decompression_dir,
+                   GetPackageId(capex.GetManifest()).c_str(),
+                   kDecompressedApexPackageSuffix);
+  // Check if decompressed APEX already exist
+  auto decompressed_path_exists = PathExists(decompressed_apex_path);
+  if (decompressed_path_exists.ok() && *decompressed_path_exists) {
+    // Check if existing decompressed APEX is valid
+    auto result =
+        OpenAndValidateDecompressedApex(capex, decompressed_apex_path);
+    if (result.ok()) {
+      LOG(INFO) << "Skipping decompression for " << capex.GetPath();
+      return result;
+    }
+    // Do not delete existing decompressed APEX when is_ota_chroot is true
+    if (!is_ota_chroot) {
+      // Existing decompressed APEX is not valid. We will have to redecompress
+      LOG(WARNING) << "Existing decompressed APEX is invalid: "
+                   << result.error();
+      RemoveFileIfExists(decompressed_apex_path);
+    }
+  }
+
+  // We can also reuse existing OTA APEX, depending on situation
+  auto ota_apex_path = StringPrintf("%s/%s%s", gConfig->decompression_dir,
+                                    GetPackageId(capex.GetManifest()).c_str(),
+                                    kOtaApexPackageSuffix);
+  auto ota_path_exists = PathExists(ota_apex_path);
+  if (ota_path_exists.ok() && *ota_path_exists) {
+    if (is_ota_chroot) {
+      // During ota_chroot, we try to reuse ota APEX as is
+      auto result = OpenAndValidateDecompressedApex(capex, ota_apex_path);
+      if (result.ok()) {
+        LOG(INFO) << "Skipping decompression for " << ota_apex_path;
+        return result;
+      }
+      // Existing ota_apex is not valid. We will have to decompress
+      LOG(WARNING) << "Existing decompressed OTA APEX is invalid: "
+                   << result.error();
+      RemoveFileIfExists(ota_apex_path);
+    } else {
+      // During boot, we can avoid decompression by renaming OTA apex
+      // to expected decompressed_apex path
+
+      // Check if ota_apex APEX is valid
+      auto result = OpenAndValidateDecompressedApex(capex, ota_apex_path);
+      if (result.ok()) {
+        // ota_apex matches with capex. Slot has been switched.
+
+        // Rename ota_apex to expected decompressed_apex path
+        if (rename(ota_apex_path.c_str(), decompressed_apex_path.c_str()) ==
+            0) {
+          // Check if renamed decompressed APEX is valid
+          result =
+              OpenAndValidateDecompressedApex(capex, decompressed_apex_path);
+          if (result.ok()) {
+            LOG(INFO) << "Renamed " << ota_apex_path << " to "
+                      << decompressed_apex_path;
+            return result;
+          }
+          // Renamed ota_apex is not valid. We will have to decompress
+          LOG(WARNING) << "Renamed decompressed APEX from " << ota_apex_path
+                       << " to " << decompressed_apex_path
+                       << " is invalid: " << result.error();
+          RemoveFileIfExists(decompressed_apex_path);
+        } else {
+          PLOG(ERROR) << "Failed to rename file " << ota_apex_path;
+        }
+      }
+    }
+  }
+
+  // There was no way to avoid decompression
+
+  // Clean up reserved space before decompressing capex
+  if (auto ret = DeleteDirContent(gConfig->ota_reserved_dir); !ret.ok()) {
+    LOG(ERROR) << "Failed to clean up reserved space: " << ret.error();
+  }
+
+  auto decompression_dest =
+      is_ota_chroot ? ota_apex_path : decompressed_apex_path;
+  auto scope_guard = android::base::make_scope_guard(
+      [&]() { RemoveFileIfExists(decompression_dest); });
+
+  auto decompression_result = capex.Decompress(decompression_dest);
+  if (!decompression_result.ok()) {
+    return Error() << "Failed to decompress : " << capex.GetPath().c_str()
+                   << " " << decompression_result.error();
+  }
+
+  // Fix label of decompressed file
+  auto restore = RestoreconPath(decompression_dest);
+  if (!restore.ok()) {
+    return restore.error();
+  }
+
+  // Validate the newly decompressed APEX
+  auto return_apex = OpenAndValidateDecompressedApex(capex, decompression_dest);
+  if (!return_apex.ok()) {
+    return Error() << "Failed to decompress CAPEX: " << return_apex.error();
+  }
+
+  /// Release compressed blocks in case decompression_dest is on f2fs-compressed
+  // filesystem.
+  ReleaseF2fsCompressedBlocks(decompression_dest);
+
+  scope_guard.Disable();
+  return return_apex;
+}
+}  // namespace
+
 /**
  * For each compressed APEX, decompress it to kApexDecompressedDir
  * and return the decompressed APEX.
@@ -2462,111 +2764,53 @@ std::vector<ApexFile> ProcessCompressedApex(
     const std::vector<ApexFileRef>& compressed_apex, bool is_ota_chroot) {
   LOG(INFO) << "Processing compressed APEX";
 
-  // Clean up reserved space before decompressing capex
-  if (auto ret = DeleteDirContent(gConfig->ota_reserved_dir); !ret.ok()) {
-    LOG(ERROR) << "Failed to clean up reserved space: " << ret.error();
-  }
-
   std::vector<ApexFile> decompressed_apex_list;
-  for (const ApexFile& apex_file : compressed_apex) {
-    if (!apex_file.IsCompressed()) {
-      continue;
-    }
-    LOG(INFO) << "Processing compressed APEX " << apex_file.GetPath();
-    // Files to clean up if processing fails for any reason
-    std::vector<std::string> cleanup;
-    auto scope_guard = android::base::make_scope_guard([&cleanup] {
-      for (const auto& file_path : cleanup) {
-        RemoveFileIfExists(file_path);
-      }
-    });
-
-    const auto suffix_to_use =
-        is_ota_chroot ? kOtaApexPackageSuffix : kDecompressedApexPackageSuffix;
-    const auto dest_path_decompressed = StringPrintf(
-        "%s/%s%s", gConfig->decompression_dir,
-        GetPackageId(apex_file.GetManifest()).c_str(), suffix_to_use);
-
-    cleanup.push_back(dest_path_decompressed);
-
-    // Decompress only if path doesn't exist. Otherwise reuse existing
-    // decompressed APEX
-    auto decompressed_path_exists = PathExists(dest_path_decompressed);
-    if (!decompressed_path_exists.ok() || !*decompressed_path_exists) {
-      // Try to avoid decompression if there is an ota_apex ready to be reused
-      // and we are not booting from chroot
-      auto ota_apex_path = StringPrintf(
-          "%s/%s%s", gConfig->decompression_dir,
-          GetPackageId(apex_file.GetManifest()).c_str(), kOtaApexPackageSuffix);
-      auto ota_path_exists = PathExists(ota_apex_path);
-      if (!is_ota_chroot && ota_path_exists.ok() && *ota_path_exists) {
-        LOG(INFO) << "Renaming " << ota_apex_path << " to "
-                  << dest_path_decompressed;
-        if (rename(ota_apex_path.c_str(), dest_path_decompressed.c_str()) !=
-            0) {
-          PLOG(ERROR) << "Failed to rename file " << ota_apex_path;
-          continue;
-        }
-      } else {
-        auto result = apex_file.Decompress(dest_path_decompressed);
-        if (!result.ok()) {
-          LOG(ERROR) << "Failed to decompress : " << apex_file.GetPath().c_str()
-                     << " " << result.error();
-          continue;
-        }
-      }
-
-      // Fix label of decompressed file
-      auto restore = RestoreconPath(dest_path_decompressed);
-      if (!restore.ok()) {
-        LOG(ERROR) << restore.error();
-        continue;
-      }
-    } else {
-      LOG(INFO) << "Skipping decompression for " << apex_file.GetPath();
-    }
-
-    // Post decompression validation
-    auto return_apex = ApexFile::Open(dest_path_decompressed);
-    if (!return_apex.ok()) {
-      LOG(ERROR) << "Failed to open decompressed APEX : "
-                 << dest_path_decompressed << " " << return_apex.error();
-      continue;
-    }
-    auto validation_result =
-        ValidateDecompressedApex(apex_file, std::cref(*return_apex));
-    if (!validation_result.ok()) {
-      LOG(ERROR) << "Validation failed for decompressed APEX "
-                 << dest_path_decompressed << " " << validation_result.error();
+  for (const ApexFile& capex : compressed_apex) {
+    if (!capex.IsCompressed()) {
       continue;
     }
 
-    // Decompressed APEX has been successfully processed. Accept it.
-    scope_guard.Disable();
-    decompressed_apex_list.emplace_back(std::move(*return_apex));
+    auto decompressed_apex = ProcessCompressedApex(capex, is_ota_chroot);
+    if (decompressed_apex.ok()) {
+      decompressed_apex_list.emplace_back(std::move(*decompressed_apex));
+      continue;
+    }
+    LOG(ERROR) << "Failed to process compressed APEX: "
+               << decompressed_apex.error();
   }
   return std::move(decompressed_apex_list);
 }
 
 Result<void> ValidateDecompressedApex(const ApexFile& capex,
                                       const ApexFile& apex) {
+  // Decompressed APEX must have same public key as CAPEX
   if (capex.GetBundledPublicKey() != apex.GetBundledPublicKey()) {
     return Error()
            << "Public key of compressed APEX is different than original "
-              "APEX for "
-           << apex.GetPath();
+           << "APEX for " << apex.GetPath();
   }
+  // Decompressed APEX must have same version as CAPEX
   if (capex.GetManifest().version() != apex.GetManifest().version()) {
     return Error()
-           << "Compressed APEX has different version than decompressed APEX"
+           << "Compressed APEX has different version than decompressed APEX "
            << apex.GetPath();
   }
-
+  // Decompressed APEX must have same root digest as what is stored in CAPEX
+  auto apex_verity = apex.VerifyApexVerity(apex.GetBundledPublicKey());
+  if (!apex_verity.ok() ||
+      capex.GetManifest().capexmetadata().originalapexdigest() !=
+          apex_verity->root_digest) {
+    return Error() << "Root digest of " << apex.GetPath()
+                   << " does not match with"
+                   << " expected root digest in " << capex.GetPath();
+  }
   return {};
 }
 
 void OnStart() {
+  ATRACE_NAME("OnStart");
   LOG(INFO) << "Marking APEXd as starting";
+  auto time_started = boot_clock::now();
   if (!SetProperty(gConfig->apex_status_sysprop, kApexStatusStarting)) {
     PLOG(ERROR) << "Failed to set " << gConfig->apex_status_sysprop << " to "
                 << kApexStatusStarting;
@@ -2584,7 +2828,7 @@ void OnStart() {
       LOG(INFO) << "Exceeded number of session retries ("
                 << kNumRetriesWhenCheckpointingEnabled
                 << "). Starting a revert";
-      RevertActiveSessions("");
+      RevertActiveSessions("", "");
     }
   }
 
@@ -2598,7 +2842,7 @@ void OnStart() {
   // them to /data/apex/active first.
   ScanStagedSessionsDirAndStage();
   if (auto status = ApexFileRepository::GetInstance().AddDataApex(
-          gConfig->active_apex_data_dir, gConfig->decompression_dir);
+          gConfig->active_apex_data_dir);
       !status.ok()) {
     LOG(ERROR) << "Failed to collect data APEX files : " << status.error();
   }
@@ -2648,15 +2892,19 @@ void OnStart() {
 
   // TODO(b/179248390): activate parallelly if possible
   auto activate_status =
-      ActivateApexPackages(activation_list, /* is_ota_chroot= */ false);
+      ActivateApexPackages(activation_list, ActivationMode::kBootMode);
   if (!activate_status.ok()) {
-    LOG(ERROR) << "Failed to activate packages: " << activate_status.error();
-    Result<void> revert_status = RevertActiveSessionsAndReboot("");
+    std::string error_message =
+        StringPrintf("Failed to activate packages: %s",
+                     activate_status.error().message().c_str());
+    LOG(ERROR) << error_message;
+    Result<void> revert_status =
+        RevertActiveSessionsAndReboot("", error_message);
     if (!revert_status.ok()) {
       LOG(ERROR) << "Failed to revert : " << revert_status.error();
     }
-    auto retry_status = ActivateMissingApexes(activation_list,
-                                              /* is_ota_chroot= */ false);
+    auto retry_status =
+        ActivateMissingApexes(activation_list, ActivationMode::kBootMode);
     if (!retry_status.ok()) {
       LOG(ERROR) << retry_status.error();
     }
@@ -2664,6 +2912,10 @@ void OnStart() {
 
   // Now that APEXes are mounted, snapshot or restore DE_sys data.
   SnapshotOrRestoreDeSysData();
+
+  auto time_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+    boot_clock::now() - time_started).count();
+  LOG(INFO) << "OnStart done, duration=" << time_elapsed;
 }
 
 void OnAllPackagesActivated(bool is_bootstrap) {
@@ -2727,6 +2979,11 @@ Result<std::vector<ApexFile>> SubmitStagedSession(
   }
 
   std::vector<ApexFile> ret;
+  auto guard = android::base::make_scope_guard([&ret]() {
+    for (const auto& apex : ret) {
+      apexd_private::UnmountTempMount(apex);
+    }
+  });
   for (int id_to_scan : ids_to_scan) {
     auto verified = VerifySessionDir(id_to_scan);
     if (!verified.ok()) {
@@ -2760,6 +3017,11 @@ Result<std::vector<ApexFile>> SubmitStagedSession(
       (*session).UpdateStateAndCommit(SessionState::VERIFIED);
   if (!commit_status.ok()) {
     return commit_status.error();
+  }
+
+  for (const auto& apex : ret) {
+    // Release compressed blocks in case /data is f2fs-compressed filesystem.
+    ReleaseF2fsCompressedBlocks(apex.GetPath());
   }
 
   return ret;
@@ -2799,7 +3061,7 @@ Result<void> MarkStagedSessionSuccessful(const int session_id) {
       return Error() << "Failed to mark session " << *session
                      << " as successful : " << cleanup_status.error();
     }
-    if (session->IsRollback() && !gInFsCheckpointMode) {
+    if (session->IsRollback() && !gSupportsFsCheckpoints) {
       DeleteDePreRestoreSnapshots(*session);
     }
     return session->UpdateStateAndCommit(SessionState::SUCCESS);
@@ -2842,9 +3104,40 @@ void RemoveInactiveDataApex() {
   }
 }
 
+bool IsApexDevice(const std::string& dev_name) {
+  auto& repo = ApexFileRepository::GetInstance();
+  for (const auto& apex : repo.GetPreInstalledApexFiles()) {
+    if (StartsWith(dev_name, apex.get().GetManifest().name())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// TODO(b/192241176): move to apexd_verity.{h,cpp}.
+void DeleteUnusedVerityDevices() {
+  DeviceMapper& dm = DeviceMapper::Instance();
+  std::vector<DeviceMapper::DmBlockDevice> all_devices;
+  if (!dm.GetAvailableDevices(&all_devices)) {
+    LOG(WARNING) << "Failed to fetch dm devices";
+    return;
+  }
+  for (const auto& dev : all_devices) {
+    auto state = dm.GetState(dev.name());
+    if (state == DmDeviceState::SUSPENDED && IsApexDevice(dev.name())) {
+      LOG(INFO) << "Deleting unused dm device " << dev.name();
+      auto res = DeleteVerityDevice(dev.name(), /* deferred= */ false);
+      if (!res.ok()) {
+        LOG(WARNING) << res.error();
+      }
+    }
+  }
+}
+
 void BootCompletedCleanup() {
   RemoveInactiveDataApex();
   ApexSession::DeleteFinalizedSessions();
+  DeleteUnusedVerityDevices();
 }
 
 int UnmountAll() {
@@ -2873,7 +3166,7 @@ int UnmountAll() {
         ret = 1;
       }
     }
-    if (auto status = Unmount(data); !status.ok()) {
+    if (auto status = Unmount(data, /* deferred= */ false); !status.ok()) {
       LOG(ERROR) << "Failed to unmount " << data.mount_point << " : "
                  << status.error();
       ret = 1;
@@ -2914,9 +3207,9 @@ Result<void> RemountPackages() {
 }
 
 // Given a single new APEX incoming via OTA, should we allocate space for it?
-Result<bool> ShouldAllocateSpaceForDecompression(
-    const std::string& new_apex_name, const int64_t new_apex_version,
-    const ApexFileRepository& instance) {
+bool ShouldAllocateSpaceForDecompression(const std::string& new_apex_name,
+                                         const int64_t new_apex_version,
+                                         const ApexFileRepository& instance) {
   // An apex at most will have two versions on device: pre-installed and data.
 
   // Check if there is a pre-installed version for the new apex.
@@ -2925,40 +3218,52 @@ Result<bool> ShouldAllocateSpaceForDecompression(
     return true;
   }
 
-  // From here on, we can assume there is a pre-installed APEX.
   // Check if there is a data apex
   if (!instance.HasDataVersion(new_apex_name)) {
-    // Decompression of compressed APEX is prevented by existing data apex.
-    // Since there is none, then new_apex will definitely get decompressed.
-    return true;
-  }
-
-  // From here on, data apex exists. So we should compare directly against data
-  // apex.
-  // TODO(b/179497746): have ApexFileRepo provide reference to individual
-  // pre-installed apex by name
-  const auto data_apex_path = instance.GetDataPath(new_apex_name);
-  if (!data_apex_path.ok()) {
-    return Error() << "Failed to open data apex";
-  }
-  const auto data_apex = ApexFile::Open(*data_apex_path);
-  // Compare the data apex version with new apex
-  const int64_t data_version = data_apex->GetManifest().version();
-
-  // new_apex will compete against the data apex if data apex is from an update.
-  if (instance.IsDecompressedApex(*data_apex)) {
-    // Since data apex is decompressed, it means device is using the compressed
+    // Data apex doesn't exist. Compare against pre-installed APEX
+    auto pre_installed_apex = instance.GetPreInstalledApex(new_apex_name);
+    if (!pre_installed_apex.get().IsCompressed()) {
+      // Compressing an existing uncompressed system APEX.
+      return true;
+    }
+    // Since there is no data apex, it means device is using the compressed
     // pre-installed version. If new apex has higher version, we are upgrading
     // the pre-install version and if new apex has lower version, we are
     // downgrading it. So the current decompressed apex should be replaced
     // with the new decompressed apex to reflect that.
-
-    return new_apex_version != data_version;
+    const int64_t pre_installed_version =
+        instance.GetPreInstalledApex(new_apex_name)
+            .get()
+            .GetManifest()
+            .version();
+    return new_apex_version != pre_installed_version;
   }
 
-  // If data apex is not decompressed, then we only decompress the new_apex
-  // if it has higher version than data apex.
+  // From here on, data apex exists. So we should compare directly against data
+  // apex.
+  auto data_apex = instance.GetDataApex(new_apex_name);
+  // Compare the data apex version with new apex
+  const int64_t data_version = data_apex.get().GetManifest().version();
+  // We only decompress the new_apex if it has higher version than data apex.
   return new_apex_version > data_version;
+}
+
+int64_t CalculateSizeForCompressedApex(
+    const std::vector<std::tuple<std::string, int64_t, int64_t>>&
+        compressed_apexes,
+    const ApexFileRepository& instance) {
+  int64_t result = 0;
+  for (const auto& compressed_apex : compressed_apexes) {
+    std::string module_name;
+    int64_t version_code;
+    int64_t decompressed_size;
+    std::tie(module_name, version_code, decompressed_size) = compressed_apex;
+    if (ShouldAllocateSpaceForDecompression(module_name, version_code,
+                                            instance)) {
+      result += decompressed_size;
+    }
+  }
+  return result;
 }
 
 void CollectApexInfoList(std::ostream& os,
@@ -2976,10 +3281,18 @@ void CollectApexInfoList(std::ostream& os,
     if (preinstalled_path.ok()) {
       preinstalled_module_path = *preinstalled_path;
     }
+
+    std::optional<int64_t> mtime;
+    struct stat stat_buf;
+    if (stat(apex.GetPath().c_str(), &stat_buf) == 0) {
+      mtime.emplace(stat_buf.st_mtime);
+    } else {
+      PLOG(WARNING) << "Failed to stat " << apex.GetPath();
+    }
     com::android::apex::ApexInfo apex_info(
         apex.GetManifest().name(), apex.GetPath(), preinstalled_module_path,
         apex.GetManifest().version(), apex.GetManifest().versionname(),
-        instance.IsPreInstalledApex(apex), is_active);
+        instance.IsPreInstalledApex(apex), is_active, mtime);
     apex_infos.emplace_back(apex_info);
   };
   for (const auto& apex : active_apexs) {
@@ -2992,20 +3305,35 @@ void CollectApexInfoList(std::ostream& os,
   com::android::apex::write(os, apex_info_list);
 }
 
-// Reserve |size| bytes in |dest_dir| by creating a zero-filled file
+// Reserve |size| bytes in |dest_dir| by creating a zero-filled file.
+// Also, we always clean up ota_apex that has been processed as
+// part of pre-reboot decompression whenever we reserve space.
 Result<void> ReserveSpaceForCompressedApex(int64_t size,
                                            const std::string& dest_dir) {
-  LOG(INFO) << "Reserving " << size << " bytes for compressed APEX";
-
   if (size < 0) {
     return Error() << "Cannot reserve negative byte of space";
   }
+
+  // Since we are reserving space, then we must be preparing for a new OTA.
+  // Clean up any processed ota_apex from previous OTA.
+  auto ota_apex_files =
+      FindFilesBySuffix(gConfig->decompression_dir, {kOtaApexPackageSuffix});
+  if (!ota_apex_files.ok()) {
+    return Error() << "Failed to clean up ota_apex: " << ota_apex_files.error();
+  }
+  for (const std::string& ota_apex : *ota_apex_files) {
+    RemoveFileIfExists(ota_apex);
+  }
+
   auto file_path = StringPrintf("%s/full.tmp", dest_dir.c_str());
   if (size == 0) {
+    LOG(INFO) << "Cleaning up reserved space for compressed APEX";
+    // Ota is being cancelled. Clean up reserved space
     RemoveFileIfExists(file_path);
     return {};
   }
 
+  LOG(INFO) << "Reserving " << size << " bytes for compressed APEX";
   unique_fd dest_fd(
       open(file_path.c_str(), O_WRONLY | O_CLOEXEC | O_CREAT, 0644));
   if (dest_fd.get() == -1) {
@@ -3051,14 +3379,14 @@ int OnStartInVmMode() {
   }
 
   if (auto status =
-          instance.AddBlockApex(gConfig->vm_payload_signature_partition);
+          instance.AddBlockApex(gConfig->vm_payload_metadata_partition);
       !status.ok()) {
     LOG(ERROR) << "Failed to scan block APEX files: " << status.error();
     return 1;
   }
 
   if (auto status = ActivateApexPackages(instance.GetPreInstalledApexFiles(),
-                                         /*is_ota_chroot=*/false);
+                                         ActivationMode::kVmMode);
       !status.ok()) {
     LOG(ERROR) << "Failed to activate apex packages : " << status.error();
     return 1;
@@ -3079,8 +3407,7 @@ int OnOtaChrootBootstrap() {
                << Join(gConfig->apex_built_in_dirs, ',');
     return 1;
   }
-  if (auto status = instance.AddDataApex(gConfig->active_apex_data_dir,
-                                         gConfig->decompression_dir);
+  if (auto status = instance.AddDataApex(gConfig->active_apex_data_dir);
       !status.ok()) {
     LOG(ERROR) << "Failed to scan upgraded apexes from "
                << gConfig->active_apex_data_dir;
@@ -3123,13 +3450,13 @@ int OnOtaChrootBootstrap() {
     }
   }
 
-  auto activate_status = ActivateApexPackages(activation_list,
-                                              /* is_ota_chroot= */ true);
+  auto activate_status =
+      ActivateApexPackages(activation_list, ActivationMode::kOtaChrootMode);
   if (!activate_status.ok()) {
     LOG(ERROR) << "Failed to activate apex packages : "
                << activate_status.error();
-    auto retry_status = ActivateMissingApexes(activation_list,
-                                              /* is_ota_chroot= */ true);
+    auto retry_status =
+        ActivateMissingApexes(activation_list, ActivationMode::kOtaChrootMode);
     if (!retry_status.ok()) {
       LOG(ERROR) << retry_status.error();
     }
@@ -3175,8 +3502,8 @@ int OnOtaChrootBootstrap() {
   return 0;
 }
 
-int OnOtaChrootBootstrapFlattenedApex() {
-  LOG(INFO) << "OnOtaChrootBootstrapFlattenedApex";
+int ActivateFlattenedApex() {
+  LOG(INFO) << "ActivateFlattenedApex";
 
   std::vector<com::android::apex::ApexInfo> apex_infos;
 
@@ -3229,7 +3556,8 @@ int OnOtaChrootBootstrapFlattenedApex() {
                               /* preinstalledModulePath= */ apex_dir,
                               /* versionCode= */ manifest->version(),
                               /* versionName= */ manifest->versionname(),
-                              /* isFactory= */ true, /* isActive= */ true);
+                              /* isFactory= */ true, /* isActive= */ true,
+                              /* lastUpdateMillis= */ 0);
     }
   }
 
@@ -3261,6 +3589,280 @@ int OnOtaChrootBootstrapFlattenedApex() {
 
 android::apex::MountedApexDatabase& GetApexDatabaseForTesting() {
   return gMountedApexes;
+}
+
+// A version of apex verification that happens during non-staged APEX
+// installation.
+Result<void> VerifyPackageNonStagedInstall(const ApexFile& apex_file) {
+  const auto& verify_package_boot_status = VerifyPackageBoot(apex_file);
+  if (!verify_package_boot_status.ok()) {
+    return verify_package_boot_status;
+  }
+
+  auto check_fn = [&apex_file](const std::string& mount_point) -> Result<void> {
+    auto dirs = GetSubdirs(mount_point);
+    if (!dirs.ok()) {
+      return dirs.error();
+    }
+    if (std::find(dirs->begin(), dirs->end(), mount_point + "/app") !=
+        dirs->end()) {
+      return Error() << apex_file.GetPath() << " contains app inside";
+    }
+    if (std::find(dirs->begin(), dirs->end(), mount_point + "/priv-app") !=
+        dirs->end()) {
+      return Error() << apex_file.GetPath() << " contains priv-app inside";
+    }
+    return Result<void>{};
+  };
+  return RunVerifyFnInsideTempMount(apex_file, check_fn, true);
+}
+
+Result<void> CheckSupportsNonStagedInstall(const ApexFile& cur_apex,
+                                           const ApexFile& new_apex) {
+  const auto& cur_manifest = cur_apex.GetManifest();
+  const auto& new_manifest = new_apex.GetManifest();
+
+  if (!new_manifest.supportsrebootlessupdate()) {
+    return Error() << new_apex.GetPath()
+                   << " does not support non-staged update";
+  }
+
+  // Check if update will impact linkerconfig.
+
+  // Updates to shared libs APEXes must be done via staged install flow.
+  if (new_manifest.providesharedapexlibs()) {
+    return Error() << new_apex.GetPath() << " is a shared libs APEX";
+  }
+
+  // This APEX provides native libs to other parts of the platform. It can only
+  // be updated via staged install flow.
+  if (new_manifest.providenativelibs_size() > 0) {
+    return Error() << new_apex.GetPath() << " provides native libs";
+  }
+
+  // This APEX requires libs provided by dynamic common library APEX, hence it
+  // can only be installed using staged install flow.
+  if (new_manifest.requiresharedapexlibs_size() > 0) {
+    return Error() << new_apex.GetPath() << " requires shared apex libs";
+  }
+
+  // We don't allow non-staged updates of APEXES that have java libs inside.
+  if (new_manifest.jnilibs_size() > 0) {
+    return Error() << new_apex.GetPath() << " requires JNI libs";
+  }
+
+  // For requireNativeLibs bit, we only allow updates that don't change list of
+  // required libs.
+
+  std::vector<std::string> cur_required_libs(
+      cur_manifest.requirenativelibs().begin(),
+      cur_manifest.requirenativelibs().end());
+  sort(cur_required_libs.begin(), cur_required_libs.end());
+
+  std::vector<std::string> new_required_libs(
+      new_manifest.requirenativelibs().begin(),
+      new_manifest.requirenativelibs().end());
+  sort(new_required_libs.begin(), new_required_libs.end());
+
+  if (cur_required_libs != new_required_libs) {
+    return Error() << "Set of native libs required by " << new_apex.GetPath()
+                   << " differs from the one required by the currently active "
+                   << cur_apex.GetPath();
+  }
+
+  auto expected_public_key =
+      ApexFileRepository::GetInstance().GetPublicKey(new_manifest.name());
+  if (!expected_public_key.ok()) {
+    return expected_public_key.error();
+  }
+  auto verity_data = new_apex.VerifyApexVerity(*expected_public_key);
+  if (!verity_data.ok()) {
+    return verity_data.error();
+  }
+  // Supporting non-staged install of APEXes without a hashtree is additional
+  // hassle, it's easier not to support it.
+  if (verity_data->desc->tree_size == 0) {
+    return Error() << new_apex.GetPath()
+                   << " does not have an embedded hash tree";
+  }
+  return {};
+}
+
+Result<size_t> ComputePackageIdMinor(const ApexFile& apex) {
+  static constexpr size_t kMaxVerityDevicesPerApexName = 3u;
+  DeviceMapper& dm = DeviceMapper::Instance();
+  std::vector<DeviceMapper::DmBlockDevice> dm_devices;
+  if (!dm.GetAvailableDevices(&dm_devices)) {
+    return Error() << "Failed to list dm devices";
+  }
+  size_t devices = 0;
+  size_t next_minor = 1;
+  for (const auto& dm_device : dm_devices) {
+    std::string_view dm_name(dm_device.name());
+    // Format is <module_name>@<version_code>[_<minor>]
+    if (!ConsumePrefix(&dm_name, apex.GetManifest().name())) {
+      continue;
+    }
+    devices++;
+    auto pos = dm_name.find_last_of('_');
+    if (pos == std::string_view::npos) {
+      continue;
+    }
+    size_t minor;
+    if (!ParseUint(std::string(dm_name.substr(pos + 1)), &minor)) {
+      return Error() << "Unexpected dm device name " << dm_device.name();
+    }
+    if (next_minor < minor + 1) {
+      next_minor = minor + 1;
+    }
+  }
+  if (devices > kMaxVerityDevicesPerApexName) {
+    return Error() << "There are too many (" << devices
+                   << ") dm block devices associated with package "
+                   << apex.GetManifest().name();
+  }
+  while (true) {
+    std::string target_file =
+        StringPrintf("%s/%s_%zu.apex", gConfig->active_apex_data_dir,
+                     GetPackageId(apex.GetManifest()).c_str(), next_minor);
+    if (access(target_file.c_str(), F_OK) == 0) {
+      next_minor++;
+    } else {
+      break;
+    }
+  }
+
+  return next_minor;
+}
+
+Result<void> UpdateApexInfoList() {
+  std::vector<ApexFile> active(GetActivePackages());
+  std::vector<ApexFile> inactive = CalculateInactivePackages(active);
+
+  std::stringstream xml;
+  CollectApexInfoList(xml, active, inactive);
+
+  std::string name = StringPrintf("%s/.default-%s", kApexRoot, kApexInfoList);
+  unique_fd fd(TEMP_FAILURE_RETRY(
+      open(name.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)));
+  if (fd.get() == -1) {
+    return ErrnoError() << "Can't open " << name;
+  }
+  if (!WriteStringToFd(xml.str(), fd)) {
+    return ErrnoError() << "Failed to write to " << name;
+  }
+
+  return {};
+}
+
+Result<ApexFile> InstallPackage(const std::string& package_path) {
+  LOG(INFO) << "Installing " << package_path;
+  auto temp_apex = ApexFile::Open(package_path);
+  if (!temp_apex.ok()) {
+    return temp_apex.error();
+  }
+
+  const std::string& module_name = temp_apex->GetManifest().name();
+  // Don't allow non-staged update if there are no active versions of this APEX.
+  auto cur_mounted_data = gMountedApexes.GetLatestMountedApex(module_name);
+  if (!cur_mounted_data.has_value()) {
+    return Error() << "No active version found for package " << module_name;
+  }
+
+  auto cur_apex = ApexFile::Open(cur_mounted_data->full_path);
+  if (!cur_apex.ok()) {
+    return cur_apex.error();
+  }
+
+  // Do a quick check if this APEX can be installed without a reboot.
+  // Note that passing this check doesn't guarantee that APEX will be
+  // successfully installed.
+  if (auto r = CheckSupportsNonStagedInstall(*cur_apex, *temp_apex); !r.ok()) {
+    return r.error();
+  }
+
+  // 1. Verify that APEX is correct. This is a heavy check that involves
+  // mounting an APEX on a temporary mount point and reading the entire
+  // dm-verity block device.
+  if (auto verify = VerifyPackageNonStagedInstall(*temp_apex); !verify.ok()) {
+    return verify.error();
+  }
+
+  // 2. Compute params for mounting new apex.
+  auto new_id_minor = ComputePackageIdMinor(*temp_apex);
+  if (!new_id_minor.ok()) {
+    return new_id_minor.error();
+  }
+
+  std::string new_id = GetPackageId(temp_apex->GetManifest()) + "_" +
+                       std::to_string(*new_id_minor);
+
+  // 2. Unmount currently active APEX.
+  if (auto res = UnmountPackage(*cur_apex, /* allow_latest= */ true,
+                                /* deferred= */ true);
+      !res.ok()) {
+    return res.error();
+  }
+
+  // 3. Hard link to final destination.
+  std::string target_file =
+      StringPrintf("%s/%s.apex", gConfig->active_apex_data_dir, new_id.c_str());
+
+  auto guard = android::base::make_scope_guard([&]() {
+    if (unlink(target_file.c_str()) != 0 && errno != ENOENT) {
+      PLOG(ERROR) << "Failed to unlink " << target_file;
+    }
+    // We can't really rely on the fact that dm-verity device backing up
+    // previously active APEX is still around. We need to create a new one.
+    std::string old_new_id = GetPackageId(temp_apex->GetManifest()) + "_" +
+                             std::to_string(*new_id_minor + 1);
+    auto res = ActivatePackageImpl(*cur_apex, old_new_id,
+                                   /* reuse_device= */ false);
+    if (!res.ok()) {
+      // At this point not much we can do... :(
+      LOG(ERROR) << res.error();
+    }
+  });
+
+  // At this point it should be safe to hard link |temp_apex| to
+  // |params->target_file|. In case reboot happens during one of the stages
+  // below, then on next boot apexd will pick up the new verified APEX.
+  if (link(package_path.c_str(), target_file.c_str()) != 0) {
+    return ErrnoError() << "Failed to link " << package_path << " to "
+                        << target_file;
+  }
+
+  auto new_apex = ApexFile::Open(target_file);
+  if (!new_apex.ok()) {
+    return new_apex.error();
+  }
+
+  // 4. And activate new one.
+  auto activate_status = ActivatePackageImpl(*new_apex, new_id,
+                                             /* reuse_device= */ false);
+  if (!activate_status.ok()) {
+    return activate_status.error();
+  }
+
+  // Accept the install.
+  guard.Disable();
+
+  // 4. Now we can unlink old APEX if it's not pre-installed.
+  if (!ApexFileRepository::GetInstance().IsPreInstalledApex(*cur_apex)) {
+    if (unlink(cur_mounted_data->full_path.c_str()) != 0) {
+      PLOG(ERROR) << "Failed to unlink " << cur_mounted_data->full_path;
+    }
+  }
+
+  if (auto res = UpdateApexInfoList(); !res.ok()) {
+    LOG(ERROR) << res.error();
+  }
+
+  // Release compressed blocks in case target_file is on f2fs-compressed
+  // filesystem.
+  ReleaseF2fsCompressedBlocks(target_file);
+
+  return new_apex;
 }
 
 }  // namespace apex
