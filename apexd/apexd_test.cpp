@@ -65,20 +65,40 @@ static std::string GetTestFile(const std::string& name) {
   return GetTestDataDir() + "/" + name;
 }
 
+static int64_t GetMTime(const std::string& path) {
+  struct stat st_buf;
+  if (stat(path.c_str(), &st_buf) != 0) {
+    PLOG(ERROR) << "Failed to stat " << path;
+    return 0;
+  }
+  return st_buf.st_mtime;
+}
+
 // A very basic mock of CheckpointInterface.
 class MockCheckpointInterface : public CheckpointInterface {
  public:
-  Result<bool> SupportsFsCheckpoints() override { return {}; }
+  Result<bool> SupportsFsCheckpoints() override {
+    return supports_fs_checkpoint_;
+  }
 
-  Result<bool> NeedsCheckpoint() override { return false; }
+  Result<bool> NeedsCheckpoint() override { return needs_checkpoint_; }
 
-  Result<bool> NeedsRollback() override { return false; }
+  Result<bool> NeedsRollback() override { return needs_rollback_; }
 
   Result<void> StartCheckpoint(int32_t num_retries) override { return {}; }
 
   Result<void> AbortChanges(const std::string& msg, bool retry) override {
     return {};
   }
+
+  void SetSupportsCheckpoint(bool value) { supports_fs_checkpoint_ = value; }
+
+  void SetNeedsCheckpoint(bool value) { needs_checkpoint_ = value; }
+
+  void SetNeedsRollback(bool value) { needs_rollback_ = value; }
+
+ private:
+  bool supports_fs_checkpoint_, needs_checkpoint_, needs_rollback_;
 };
 
 static constexpr const char* kTestApexdStatusSysprop = "apexd.status.test";
@@ -202,6 +222,8 @@ TEST_F(ApexdUnitTest, ApexMustHavePreInstalledVersionForSelection) {
 
   auto apexd_test_file = ApexFile::Open(AddDataApex("apex.apexd_test.apex"));
   auto shim_v1 = ApexFile::Open(AddDataApex("com.android.apex.cts.shim.apex"));
+  // Normally both pre-installed and data apex would be activated for a shared
+  // libs apex, but if they are the same version only the data apex will be.
   auto shared_lib_2 = ApexFile::Open(
       AddDataApex("com.android.apex.test.sharedlibs_generated.v1.libvX.apex"));
   ASSERT_TRUE(IsOk(instance.AddDataApex(GetDataDir())));
@@ -214,10 +236,9 @@ TEST_F(ApexdUnitTest, ApexMustHavePreInstalledVersionForSelection) {
   ASSERT_EQ(result.size(), 0u);
   // When passed proper instance they should get selected
   result = SelectApexForActivation(all_apex, instance);
-  ASSERT_EQ(result.size(), 4u);
+  ASSERT_EQ(result.size(), 3u);
   ASSERT_THAT(result, UnorderedElementsAre(ApexFileEq(ByRef(*apexd_test_file)),
                                            ApexFileEq(ByRef(*shim_v1)),
-                                           ApexFileEq(ByRef(*shared_lib_1)),
                                            ApexFileEq(ByRef(*shared_lib_2))));
 }
 
@@ -265,7 +286,8 @@ TEST_F(ApexdUnitTest, DataApexGetsPriorityForSameVersions) {
                                            ApexFileEq(ByRef(*shim_v1))));
 }
 
-// Both versions of shared libs can be selected
+// Both versions of shared libs can be selected when preinstalled version is
+// lower than data version
 TEST_F(ApexdUnitTest, SharedLibsCanHaveBothVersionSelected) {
   auto shared_lib_v1 = ApexFile::Open(AddPreInstalledApex(
       "com.android.apex.test.sharedlibs_generated.v1.libvX.apex"));
@@ -284,6 +306,27 @@ TEST_F(ApexdUnitTest, SharedLibsCanHaveBothVersionSelected) {
 
   ASSERT_THAT(result, UnorderedElementsAre(ApexFileEq(ByRef(*shared_lib_v1)),
                                            ApexFileEq(ByRef(*shared_lib_v2))));
+}
+
+// Data version of shared libs should not be selected if lower than
+// preinstalled version
+TEST_F(ApexdUnitTest, SharedLibsDataVersionDeletedIfLower) {
+  auto shared_lib_v2 = ApexFile::Open(AddPreInstalledApex(
+      "com.android.apex.test.sharedlibs_generated.v2.libvY.apex"));
+  // Initialize pre-installed APEX information
+  auto& instance = ApexFileRepository::GetInstance();
+  ASSERT_TRUE(IsOk(instance.AddPreInstalledApex({GetBuiltInDir()})));
+
+  auto shared_lib_v1 = ApexFile::Open(
+      AddDataApex("com.android.apex.test.sharedlibs_generated.v1.libvX.apex"));
+  // Initialize data APEX information
+  ASSERT_TRUE(IsOk(instance.AddDataApex(GetDataDir())));
+
+  auto all_apex = instance.AllApexFilesByName();
+  auto result = SelectApexForActivation(all_apex, instance);
+  ASSERT_EQ(result.size(), 1u);
+
+  ASSERT_THAT(result, UnorderedElementsAre(ApexFileEq(ByRef(*shared_lib_v2))));
 }
 
 TEST_F(ApexdUnitTest, ProcessCompressedApex) {
@@ -1255,18 +1298,18 @@ TEST_F(ApexdMountTest, InstallPackageUpdatesApexInfoList) {
       /* modulePath= */ apex_1,
       /* preinstalledModulePath= */ apex_1,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ false);
+      /* isFactory= */ true, /* isActive= */ false, GetMTime(apex_1));
   auto apex_info_xml_2 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package",
       /* modulePath= */ apex_2, /* preinstalledModulePath= */ apex_2,
       /* versionCode= */ 1, /* versionName= */ "1", /* isFactory= */ true,
-      /* isActive= */ true);
+      /* isActive= */ true, GetMTime(apex_2));
   auto apex_info_xml_3 = com::android::apex::ApexInfo(
       /* moduleName= */ "test.apex.rebootless",
       /* modulePath= */ ret->GetPath(),
       /* preinstalledModulePath= */ apex_1,
       /* versionCode= */ 2, /* versionName= */ "2",
-      /* isFactory= */ false, /* isActive= */ true);
+      /* isFactory= */ false, /* isActive= */ true, GetMTime(ret->GetPath()));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_1),
                                    ApexInfoXmlEq(apex_info_xml_2),
@@ -1398,12 +1441,12 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapOnlyPreInstalledApexes) {
       /* modulePath= */ apex_path_1,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true, GetMTime(apex_path_1));
   auto apex_info_xml_2 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package_2",
       /* modulePath= */ apex_path_2, /* preinstalledModulePath= */ apex_path_2,
       /* versionCode= */ 1, /* versionName= */ "1", /* isFactory= */ true,
-      /* isActive= */ true);
+      /* isActive= */ true, GetMTime(apex_path_2));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_1),
                                    ApexInfoXmlEq(apex_info_xml_2)));
@@ -1443,18 +1486,18 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapDataHasHigherVersion) {
       /* modulePath= */ apex_path_1,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ false);
+      /* isFactory= */ true, /* isActive= */ false, GetMTime(apex_path_1));
   auto apex_info_xml_2 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package_2",
       /* modulePath= */ apex_path_2, /* preinstalledModulePath= */ apex_path_2,
       /* versionCode= */ 1, /* versionName= */ "1", /* isFactory= */ true,
-      /* isActive= */ true);
+      /* isActive= */ true, GetMTime(apex_path_2));
   auto apex_info_xml_3 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package",
       /* modulePath= */ apex_path_3,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 2, /* versionName= */ "2",
-      /* isFactory= */ false, /* isActive= */ true);
+      /* isFactory= */ false, /* isActive= */ true, GetMTime(apex_path_3));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_1),
                                    ApexInfoXmlEq(apex_info_xml_2),
@@ -1488,18 +1531,18 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapDataHasSameVersion) {
       /* modulePath= */ apex_path_1,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ false);
+      /* isFactory= */ true, /* isActive= */ false, GetMTime(apex_path_1));
   auto apex_info_xml_2 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package_2",
       /* modulePath= */ apex_path_2, /* preinstalledModulePath= */ apex_path_2,
       /* versionCode= */ 1, /* versionName= */ "1", /* isFactory= */ true,
-      /* isActive= */ true);
+      /* isActive= */ true, GetMTime(apex_path_2));
   auto apex_info_xml_3 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package",
       /* modulePath= */ apex_path_3,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ false, /* isActive= */ true);
+      /* isFactory= */ false, /* isActive= */ true, GetMTime(apex_path_3));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_1),
                                    ApexInfoXmlEq(apex_info_xml_2),
@@ -1533,12 +1576,12 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapSystemHasHigherVersion) {
       /* modulePath= */ apex_path_1,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 2, /* versionName= */ "2",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true, GetMTime(apex_path_1));
   auto apex_info_xml_2 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package_2",
       /* modulePath= */ apex_path_2, /* preinstalledModulePath= */ apex_path_2,
       /* versionCode= */ 1, /* versionName= */ "1", /* isFactory= */ true,
-      /* isActive= */ true);
+      /* isActive= */ true, GetMTime(apex_path_2));
 
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_1),
@@ -1572,12 +1615,12 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapDataHasSameVersionButDifferentKey) {
       /* modulePath= */ apex_path_1,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true, GetMTime(apex_path_1));
   auto apex_info_xml_2 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package_2",
       /* modulePath= */ apex_path_2, /* preinstalledModulePath= */ apex_path_2,
       /* versionCode= */ 1, /* versionName= */ "1", /* isFactory= */ true,
-      /* isActive= */ true);
+      /* isActive= */ true, GetMTime(apex_path_2));
 
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_1),
@@ -1619,12 +1662,12 @@ TEST_F(ApexdMountTest,
       /* modulePath= */ apex_path_1,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true, GetMTime(apex_path_1));
   auto apex_info_xml_2 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package_2",
       /* modulePath= */ apex_path_2, /* preinstalledModulePath= */ apex_path_2,
       /* versionCode= */ 1, /* versionName= */ "1", /* isFactory= */ true,
-      /* isActive= */ true);
+      /* isActive= */ true, GetMTime(apex_path_2));
 
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_1),
@@ -1653,7 +1696,7 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapDataApexWithoutPreInstalledApex) {
       /* modulePath= */ apex_path_1,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true, GetMTime(apex_path_1));
 
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_1)));
@@ -1685,19 +1728,19 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapPreInstalledSharedLibsApex) {
       /* modulePath= */ apex_path_1,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ false);
+      /* isFactory= */ true, /* isActive= */ false, GetMTime(apex_path_1));
   auto apex_info_xml_2 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test.sharedlibs",
       /* modulePath= */ apex_path_2,
       /* preinstalledModulePath= */ apex_path_2,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true, GetMTime(apex_path_2));
   auto apex_info_xml_3 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package",
       /* modulePath= */ apex_path_3,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 2, /* versionName= */ "2",
-      /* isFactory= */ false, /* isActive= */ true);
+      /* isFactory= */ false, /* isActive= */ true, GetMTime(apex_path_3));
 
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_1),
@@ -1766,25 +1809,25 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapSharedLibsApexBothVersions) {
       /* modulePath= */ apex_path_1,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ false);
+      /* isFactory= */ true, /* isActive= */ false, GetMTime(apex_path_1));
   auto apex_info_xml_2 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test.sharedlibs",
       /* modulePath= */ apex_path_2,
       /* preinstalledModulePath= */ apex_path_2,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ false);
+      /* isFactory= */ true, /* isActive= */ false, GetMTime(apex_path_2));
   auto apex_info_xml_3 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package",
       /* modulePath= */ apex_path_3,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 2, /* versionName= */ "2",
-      /* isFactory= */ false, /* isActive= */ true);
+      /* isFactory= */ false, /* isActive= */ true, GetMTime(apex_path_3));
   auto apex_info_xml_4 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test.sharedlibs",
       /* modulePath= */ apex_path_4,
       /* preinstalledModulePath= */ apex_path_2,
       /* versionCode= */ 2, /* versionName= */ "2",
-      /* isFactory= */ false, /* isActive= */ true);
+      /* isFactory= */ false, /* isActive= */ true, GetMTime(apex_path_4));
 
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_1),
@@ -1859,7 +1902,7 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapOnlyCompressedApexes) {
       /* modulePath= */ decompressed_apex,
       /* preinstalledModulePath= */ apex_path,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true, GetMTime(decompressed_apex));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_decompressed)));
   auto& db = GetApexDatabaseForTesting();
@@ -1937,7 +1980,8 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapUpgradeCapex) {
       /* modulePath= */ decompressed_active_apex,
       /* preinstalledModulePath= */ apex_path,
       /* versionCode= */ 2, /* versionName= */ "2",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true,
+      GetMTime(decompressed_active_apex));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_decompressed)));
   auto& db = GetApexDatabaseForTesting();
@@ -1984,7 +2028,8 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapSamegradeCapex) {
       /* modulePath= */ decompressed_active_apex,
       /* preinstalledModulePath= */ apex_path,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true,
+      GetMTime(decompressed_active_apex));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_decompressed)));
   auto& db = GetApexDatabaseForTesting();
@@ -2031,7 +2076,8 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapSamegradeCapexDifferentDigest) {
       /* modulePath= */ decompressed_ota_apex,
       /* preinstalledModulePath= */ apex_path,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true,
+      GetMTime(decompressed_ota_apex));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_decompressed)));
   auto& db = GetApexDatabaseForTesting();
@@ -2094,7 +2140,8 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapSamegradeCapexDifferentKey) {
       /* modulePath= */ decompressed_active_apex,
       /* preinstalledModulePath= */ apex_path,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true,
+      GetMTime(decompressed_active_apex));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_decompressed)));
   auto& db = GetApexDatabaseForTesting();
@@ -2137,7 +2184,7 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapCapexToApex) {
       /* modulePath= */ apex_path,
       /* preinstalledModulePath= */ apex_path,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true, GetMTime(apex_path));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_uncompressed)));
 }
@@ -2176,7 +2223,8 @@ TEST_F(ApexdMountTest,
       /* modulePath= */ decompressed_active_apex,
       /* preinstalledModulePath= */ apex_path,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true,
+      GetMTime(decompressed_active_apex));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_decompressed)));
 }
@@ -2207,13 +2255,13 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapDataHigherThanCapex) {
       /* modulePath= */ data_apex_path,
       /* preinstalledModulePath= */ system_apex_path,
       /* versionCode= */ 2, /* versionName= */ "2",
-      /* isFactory= */ false, /* isActive= */ true);
+      /* isFactory= */ false, /* isActive= */ true, GetMTime(data_apex_path));
   auto apex_info_xml_system = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.compressed",
       /* modulePath= */ system_apex_path,
       /* preinstalledModulePath= */ system_apex_path,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ false);
+      /* isFactory= */ true, /* isActive= */ false, GetMTime(system_apex_path));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_data),
                                    ApexInfoXmlEq(apex_info_xml_system)));
@@ -2256,7 +2304,8 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapDataLowerThanCapex) {
       /* modulePath= */ decompressed_active_apex,
       /* preinstalledModulePath= */ apex_path,
       /* versionCode= */ 2, /* versionName= */ "2",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true,
+      GetMTime(decompressed_active_apex));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml)));
   auto& db = GetApexDatabaseForTesting();
@@ -2297,13 +2346,13 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapDataSameAsCapex) {
       /* modulePath= */ data_apex_path,
       /* preinstalledModulePath= */ system_apex_path,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ false, /* isActive= */ true);
+      /* isFactory= */ false, /* isActive= */ true, GetMTime(data_apex_path));
   auto apex_info_xml_system = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.compressed",
       /* modulePath= */ system_apex_path,
       /* preinstalledModulePath= */ system_apex_path,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ false);
+      /* isFactory= */ true, /* isActive= */ false, GetMTime(system_apex_path));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_data),
                                    ApexInfoXmlEq(apex_info_xml_system)));
@@ -2346,7 +2395,8 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapDataHasDifferentKeyThanCapex) {
       /* modulePath= */ decompressed_active_apex,
       /* preinstalledModulePath= */ apex_path,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true,
+      GetMTime(decompressed_active_apex));
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_decompressed)));
   auto& db = GetApexDatabaseForTesting();
@@ -2447,12 +2497,12 @@ TEST_F(ApexdMountTest,
       /* modulePath= */ apex_path_1,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 137, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ false);
+      /* isFactory= */ true, /* isActive= */ false, GetMTime(apex_path_1));
   auto apex_info_xml_2 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package_2",
       /* modulePath= */ apex_path_2, /* preinstalledModulePath= */ apex_path_2,
       /* versionCode= */ 1, /* versionName= */ "1", /* isFactory= */ true,
-      /* isActive= */ true);
+      /* isActive= */ true, GetMTime(apex_path_2));
 
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_1),
@@ -2487,12 +2537,12 @@ TEST_F(ApexdMountTest,
       /* modulePath= */ apex_path_1,
       /* preinstalledModulePath= */ apex_path_1,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true, GetMTime(apex_path_1));
   auto apex_info_xml_2 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package_2",
       /* modulePath= */ apex_path_2, /* preinstalledModulePath= */ apex_path_2,
       /* versionCode= */ 1, /* versionName= */ "1", /* isFactory= */ true,
-      /* isActive= */ true);
+      /* isActive= */ true, GetMTime(apex_path_2));
 
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_1),
@@ -2542,13 +2592,15 @@ TEST_F(ApexdMountTest, OnOtaChrootBootstrapFlattenedApex) {
       /* modulePath= */ apex_dir_1,
       /* preinstalledModulePath= */ apex_dir_1,
       /* versionCode= */ 2, /* versionName= */ "2",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true,
+      /* lastUpdateMillis= */ 0);
   auto apex_info_xml_2 = com::android::apex::ApexInfo(
       /* moduleName= */ "com.android.apex.test_package_2",
       /* modulePath= */ apex_dir_2,
       /* preinstalledModulePath= */ apex_dir_2,
       /* versionCode= */ 1, /* versionName= */ "1",
-      /* isFactory= */ true, /* isActive= */ true);
+      /* isFactory= */ true, /* isActive= */ true,
+      /* lastUpdateMillis= */ 0);
 
   ASSERT_THAT(info_list->getApexInfo(),
               UnorderedElementsAre(ApexInfoXmlEq(apex_info_xml_1),
@@ -3500,6 +3552,51 @@ TEST_F(ApexActivationFailureTests, ActivatePackageImplFails) {
               HasSubstr("Failed to activate packages"));
   ASSERT_THAT(apex_session->GetErrorMessage(),
               HasSubstr("has unexpected SHA512 hash"));
+}
+
+TEST_F(ApexActivationFailureTests,
+       StagedSessionFailsWhenNotInFsCheckpointMode) {
+  MockCheckpointInterface checkpoint_interface;
+  checkpoint_interface.SetSupportsCheckpoint(true);
+  // Need to call InitializeVold before calling OnStart
+  InitializeVold(&checkpoint_interface);
+
+  auto pre_installed_apex = AddPreInstalledApex("apex.apexd_test.apex");
+  auto& instance = ApexFileRepository::GetInstance();
+  ASSERT_RESULT_OK(instance.AddPreInstalledApex({GetBuiltInDir()}));
+
+  auto apex_session = CreateStagedSession("apex.apexd_test.apex", 123);
+  apex_session->UpdateStateAndCommit(SessionState::STAGED);
+
+  UnmountOnTearDown(pre_installed_apex);
+  OnStart();
+
+  apex_session = ApexSession::GetSession(123);
+  ASSERT_EQ(apex_session->GetState(), SessionState::ACTIVATION_FAILED);
+  ASSERT_THAT(
+      apex_session->GetErrorMessage(),
+      HasSubstr("Cannot install apex session if not in fs-checkpoint mode"));
+}
+
+TEST_F(ApexActivationFailureTests, StagedSessionRevertsWhenInFsRollbackMode) {
+  MockCheckpointInterface checkpoint_interface;
+  checkpoint_interface.SetSupportsCheckpoint(true);
+  checkpoint_interface.SetNeedsRollback(true);
+  // Need to call InitializeVold before calling OnStart
+  InitializeVold(&checkpoint_interface);
+
+  auto pre_installed_apex = AddPreInstalledApex("apex.apexd_test.apex");
+  auto& instance = ApexFileRepository::GetInstance();
+  ASSERT_RESULT_OK(instance.AddPreInstalledApex({GetBuiltInDir()}));
+
+  auto apex_session = CreateStagedSession("apex.apexd_test.apex", 123);
+  apex_session->UpdateStateAndCommit(SessionState::STAGED);
+
+  UnmountOnTearDown(pre_installed_apex);
+  OnStart();
+
+  apex_session = ApexSession::GetSession(123);
+  ASSERT_EQ(apex_session->GetState(), SessionState::REVERTED);
 }
 
 }  // namespace apex
