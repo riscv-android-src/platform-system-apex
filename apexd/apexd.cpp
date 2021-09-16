@@ -532,6 +532,17 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
     return Error() << "Failed to verify Apex Verity data for " << full_path
                    << ": " << verity_data.error();
   }
+  if (instance.IsBlockApex(apex)) {
+    auto root_digest =
+        instance.GetBlockApexRootDigest(apex.GetManifest().name());
+    if (root_digest.has_value() &&
+        root_digest.value() != verity_data->root_digest) {
+      return Error()
+             << "Failed to verify Apex Verity data for " << full_path
+             << ": root digest mismatches with the one specified in config";
+    }
+  }
+
   std::string block_device = loopback_device.name;
   MountedApexData apex_data(loopback_device.name, apex.GetPath(), mount_point,
                             /* device_name = */ "",
@@ -542,8 +553,11 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   // dm-verity because they are already in the dm-verity protected partition;
   // system. However, note that we don't skip verification to ensure that APEXes
   // are correctly signed.
-  const bool mount_on_verity =
-      !instance.IsPreInstalledApex(apex) || instance.IsDecompressedApex(apex);
+  const bool mount_on_verity = !instance.IsPreInstalledApex(apex) ||
+                               // decompressed apexes are on /data
+                               instance.IsDecompressedApex(apex) ||
+                               // block apexes are from host
+                               instance.IsBlockApex(apex);
 
   DmVerityDevice verity_dev;
   loop::LoopbackDeviceUniqueFd loop_for_hash;
