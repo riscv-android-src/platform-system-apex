@@ -28,7 +28,6 @@
 #include "apexd_checkpoint.h"
 #include "apexd_lifecycle.h"
 #include "apexd_loop.h"
-#include "apexd_prepostinstall.h"
 #include "apexd_rollback_utils.h"
 #include "apexd_session.h"
 #include "apexd_utils.h"
@@ -758,60 +757,6 @@ Result<void> RunVerifyFnInsideTempMount(const ApexFile& apex,
     scope_guard.Disable();
   }
   return {};
-}
-
-template <typename HookFn, typename HookCall>
-Result<void> PrePostinstallPackages(const std::vector<ApexFile>& apexes,
-                                    HookFn fn, HookCall call) {
-  auto scope_guard = android::base::make_scope_guard([&]() {
-    for (const ApexFile& apex_file : apexes) {
-      apexd_private::UnmountTempMount(apex_file);
-    }
-  });
-  if (apexes.empty()) {
-    return Errorf("Empty set of inputs");
-  }
-
-  // 1) Check whether the APEXes have hooks.
-  bool has_hooks = false;
-  for (const ApexFile& apex_file : apexes) {
-    if (!(apex_file.GetManifest().*fn)().empty()) {
-      has_hooks = true;
-      break;
-    }
-  }
-
-  // 2) If we found hooks, temp mount if required, and run the pre/post-install.
-  if (has_hooks) {
-    std::vector<std::string> mount_points;
-    for (const ApexFile& apex : apexes) {
-      // Retrieve the mount data if the apex is already temp mounted, temp
-      // mount it otherwise.
-      std::string mount_point =
-          apexd_private::GetPackageTempMountPoint(apex.GetManifest());
-      Result<MountedApexData> mount_data =
-          apexd_private::GetTempMountedApexData(apex.GetManifest().name());
-      if (!mount_data.ok()) {
-        mount_data = VerifyAndTempMountPackage(apex, mount_point);
-        if (!mount_data.ok()) {
-          return mount_data.error();
-        }
-      }
-      mount_points.push_back(mount_point);
-    }
-
-    Result<void> install_status = (*call)(apexes, mount_points);
-    if (!install_status.ok()) {
-      return install_status;
-    }
-  }
-
-  return {};
-}
-
-Result<void> PreinstallPackages(const std::vector<ApexFile>& apexes) {
-  return PrePostinstallPackages(apexes, &ApexManifest::preinstallhook,
-                                &StagePreInstall);
 }
 
 // Converts a list of apex file paths into a list of ApexFile objects
@@ -1661,8 +1606,8 @@ std::vector<Result<void>> ActivateApexWorker(
     bool reuse_device = mode == ActivationMode::kBootMode;
     auto res = ActivatePackageImpl(*apex, device_name, reuse_device);
     if (!res.ok()) {
-      ret.push_back(Error() << "Failed to activate " << apex->GetPath() << " : "
-                            << res.error());
+      ret.push_back(Error() << "Failed to activate " << apex->GetPath() << "("
+                            << device_name << "): " << res.error());
     } else {
       ret.push_back({});
     }
@@ -2158,15 +2103,6 @@ void ScanStagedSessionsDirAndStage() {
                  << " as activated : " << st.error();
     }
   }
-}
-
-Result<void> PreinstallPackages(const std::vector<std::string>& paths) {
-  Result<std::vector<ApexFile>> apex_files = OpenApexFiles(paths);
-  if (!apex_files.ok()) {
-    return apex_files.error();
-  }
-  LOG(DEBUG) << "PreinstallPackages() for " << Join(paths, ',');
-  return PreinstallPackages(*apex_files);
 }
 
 namespace {
@@ -2993,7 +2929,7 @@ Result<std::vector<ApexFile>> SubmitStagedSession(
   }
 
   std::vector<ApexFile> ret;
-  auto guard = android::base::make_scope_guard([&ret]() {
+  auto guard = android::base::make_scope_guard([&]() {
     for (const auto& apex : ret) {
       apexd_private::UnmountTempMount(apex);
     }
@@ -3003,13 +2939,8 @@ Result<std::vector<ApexFile>> SubmitStagedSession(
     if (!verified.ok()) {
       return verified.error();
     }
+    LOG(DEBUG) << verified->GetPath() << " is verified";
     ret.push_back(std::move(*verified));
-  }
-
-  // Run preinstall, if necessary.
-  Result<void> preinstall_status = PreinstallPackages(ret);
-  if (!preinstall_status.ok()) {
-    return preinstall_status.error();
   }
 
   if (has_rollback_enabled && is_rollback) {
@@ -3036,6 +2967,14 @@ Result<std::vector<ApexFile>> SubmitStagedSession(
   for (const auto& apex : ret) {
     // Release compressed blocks in case /data is f2fs-compressed filesystem.
     ReleaseF2fsCompressedBlocks(apex.GetPath());
+  }
+
+  // The scope guard above uses lambda that captures ret by reference.
+  // Unfortunately, for the capture by-reference, lifetime of the captured
+  // reference ends together with the lifetime of the closure object. This means
+  // that we need to manually call UnmountTempMount here.
+  for (const auto& apex : ret) {
+    apexd_private::UnmountTempMount(apex);
   }
 
   return ret;
