@@ -2389,6 +2389,18 @@ int OnBootstrap() {
     return 1;
   }
 
+  // TODO(b/209491448) Remove this.
+  auto block_count = AddBlockApex(instance);
+  if (!block_count.ok()) {
+    LOG(ERROR) << status.error();
+    return 1;
+  }
+  pre_allocate = loop::PreAllocateLoopDevices(*block_count);
+  if (!pre_allocate.ok()) {
+    LOG(ERROR) << "Failed to pre-allocate loop devices for block apexes : "
+               << pre_allocate.error();
+  }
+
   DeviceMapper& dm = DeviceMapper::Instance();
   // Create empty dm device for each found APEX.
   // This is a boot time optimization that makes use of the fact that user space
@@ -2474,6 +2486,13 @@ void Initialize(CheckpointInterface* checkpoint_service) {
                << status.error();
     return;
   }
+
+  // TODO(b/209491448) Remove this.
+  if (auto block_status = AddBlockApex(instance); !block_status.ok()) {
+    LOG(ERROR) << status.error();
+    return;
+  }
+
   gMountedApexes.PopulateFromMounts(gConfig->active_apex_data_dir,
                                     gConfig->decompression_dir,
                                     gConfig->apex_hash_tree_dir);
@@ -2608,6 +2627,13 @@ Result<ApexFile> OpenAndValidateDecompressedApex(const ApexFile& capex,
   auto result = ValidateDecompressedApex(capex, *apex);
   if (!result.ok()) {
     return result.error();
+  }
+  auto ctx = GetfileconPath(apex_path);
+  if (!ctx.ok()) {
+    return ctx.error();
+  }
+  if (!StartsWith(*ctx, gConfig->active_apex_selinux_ctx)) {
+    return Error() << apex_path << " has wrong SELinux context " << *ctx;
   }
   return std::move(*apex);
 }
@@ -3330,6 +3356,23 @@ Result<void> ReserveSpaceForCompressedApex(int64_t size,
   return {};
 }
 
+// Adds block apexes if system property is set.
+Result<int> AddBlockApex(ApexFileRepository& instance) {
+  auto prop = GetProperty(gConfig->vm_payload_metadata_partition_prop, "");
+  if (prop != "") {
+    auto block_count = instance.AddBlockApex(prop);
+    if (!block_count.ok()) {
+      return Error() << "Failed to scan block APEX files: "
+                     << block_count.error();
+    }
+    return block_count;
+  } else {
+    LOG(INFO) << "No block apex metadata partition found, not adding block "
+              << "apexes";
+  }
+  return 0;
+}
+
 // When running in the VM mode, we follow the minimal start-up operations.
 // - CreateSharedLibsApexDir
 // - AddPreInstalledApex: note that CAPEXes are not supported in the VM mode
@@ -3355,10 +3398,8 @@ int OnStartInVmMode() {
     return 1;
   }
 
-  if (auto status =
-          instance.AddBlockApex(gConfig->vm_payload_metadata_partition);
-      !status.ok()) {
-    LOG(ERROR) << "Failed to scan block APEX files: " << status.error();
+  if (auto status = AddBlockApex(instance); !status.ok()) {
+    LOG(ERROR) << status.error();
     return 1;
   }
 

@@ -54,7 +54,6 @@ using android::base::GetBoolProperty;
 using android::base::ParseUint;
 using android::base::ReadFileToString;
 using android::base::Result;
-using android::base::ResultError;
 using android::base::StartsWith;
 using android::base::StringPrintf;
 using android::base::unique_fd;
@@ -197,7 +196,7 @@ static Result<uint32_t> BlockDeviceQueueDepth(const std::string& file_path) {
   if (!ReadFileToString(nr_tags_path, &nr_tags)) {
     return Error() << "Failed to read " << nr_tags_path;
   }
-  android::base::Trim(nr_tags);
+  nr_tags = android::base::Trim(nr_tags);
   LOG(VERBOSE) << file_path << " is backed by /dev/" << blockdev
                << " and that block device supports queue depth " << nr_tags;
   return strtol(nr_tags.c_str(), NULL, 0);
@@ -219,18 +218,20 @@ Result<void> ConfigureQueueDepth(const std::string& loop_device_path,
   if (!ReadFileToString(sysfs_path, &cur_nr_requests_str)) {
     return Error() << "Failed to read " << sysfs_path;
   }
+  cur_nr_requests_str = android::base::Trim(cur_nr_requests_str);
   uint32_t cur_nr_requests = 0;
-  if (!ParseUint(cur_nr_requests_str.c_str(), &cur_nr_requests))
-    return Error() << "Failed to parse " << cur_nr_requests;
+  if (!ParseUint(cur_nr_requests_str.c_str(), &cur_nr_requests)) {
+    return Error() << "Failed to parse " << cur_nr_requests_str;
+  }
 
   unique_fd sysfs_fd(open(sysfs_path.c_str(), O_RDWR | O_CLOEXEC));
   if (sysfs_fd.get() == -1) {
     return ErrnoErrorf("Failed to open {}", sysfs_path);
   }
 
-  const Result<uint32_t> qd = BlockDeviceQueueDepth(file_path);
+  const auto qd = BlockDeviceQueueDepth(file_path);
   if (!qd.ok()) {
-    return ResultError(qd.error());
+    return qd.error();
   }
   if (*qd == cur_nr_requests) {
     return {};

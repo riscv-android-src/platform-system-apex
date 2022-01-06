@@ -14,12 +14,7 @@
  * limitations under the License.
  */
 
-#include <functional>
-#include <optional>
-#include <string>
-#include <tuple>
-#include <unordered_set>
-#include <vector>
+#include "apexd.h"
 
 #include <android-base/file.h>
 #include <android-base/properties.h>
@@ -30,18 +25,24 @@
 #include <gtest/gtest.h>
 #include <libdm/dm.h>
 #include <microdroid/metadata.h>
+#include <selinux/selinux.h>
 #include <sys/stat.h>
+
+#include <functional>
+#include <optional>
+#include <string>
+#include <tuple>
+#include <unordered_set>
+#include <vector>
 
 #include "apex_database.h"
 #include "apex_file_repository.h"
-#include "apexd.h"
+#include "apex_manifest.pb.h"
 #include "apexd_checkpoint.h"
 #include "apexd_loop.h"
 #include "apexd_session.h"
 #include "apexd_test_utils.h"
 #include "apexd_utils.h"
-
-#include "apex_manifest.pb.h"
 #include "com_android_apex.h"
 #include "gmock/gmock-matchers.h"
 
@@ -122,6 +123,11 @@ class MockCheckpointInterface : public CheckpointInterface {
 };
 
 static constexpr const char* kTestApexdStatusSysprop = "apexd.status.test";
+static constexpr const char* kTestVmPayloadMetadataPartitionProp =
+    "apexd.vm.payload_metadata_partition.test";
+
+static constexpr const char* kTestActiveApexSelinuxCtx =
+    "u:object_r:shell_data_file:s0";
 
 // A test fixture that provides frequently required temp directories for tests
 class ApexdUnitTest : public ::testing::Test {
@@ -135,12 +141,12 @@ class ApexdUnitTest : public ::testing::Test {
     staged_session_dir_ = StringPrintf("%s/staged-session-dir", td_.path);
 
     vm_payload_disk_ = StringPrintf("%s/vm-payload", td_.path);
-    vm_payload_metadata_path_ = vm_payload_disk_ + "1";
 
     config_ = {kTestApexdStatusSysprop,     {built_in_dir_},
                data_dir_.c_str(),           decompression_dir_.c_str(),
                ota_reserved_dir_.c_str(),   hash_tree_dir_.c_str(),
-               staged_session_dir_.c_str(), vm_payload_metadata_path_.c_str()};
+               staged_session_dir_.c_str(), kTestVmPayloadMetadataPartitionProp,
+               kTestActiveApexSelinuxCtx};
   }
 
   const std::string& GetBuiltInDir() { return built_in_dir_; }
@@ -218,6 +224,12 @@ class ApexdUnitTest : public ::testing::Test {
     return result;
   }
 
+  void SetBlockApexEnabled(bool enabled) {
+    // The first partition(1) is "metadata" partition
+    base::SetProperty(kTestVmPayloadMetadataPartitionProp,
+                      enabled ? (vm_payload_disk_ + "1") : "");
+  }
+
  protected:
   void SetUp() override {
     SetConfig(config_);
@@ -241,11 +253,18 @@ class ApexdUnitTest : public ::testing::Test {
     apex->set_public_key(public_key);
     apex->set_root_digest(root_digest);
 
-    std::ofstream out(vm_payload_metadata_path_);
+    // The first partition is metadata partition
+    auto metadata_partition = vm_payload_disk_ + "1";
+    LOG(INFO) << "Writing metadata to " << metadata_partition;
+    std::ofstream out(metadata_partition);
+
     android::microdroid::WriteMetadata(metadata, out);
   }
 
-  void TearDown() override { DeleteDirContent(ApexSession::GetSessionsDir()); }
+  void TearDown() override {
+    DeleteDirContent(ApexSession::GetSessionsDir());
+    SetBlockApexEnabled(false);
+  }
 
  private:
   TemporaryDir td_;
@@ -3922,6 +3941,9 @@ TEST_F(ApexdMountTest, OnStartInVmModeActivatesBlockDevicesAsWell) {
   // Need to call InitializeVold before calling OnStart
   InitializeVold(&checkpoint_interface);
 
+  // Set system property to enable block apexes
+  SetBlockApexEnabled(true);
+
   auto path1 = AddBlockApex("apex.apexd_test.apex");
 
   ASSERT_EQ(0, OnStartInVmMode());
@@ -3953,6 +3975,9 @@ TEST_F(ApexdMountTest, OnStartInVmModeFailsWithDuplicateNames) {
   // Need to call InitializeVold before calling OnStart
   InitializeVold(&checkpoint_interface);
 
+  // Set system property to enable block apexes
+  SetBlockApexEnabled(true);
+
   AddPreInstalledApex("apex.apexd_test.apex");
   AddBlockApex("apex.apexd_test_v2.apex");
 
@@ -3964,6 +3989,9 @@ TEST_F(ApexdMountTest, OnStartInVmModeFailsWithWrongPubkey) {
   // Need to call InitializeVold before calling OnStart
   InitializeVold(&checkpoint_interface);
 
+  // Set system property to enable block apexes
+  SetBlockApexEnabled(true);
+
   AddBlockApex("apex.apexd_test.apex", /*public_key=*/"wrong pubkey");
 
   ASSERT_EQ(1, OnStartInVmMode());
@@ -3973,6 +4001,9 @@ TEST_F(ApexdMountTest, GetActivePackagesReturningBlockApexesAsWell) {
   MockCheckpointInterface checkpoint_interface;
   // Need to call InitializeVold before calling OnStart
   InitializeVold(&checkpoint_interface);
+
+  // Set system property to enable block apexes
+  SetBlockApexEnabled(true);
 
   auto path1 = AddBlockApex("apex.apexd_test.apex");
 
@@ -3989,10 +4020,208 @@ TEST_F(ApexdMountTest, OnStartInVmModeFailsWithWrongRootDigest) {
   // Need to call InitializeVold before calling OnStart
   InitializeVold(&checkpoint_interface);
 
+  // Set system property to enable block apexes
+  SetBlockApexEnabled(true);
+
   AddBlockApex("apex.apexd_test.apex", /*public_key=*/"",
                /*root_digest=*/"wrong root digest");
 
   ASSERT_EQ(1, OnStartInVmMode());
+}
+
+// Test that OnStart works with only block devices
+TEST_F(ApexdMountTest, OnStartOnlyBlockDevices) {
+  MockCheckpointInterface checkpoint_interface;
+  // Need to call InitializeVold before calling OnStart
+  InitializeVold(&checkpoint_interface);
+
+  // Set system property to enable block apexes
+  SetBlockApexEnabled(true);
+
+  auto path1 = AddBlockApex("apex.apexd_test.apex");
+
+  ASSERT_THAT(android::apex::AddBlockApex(ApexFileRepository::GetInstance()),
+              Ok());
+
+  OnStart();
+  UnmountOnTearDown(path1);
+
+  ASSERT_EQ(GetProperty(kTestApexdStatusSysprop, ""), "starting");
+  auto apex_mounts = GetApexMounts();
+
+  ASSERT_THAT(apex_mounts,
+              UnorderedElementsAre("/apex/com.android.apex.test_package",
+                                   "/apex/com.android.apex.test_package@1"));
+}
+
+// Test that we can have a mix of both block and system apexes
+TEST_F(ApexdMountTest, OnStartBlockAndSystemInstalled) {
+  MockCheckpointInterface checkpoint_interface;
+  // Need to call InitializeVold before calling OnStart
+  InitializeVold(&checkpoint_interface);
+
+  // Set system property to enable block apexes
+  SetBlockApexEnabled(true);
+
+  auto path1 = AddPreInstalledApex("apex.apexd_test.apex");
+  auto path2 = AddBlockApex("apex.apexd_test_different_app.apex");
+
+  auto& instance = ApexFileRepository::GetInstance();
+
+  ASSERT_THAT(instance.AddPreInstalledApex({GetBuiltInDir()}), Ok());
+  ASSERT_THAT(android::apex::AddBlockApex(instance), Ok());
+
+  OnStart();
+  UnmountOnTearDown(path1);
+  UnmountOnTearDown(path2);
+
+  ASSERT_EQ(GetProperty(kTestApexdStatusSysprop, ""), "starting");
+  auto apex_mounts = GetApexMounts();
+
+  ASSERT_THAT(apex_mounts,
+              UnorderedElementsAre("/apex/com.android.apex.test_package",
+                                   "/apex/com.android.apex.test_package@1",
+                                   "/apex/com.android.apex.test_package_2",
+                                   "/apex/com.android.apex.test_package_2@1"));
+}
+
+TEST_F(ApexdMountTest, OnStartBlockAndCompressedInstalled) {
+  MockCheckpointInterface checkpoint_interface;
+  // Need to call InitializeVold before calling OnStart
+  InitializeVold(&checkpoint_interface);
+
+  // Set system property to enable block apexes
+  SetBlockApexEnabled(true);
+
+  auto path1 = AddPreInstalledApex("com.android.apex.compressed.v1.capex");
+  auto path2 = AddBlockApex("apex.apexd_test.apex");
+
+  auto& instance = ApexFileRepository::GetInstance();
+
+  ASSERT_THAT(instance.AddPreInstalledApex({GetBuiltInDir()}), Ok());
+  ASSERT_THAT(android::apex::AddBlockApex(instance), Ok());
+
+  OnStart();
+  UnmountOnTearDown(path1);
+  UnmountOnTearDown(path2);
+
+  // Decompressed APEX should be mounted
+  std::string decompressed_active_apex = StringPrintf(
+      "%s/com.android.apex.compressed@1%s", GetDecompressionDir().c_str(),
+      kDecompressedApexPackageSuffix);
+  UnmountOnTearDown(decompressed_active_apex);
+
+  ASSERT_EQ(GetProperty(kTestApexdStatusSysprop, ""), "starting");
+  auto apex_mounts = GetApexMounts();
+  ASSERT_THAT(apex_mounts,
+              UnorderedElementsAre("/apex/com.android.apex.compressed",
+                                   "/apex/com.android.apex.compressed@1",
+                                   "/apex/com.android.apex.test_package",
+                                   "/apex/com.android.apex.test_package@1"));
+}
+
+// Test that data version of apex is used if newer
+TEST_F(ApexdMountTest, BlockAndNewerData) {
+  // MockCheckpointInterface checkpoint_interface;
+  //// Need to call InitializeVold before calling OnStart
+  // InitializeVold(&checkpoint_interface);
+
+  // Set system property to enable block apexes
+  SetBlockApexEnabled(true);
+
+  auto& instance = ApexFileRepository::GetInstance();
+  AddBlockApex("apex.apexd_test.apex");
+  ASSERT_THAT(android::apex::AddBlockApex(instance), Ok());
+
+  TemporaryDir data_dir;
+  auto apexd_test_file_v2 =
+      ApexFile::Open(AddDataApex("apex.apexd_test_v2.apex"));
+  ASSERT_THAT(instance.AddDataApex(GetDataDir()), Ok());
+
+  auto all_apex = instance.AllApexFilesByName();
+  auto result = SelectApexForActivation(all_apex, instance);
+  ASSERT_EQ(result.size(), 1u);
+
+  ASSERT_THAT(result,
+              UnorderedElementsAre(ApexFileEq(ByRef(*apexd_test_file_v2))));
+}
+
+// Test that data version of apex not is used if older
+TEST_F(ApexdMountTest, BlockApexAndOlderData) {
+  MockCheckpointInterface checkpoint_interface;
+  // Need to call InitializeVold before calling OnStart
+  InitializeVold(&checkpoint_interface);
+
+  // Set system property to enable block apexes
+  SetBlockApexEnabled(true);
+
+  auto& instance = ApexFileRepository::GetInstance();
+  auto apexd_test_file_v2 =
+      ApexFile::Open(AddBlockApex("apex.apexd_test_v2.apex"));
+  ASSERT_THAT(android::apex::AddBlockApex(instance), Ok());
+
+  TemporaryDir data_dir;
+  AddDataApex("apex.apexd_test.apex");
+  ASSERT_THAT(instance.AddDataApex(GetDataDir()), Ok());
+
+  auto all_apex = instance.AllApexFilesByName();
+  auto result = SelectApexForActivation(all_apex, instance);
+  ASSERT_EQ(result.size(), 1u);
+
+  ASSERT_THAT(result,
+              UnorderedElementsAre(ApexFileEq(ByRef(*apexd_test_file_v2))));
+}
+
+// Test that AddBlockApex does nothing if system property not set.
+TEST_F(ApexdMountTest, AddBlockApexWithoutSystemProp) {
+  MockCheckpointInterface checkpoint_interface;
+  // Need to call InitializeVold before calling OnStart
+  InitializeVold(&checkpoint_interface);
+
+  auto& instance = ApexFileRepository::GetInstance();
+  AddBlockApex("apex.apexd_test.apex");
+  ASSERT_THAT(android::apex::AddBlockApex(instance), Ok());
+  ASSERT_EQ(instance.AllApexFilesByName().size(), 0ul);
+}
+
+// Test that adding block apex fails if preinstalled version exists
+TEST_F(ApexdMountTest, AddBlockApexFailsWithDuplicate) {
+  MockCheckpointInterface checkpoint_interface;
+  // Need to call InitializeVold before calling OnStart
+  InitializeVold(&checkpoint_interface);
+
+  // Set system property to enable block apexes
+  SetBlockApexEnabled(true);
+
+  AddPreInstalledApex("apex.apexd_test.apex");
+  AddBlockApex("apex.apexd_test_v2.apex");
+
+  auto& instance = ApexFileRepository::GetInstance();
+
+  ASSERT_THAT(instance.AddPreInstalledApex({GetBuiltInDir()}), Ok());
+  ASSERT_THAT(android::apex::AddBlockApex(instance),
+              HasError(WithMessage(HasSubstr(
+                  "duplicate of com.android.apex.test_package found"))));
+}
+
+// Test that adding block apex fails if preinstalled compressed version exists
+TEST_F(ApexdMountTest, AddBlockApexFailsWithCompressedDuplicate) {
+  MockCheckpointInterface checkpoint_interface;
+  // Need to call InitializeVold before calling OnStart
+  InitializeVold(&checkpoint_interface);
+
+  // Set system property to enable block apexes
+  SetBlockApexEnabled(true);
+
+  auto path1 = AddPreInstalledApex("com.android.apex.compressed.v1.capex");
+  auto path2 = AddBlockApex("com.android.apex.compressed.v1_original.apex");
+
+  auto& instance = ApexFileRepository::GetInstance();
+
+  ASSERT_THAT(instance.AddPreInstalledApex({GetBuiltInDir()}), Ok());
+  ASSERT_THAT(android::apex::AddBlockApex(instance),
+              HasError(WithMessage(HasSubstr(
+                  "duplicate of com.android.apex.compressed found"))));
 }
 
 class ApexActivationFailureTests : public ApexdMountTest {};
@@ -4323,8 +4552,7 @@ TEST_F(ApexdUnitTest, MountAndDeriveClasspathNoJar) {
   apex_files.emplace_back(std::move(*apex_file));
   auto class_path = MountAndDeriveClassPath(apex_files);
   ASSERT_THAT(class_path, Ok());
-  ASSERT_THAT(class_path->HasBootClassPathJars(package_name), false);
-  ASSERT_THAT(class_path->HasSystemServerClassPathJars(package_name), false);
+  ASSERT_THAT(class_path->HasClassPathJars(package_name), false);
 }
 
 TEST_F(ApexdUnitTest, MountAndDeriveClassPathJarsPresent) {
@@ -4339,8 +4567,38 @@ TEST_F(ApexdUnitTest, MountAndDeriveClassPathJarsPresent) {
   apex_files.emplace_back(std::move(*apex_file));
   auto class_path = MountAndDeriveClassPath(apex_files);
   ASSERT_THAT(class_path, Ok());
-  ASSERT_THAT(class_path->HasBootClassPathJars(package_name), true);
-  ASSERT_THAT(class_path->HasSystemServerClassPathJars(package_name), true);
+  ASSERT_THAT(class_path->HasClassPathJars(package_name), true);
+}
+
+TEST_F(ApexdUnitTest, ProcessCompressedApexWrongSELinuxContext) {
+  auto compressed_apex = ApexFile::Open(
+      AddPreInstalledApex("com.android.apex.compressed.v1.capex"));
+
+  std::vector<ApexFileRef> compressed_apex_list;
+  compressed_apex_list.emplace_back(std::cref(*compressed_apex));
+  auto return_value =
+      ProcessCompressedApex(compressed_apex_list, /* is_ota_chroot= */ false);
+  ASSERT_EQ(return_value.size(), 1u);
+
+  auto decompressed_apex_path = StringPrintf(
+      "%s/com.android.apex.compressed@1%s", GetDecompressionDir().c_str(),
+      kDecompressedApexPackageSuffix);
+  // Verify that so far it has correct context.
+  ASSERT_EQ(kTestActiveApexSelinuxCtx,
+            GetSelinuxContext(decompressed_apex_path));
+
+  // Manually mess up the context
+  ASSERT_EQ(0, setfilecon(decompressed_apex_path.c_str(),
+                          "u:object_r:apex_data_file:s0"));
+  ASSERT_EQ("u:object_r:apex_data_file:s0",
+            GetSelinuxContext(decompressed_apex_path));
+
+  auto attempt_2 =
+      ProcessCompressedApex(compressed_apex_list, /* is_ota_chroot= */ false);
+  ASSERT_EQ(attempt_2.size(), 1u);
+  // Verify that it again has correct context.
+  ASSERT_EQ(kTestActiveApexSelinuxCtx,
+            GetSelinuxContext(decompressed_apex_path));
 }
 
 }  // namespace apex
